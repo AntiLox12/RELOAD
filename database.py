@@ -3226,3 +3226,15 @@ def add_silk_to_player_inventory(user_id: int, silk_type: str, quantity: int, qu
         return False
     finally:
         dbs.close()
+
+def get_ready_silk_plantations() -> list[SilkPlantation]:
+    """Получить все готовые к сбору шёлковые плантации для уведомлений."""
+    dbs = SessionLocal()
+    try:
+        return list(
+            dbs.query(SilkPlantation)
+            .filter(SilkPlantation.status == 'ready')
+            .all()
+        )
+    finally:
+        dbs.close()
