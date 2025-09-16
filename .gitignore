@@ -1,0 +1,9 @@
+# Файл конфигурации с токеном
+config.py
+
+# База данных
+bot_data.db
+*.db
+
+# Кэш Python
+__pycache__/ 
