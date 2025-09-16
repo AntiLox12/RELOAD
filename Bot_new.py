@@ -57,10 +57,6 @@ from constants import (
     TG_PREMIUM_DURATION_SEC,
     ADMIN_USERNAMES,
     AUTO_SEARCH_DAILY_LIMIT,
-    CASINO_WIN_PROB,
-    RECEIVER_PRICES,
-    RECEIVER_COMMISSION,
-    SHOP_PRICES,
 )
 # --- Настройки ---
 # Константы импортируются из constants.py
@@ -106,10 +102,6 @@ def _get_lock(key: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _LOCKS[key] = lock
     return lock
-
-# --- Магазин: кэш предложений на пользователя ---
-# SHOP_OFFERS[user_id] = { 'offers': [ {idx, drink_id, drink_name, rarity} ], 'ts': int }
-SHOP_OFFERS: Dict[int, dict] = {}
 
 TEXTS = {
     'menu_title': {
@@ -272,7 +264,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(search_status, callback_data='find_energy')],
         [InlineKeyboardButton(bonus_status, callback_data='claim_bonus')],
         [InlineKeyboardButton(t(lang, 'extra_bonuses'), callback_data='extra_bonuses')],
-        [InlineKeyboardButton("🏙️ Города", callback_data='cities_menu')],
+        [InlineKeyboardButton("🛒 Рынок", callback_data='market_menu')],
         [InlineKeyboardButton(t(lang, 'inventory'), callback_data='inventory')],
         [InlineKeyboardButton(t(lang, 'stats'), callback_data='stats')],
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
@@ -925,22 +917,9 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"{drink.description}"
     )
 
-    # Расчёт выплат для кнопок продажи
-    unit_payout = int(RECEIVER_PRICES.get(rarity, 0) * (1.0 - RECEIVER_COMMISSION))
-    total_payout_all = unit_payout * int(inventory_item.quantity)
-
-    rows = []
-    if unit_payout > 0:
-        rows.append([InlineKeyboardButton(f"♻️ Продать 1 (+{unit_payout})", callback_data=f"sell_{inventory_item.id}")])
-        if inventory_item.quantity > 1:
-            rows.append([
-                InlineKeyboardButton(
-                    f"♻️ Продать всё {inventory_item.quantity} (+{total_payout_all})",
-                    callback_data=f"sellall_{inventory_item.id}"
-                )
-            ])
-    rows.append([InlineKeyboardButton("🔙 Назад", callback_data='inventory')])
-    keyboard = InlineKeyboardMarkup(rows)
+    back_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔙 Назад", callback_data='inventory')]]
+    )
 
     image_full_path = os.path.join(ENERGY_IMAGES_DIR, drink.image_path) if drink.image_path else None
 
@@ -956,67 +935,17 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
                 chat_id=query.message.chat_id,
                 photo=photo,
                 caption=caption,
-                reply_markup=keyboard,
+                reply_markup=back_keyboard,
                 parse_mode='HTML'
             )
     else:
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=caption,
-            reply_markup=keyboard,
+            reply_markup=back_keyboard,
             parse_mode='HTML'
         )
 
-
-# --- Приёмник: обработка продажи ---
-async def handle_sell_action(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int, sell_all: bool):
-    """Обрабатывает продажу одного предмета или всего количества через Приёмник."""
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    # Блокировка на (user_id, item_id), чтобы избежать двойных кликов
-    lock = _get_lock(f"sell:{user_id}:{item_id}")
-    async with lock:
-        qty = 10**9 if sell_all else 1
-        try:
-            result = db.sell_inventory_item(user_id, item_id, qty)
-        except Exception:
-            await query.answer("Ошибка при продаже. Попробуйте позже.", show_alert=True)
-            return
-
-        if not result or not result.get("ok"):
-            reason = (result or {}).get("reason")
-            reason_map = {
-                "not_found": "Предмет не найден",
-                "forbidden": "Этот предмет принадлежит другому игроку",
-                "bad_quantity": "Некорректное количество",
-                "empty": "Количество равно 0",
-                "unsupported_rarity": "Эта редкость пока не принимается",
-                "exception": "Произошла ошибка. Повторите попытку",
-            }
-            msg = reason_map.get(reason, "Не удалось выполнить продажу. Повторите попытку позже.")
-            await query.answer(msg, show_alert=True)
-            return
-
-        # Успешная продажа: обновляем экран инвентаря и шлём инфо-сообщение
-        qsold = int(result.get("quantity_sold", 0))
-        unit = int(result.get("unit_payout", 0))
-        total = int(result.get("total_payout", 0))
-        coins_after = int(result.get("coins_after", 0))
-        left = int(result.get("item_left_qty", 0))
-
-        # Обновляем инвентарь (внутри будет ответ на callback_query)
-        await show_inventory(update, context)
-
-        # Уведомляем об успехе отдельным сообщением (не alert, чтобы избежать двойного answer)
-        success_text = (
-            f"♻️ Продажа успешна: {qsold} шт. × {unit} = +{total} монет.\n"
-            f"Баланс: {coins_after}. Осталось: {left}."
-        )
-        try:
-            await context.bot.send_message(chat_id=user_id, text=success_text)
-        except Exception:
-            pass
 
 # --- Доп. Бонусы: подменю и элементы ---
 async def show_extra_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1064,142 +993,6 @@ async def show_extra_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
         except BadRequest:
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-
-
-async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экран Казино в городе ХайТаун."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    coins = int(getattr(player, 'coins', 0) or 0)
-
-    text = (
-        "<b>🎰 Казино ХайТаун</b>\n"
-        f"Ваш баланс: <b>{coins}</b> септимов.\n\n"
-        f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 10", callback_data='casino_bet_10'), InlineKeyboardButton("🎲 50", callback_data='casino_bet_50')],
-        [InlineKeyboardButton("🎲 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-        [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message = query.message
-    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
-        try:
-            await message.delete()
-        except BadRequest:
-            pass
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        except BadRequest:
-            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-
-
-async def show_casino_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "<b>📜 Правила Казино</b>\n\n"
-        f"• Игра: подбрасывание монеты (шанс ~{int(CASINO_WIN_PROB * 100)}% в пользу заведения).\n"
-        "• Выплата: 1 к 1 (вы получаете свою ставку и столько же сверху).\n"
-        "• Ставка списывается сразу. При победе начисляется двойная сумма.\n"
-        "• Играйте ответственно."
-    )
-    keyboard = [
-        [InlineKeyboardButton("🔙 В Казино", callback_data='city_casino')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-    ]
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-    except BadRequest:
-        await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
-    """Обрабатывает ставку игрока."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-
-    if int(amount) <= 0:
-        await query.answer("Неверная ставка", show_alert=True)
-        return
-
-    lock = _get_lock(f"user:{user.id}:casino")
-    if lock.locked():
-        await query.answer("Игра уже обрабатывается…", show_alert=True)
-        return
-    async with lock:
-        player = db.get_or_create_player(user.id, user.username or user.first_name)
-        coins_before = int(getattr(player, 'coins', 0) or 0)
-        if coins_before < int(amount):
-            await query.answer("Недостаточно септимов", show_alert=True)
-            # просто перерисуем экран казино
-            await show_city_casino(update, context)
-            return
-
-        # Списываем ставку
-        after_debit = db.increment_coins(user.id, -int(amount))
-        if after_debit is None:
-            await query.answer("Ошибка при списании", show_alert=True)
-            return
-
-        # Разыгрываем исход — вероятность задаётся константой
-        win = random.random() < CASINO_WIN_PROB
-        coins_after = after_debit
-        result_line = ""
-        if win:
-            coins_after = db.increment_coins(user.id, int(amount) * 2) or after_debit + int(amount) * 2
-            result_line = f"🎉 Победа! Вы получаете +{amount} септимов."
-        else:
-            result_line = f"💥 Поражение! Списано {amount} септимов."
-
-        # Перерисовываем экран с обновлённым балансом и результатом
-        text = (
-            "<b>🎰 Казино ХайТаун</b>\n"
-            f"{result_line}\n"
-            f"Баланс: <b>{int(coins_after)}</b> септимов.\n\n"
-            f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
-        )
-        keyboard = [
-            [InlineKeyboardButton("🎲 Ставка 10", callback_data='casino_bet_10'), InlineKeyboardButton("🎲 50", callback_data='casino_bet_50')],
-            [InlineKeyboardButton("🎲 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-            [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-        ]
-        try:
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-        except BadRequest:
-            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def open_casino_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Открывает Казино по текстовому триггеру (сообщение)."""
-    msg = update.effective_message
-    user = update.effective_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    coins = int(getattr(player, 'coins', 0) or 0)
-
-    text = (
-        "<b>🎰 Казино ХайТаун</b>\n"
-        f"Ваш баланс: <b>{coins}</b> септимов.\n\n"
-        f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 10", callback_data='casino_bet_10'), InlineKeyboardButton("🎲 50", callback_data='casino_bet_50')],
-        [InlineKeyboardButton("🎲 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-        [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-    ]
-    await msg.reply_html(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def buy_steam_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1264,7 +1057,7 @@ async def buy_steam_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню Плантации."""
+    """Экран Плантации (заглушка)."""
     query = update.callback_query
     await query.answer()
 
@@ -1272,25 +1065,9 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    # TODO: В будущем здесь будет статистика плантаций игрока
-    text = (
-        "<b>🌱 Плантация</b>\n\n"
-        "Добро пожаловать в систему плантаций!\n"
-        "Здесь вы сможете выращивать энергетики и собирать урожай.\n\n"
-        "<i>🚧 Система находится в разработке</i>"
-    )
-    
+    text = "<b>🌱 Плантация</b>\nСкоро здесь можно будет выращивать ресурсы и собирать урожай."
     keyboard = [
-        [InlineKeyboardButton("🌾 Мои грядки", callback_data='plantation_my_beds')],
-        [InlineKeyboardButton("🛒 Купить семена", callback_data='plantation_shop')],
-        [InlineKeyboardButton("🧪 Купить удобрения", callback_data='plantation_fertilizers_shop')],
-        [InlineKeyboardButton("🧪 Мои удобрения", callback_data='plantation_fertilizers_inv')],
-        [InlineKeyboardButton("➕ Купить грядку", callback_data='plantation_buy_bed')],
-        [InlineKeyboardButton("🥕 Собрать урожай", callback_data='plantation_harvest')],
-        [InlineKeyboardButton("🌍 Общие плантации", callback_data='plantation_community')],
-        [InlineKeyboardButton("💧 Полить грядки", callback_data='plantation_water')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='plantation_stats')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='market_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1309,915 +1086,8 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-# === PLANTATION MENU FUNCTIONS ===
-
-async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Мои грядки."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    # Гарантируем грядки и читаем текущее состояние
-    try:
-        db.ensure_player_beds(user.id)
-    except Exception:
-        pass
-    beds = db.get_player_beds(user.id) or []
-
-    lines = ["<b>🌾 Мои грядки</b>"]
-    actions = []
-    for b in beds:
-        idx = int(getattr(b, 'bed_index', 0) or 0)
-        state = str(getattr(b, 'state', 'empty') or 'empty')
-        st = getattr(b, 'seed_type', None)
-        if state == 'empty':
-            lines.append(f"🌱 Грядка {idx}: Пустая")
-            actions.append([InlineKeyboardButton(f"➕ Посадить в {idx}", callback_data=f'plantation_choose_{idx}')])
-        elif state == 'withered':
-            lines.append(f"🌱 Грядка {idx}: Завяла")
-            actions.append([InlineKeyboardButton(f"🔁 Пересадить {idx}", callback_data=f'plantation_choose_{idx}')])
-        elif state == 'growing':
-            name = html.escape(getattr(st, 'name', 'Семена')) if st else 'Семена'
-            grow = int(getattr(st, 'grow_time_sec', 0) or 0) if st else 0
-            planted = int(getattr(b, 'planted_at', 0) or 0)
-            passed = max(0, int(time.time()) - planted)
-            remain = max(0, grow - passed)
-            last = int(getattr(b, 'last_watered_at', 0) or 0)
-            interval = int(getattr(st, 'water_interval_sec', 0) or 0) if st else 0
-            next_water = max(0, interval - (int(time.time()) - last)) if last and interval else 0
-            prog = f"⏳ До созревания: { _fmt_time(remain) }" if remain else "⏳ Проверка готовности…"
-            water_info = "💧 Можно поливать" if not next_water else f"💧 Через { _fmt_time(next_water) }"
-            lines.append(f"🌱 Грядка {idx}: Растёт {name}\n{prog}\n{water_info}")
-            actions.append([
-                InlineKeyboardButton(f"💧 Полить {idx}", callback_data=f'plantation_water_{idx}'),
-                InlineKeyboardButton(f"🧪 Удобрить {idx}", callback_data=f'fert_pick_for_bed_{idx}')
-            ])
-        elif state == 'ready':
-            name = html.escape(getattr(st, 'name', 'Семена')) if st else 'Семена'
-            lines.append(f"🌱 Грядка {idx}: Готово! ({name})")
-            actions.append([InlineKeyboardButton(f"🥕 Собрать {idx}", callback_data=f'plantation_harvest_bed_{idx}')])
-        else:
-            lines.append(f"🌱 Грядка {idx}: {state}")
-
-    if not beds:
-        lines.append("\nНет доступных грядок.")
-
-    keyboard = []
-    keyboard.extend(actions)
-    keyboard.append([InlineKeyboardButton("🛒 Купить семена", callback_data='plantation_shop')])
-    keyboard.append([InlineKeyboardButton("🧪 Купить удобрения", callback_data='plantation_fertilizers_shop'), InlineKeyboardButton("🧪 Мои удобрения", callback_data='plantation_fertilizers_inv')])
-    keyboard.append([InlineKeyboardButton("➕ Купить грядку", callback_data='plantation_buy_bed')])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_plantation_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Магазин семян."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    seed_types = []
-    try:
-        drinks = db.get_all_drinks() or []
-        if drinks:
-            pick = random.sample(drinks, min(3, len(drinks)))
-            seed_types = db.ensure_seed_types_for_drinks([int(d.id) for d in pick]) or []
-        else:
-            seed_types = db.list_seed_types() or []
-    except Exception:
-        seed_types = db.list_seed_types() or []
-
-    lines = [f"<b>🛒 Магазин семян</b>", f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов"]
-    keyboard = []
-    if seed_types:
-        lines.append("\nДоступные семена:")
-        for st in seed_types:
-            name = html.escape(getattr(st, 'name', 'Семена'))
-            price = int(getattr(st, 'price_coins', 0) or 0)
-            ymin = int(getattr(st, 'yield_min', 0) or 0)
-            ymax = int(getattr(st, 'yield_max', 0) or 0)
-            grow_m = int((int(getattr(st, 'grow_time_sec', 0) or 0)) / 60)
-            lines.append(f"🌱 {name} — {price}💰, урожай {ymin}-{ymax}, рост ~{grow_m} мин")
-            keyboard.append([
-                InlineKeyboardButton("Купить 1", callback_data=f'plantation_buy_{st.id}_1'),
-                InlineKeyboardButton("Купить 5", callback_data=f'plantation_buy_{st.id}_5'),
-            ])
-    else:
-        lines.append("\nПока нет доступных семян. Загляните позже.")
-
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def handle_community_seed_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    try:
-        is_admin = bool(db.is_admin(user.id) or (user.username in ADMIN_USERNAMES))
-    except Exception:
-        is_admin = bool(user.username in ADMIN_USERNAMES)
-    if not is_admin:
-        await query.answer("Нет прав", show_alert=True)
-        return
-    # Если уже есть проекты — не создаём повторно
-    existing = db.list_community_plantations(limit=1) or []
-    if existing:
-        await query.answer("Проекты уже существуют", show_alert=True)
-        await show_plantation_community(update, context)
-        return
-    # Создаём пару демонстрационных проектов
-    try:
-        db.create_community_plantation(
-            title="Летний урожай Monster",
-            description="Кооперативный проект по выращиванию. Присоединяйтесь и вносите свой вклад!",
-            created_by=user.id,
-        )
-        db.create_community_plantation(
-            title="Редкие семена Burn",
-            description="Набор участников открыт. Цель — собрать редкие семена для общего дела.",
-            created_by=user.id,
-        )
-        await query.answer("Демо-проекты добавлены", show_alert=False)
-    except Exception:
-        await query.answer("Ошибка при создании проектов", show_alert=True)
-    await show_plantation_community(update, context)
-
-async def show_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбор урожая."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    beds = db.get_player_beds(user.id) or []
-    ready = [b for b in beds if str(getattr(b, 'state', '')) == 'ready']
-    lines = ["<b>🥕 Сбор урожая</b>"]
-    keyboard = []
-    if ready:
-        lines.append("\nДоступно к сбору:")
-        for b in ready:
-            idx = int(getattr(b, 'bed_index', 0) or 0)
-            st = getattr(b, 'seed_type', None)
-            name = html.escape(getattr(st, 'name', 'Растение')) if st else 'Растение'
-            lines.append(f"• Грядка {idx}: {name} — Готово")
-            keyboard.append([InlineKeyboardButton(f"🥕 Собрать {idx}", callback_data=f'plantation_harvest_bed_{idx}')])
-        # Кнопка массового сбора всех готовых грядок
-        keyboard.append([InlineKeyboardButton("✅ Собрать всё", callback_data='plantation_harvest_all')])
-    else:
-        lines.append("\nПока нет готового урожая.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_plantation_community(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Общие плантации."""
-    query = update.callback_query
-    await query.answer()
-    lines = ["<b>🌍 Общие плантации</b>"]
-    keyboard = []
-    user = query.from_user
-    # Определим права админа (для возможности быстро создать демо-проекты)
-    try:
-        is_admin = bool(db.is_admin(user.id) or (user.username in ADMIN_USERNAMES))
-    except Exception:
-        is_admin = bool(user.username in ADMIN_USERNAMES)
-    try:
-        projects = db.list_community_plantations(limit=10) or []
-    except Exception:
-        projects = []
-    if projects:
-        lines.append("\nДоступные проекты:")
-        for p in projects:
-            title = html.escape(getattr(p, 'title', 'Проект'))
-            lines.append(f"• {title}")
-            keyboard.append([InlineKeyboardButton(f"▶ Открыть: {title}", callback_data=f"community_view_{p.id}")])
-    else:
-        lines.append("\nПока нет проектов. Загляните позже.")
-        if is_admin:
-            keyboard.append([InlineKeyboardButton("➕ Добавить демо-проекты", callback_data='community_seed_demo')])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_community_project(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    query = update.callback_query
-    await query.answer()
-    cp = db.get_community_plantation_by_id(project_id)
-    if not cp:
-        await query.answer("Проект не найден", show_alert=True)
-        await show_plantation_community(update, context)
-        return
-    user = query.from_user
-    title = html.escape(getattr(cp, 'title', 'Проект'))
-    desc = html.escape(getattr(cp, 'description', '') or '')
-    # Статистика проекта
-    try:
-        stats = db.get_community_stats(project_id) or {}
-    except Exception:
-        stats = {}
-    goal = int(stats.get('goal', 0) or 0)
-    progress = int(stats.get('progress', 0) or 0)
-    participants = int(stats.get('participants', 0) or 0)
-    status = str(stats.get('status') or 'active')
-    percent = int((progress * 100) // goal) if goal > 0 else 0
-    # Участие пользователя
-    try:
-        part = db.get_community_participant(project_id, user.id)
-    except Exception:
-        part = None
-    my_contrib = int(getattr(part, 'contributed_amount', 0) or 0) if part else 0
-
-    lines = [f"<b>🌍 {title}</b>"]
-    if desc:
-        lines.append(f"\n{desc}")
-    # Прогресс
-    bar = _progress_bar(progress, goal, width=16)
-    lines.append("")
-    lines.append(f"Прогресс: {progress}/{goal} ({percent}%)")
-    lines.append(bar)
-    lines.append(f"👥 Участников: {participants} | Статус: {'✅ завершён' if status == 'completed' else '🟢 активен'}")
-    if my_contrib > 0:
-        lines.append(f"Ваш вклад: {my_contrib} септимов")
-
-    keyboard = []
-    if status == 'active':
-        if not part:
-            keyboard.append([InlineKeyboardButton("🤝 Присоединиться", callback_data=f'community_join_{project_id}')])
-        # Быстрые суммы взносов
-        keyboard.append([
-            InlineKeyboardButton("💰 10", callback_data=f'community_contrib_{project_id}_10'),
-            InlineKeyboardButton("💰 50", callback_data=f'community_contrib_{project_id}_50'),
-            InlineKeyboardButton("💰 100", callback_data=f'community_contrib_{project_id}_100'),
-            InlineKeyboardButton("💰 500", callback_data=f'community_contrib_{project_id}_500'),
-        ])
-    else:
-        # Проект завершён — возможность забрать награду
-        keyboard.append([InlineKeyboardButton("🎁 Забрать награду", callback_data=f'community_claim_{project_id}')])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_community')])
-
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_plantation_water(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Полив грядок."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    beds = db.get_player_beds(user.id) or []
-    lines = ["<b>💧 Полив грядок</b>"]
-    keyboard = []
-    any_growing = False
-    now_ts = int(time.time())
-    for b in beds:
-        if str(getattr(b, 'state', '')) != 'growing':
-            continue
-        st = getattr(b, 'seed_type', None)
-        idx = int(getattr(b, 'bed_index', 0) or 0)
-        any_growing = True
-        last = int(getattr(b, 'last_watered_at', 0) or 0)
-        interval = int(getattr(st, 'water_interval_sec', 0) or 0) if st else 0
-        next_in = max(0, interval - (now_ts - last)) if last and interval else 0
-        name = html.escape(getattr(st, 'name', 'Растение')) if st else 'Растение'
-        if next_in:
-            lines.append(f"• Грядка {idx}: {name} — полив через { _fmt_time(next_in) }")
-            keyboard.append([InlineKeyboardButton(f"⏳ Рано ({idx})", callback_data='noop')])
-        else:
-            lines.append(f"• Грядка {idx}: {name} — можно поливать")
-            keyboard.append([InlineKeyboardButton(f"💧 Полить {idx}", callback_data=f'plantation_water_{idx}')])
-    if not any_growing:
-        lines.append("\nНет растущих грядок для полива.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_plantation_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика плантации."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    beds = db.get_player_beds(user.id) or []
-    inv = db.get_seed_inventory(user.id) or []
-
-    counts = {'empty': 0, 'growing': 0, 'ready': 0, 'withered': 0}
-    for b in beds:
-        s = str(getattr(b, 'state', 'empty') or 'empty')
-        counts[s] = counts.get(s, 0) + 1
-
-    lines = ["<b>📊 Статистика плантации</b>"]
-    lines.append(f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов")
-    lines.append(f"🌾 Грядок: {len(beds)} (пустых {counts.get('empty',0)}, растёт {counts.get('growing',0)}, готово {counts.get('ready',0)}, завяло {counts.get('withered',0)})")
-    if inv:
-        lines.append("\n🌱 Семена в инвентаре:")
-        for it in inv:
-            st = getattr(it, 'seed_type', None)
-            name = html.escape(getattr(st, 'name', 'Семена')) if st else 'Семена'
-            qty = int(getattr(it, 'quantity', 0) or 0)
-            if qty > 0:
-                lines.append(f"• {name}: {qty} шт.")
-    else:
-        lines.append("\n🌱 Семян нет.")
-
-    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')]]
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-# === FERTILIZERS: SHOP, INVENTORY, APPLY ===
-
-async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Магазин удобрений."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    try:
-        fertilizers = db.list_fertilizers() or []
-    except Exception:
-        fertilizers = []
-
-    lines = [f"<b>🧪 Магазин удобрений</b>", f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов"]
-    keyboard = []
-    if fertilizers:
-        lines.append("\nДоступные удобрения:")
-        for fz in fertilizers:
-            name = html.escape(getattr(fz, 'name', 'Удобрение'))
-            desc = html.escape(getattr(fz, 'description', '') or '')
-            price = int(getattr(fz, 'price_coins', 0) or 0)
-            eff = html.escape(getattr(fz, 'effect', '') or '')
-            dur_m = int((int(getattr(fz, 'duration_sec', 0) or 0)) / 60)
-            lines.append(f"• {name} — {price}💰 | эффект: {eff} | длительность: ~{dur_m} мин\n  {desc}")
-            keyboard.append([
-                InlineKeyboardButton("Купить 1", callback_data=f'fert_buy_{fz.id}_1'),
-                InlineKeyboardButton("Купить 5", callback_data=f'fert_buy_{fz.id}_5'),
-            ])
-    else:
-        lines.append("\nПока нет удобрений. Загляните позже.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def handle_fertilizer_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int, quantity: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:fert_buy")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.purchase_fertilizer(user.id, int(fertilizer_id), int(quantity))
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'not_enough_coins':
-                await query.answer('Недостаточно монет', show_alert=True)
-            elif reason == 'no_such_fertilizer':
-                await query.answer('Удобрение не найдено', show_alert=True)
-            elif reason == 'invalid_quantity':
-                await query.answer('Неверное количество', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer(f"Куплено! Баланс: {res.get('coins_left')}", show_alert=False)
-        await show_plantation_fertilizers_shop(update, context)
-
-async def show_plantation_fertilizers_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Инвентарь удобрений."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    try:
-        inv = db.get_fertilizer_inventory(user.id) or []
-    except Exception:
-        inv = []
-    lines = ["<b>🧪 Мои удобрения</b>"]
-    keyboard = []
-    any_items = False
-    for it in inv:
-        qty = int(getattr(it, 'quantity', 0) or 0)
-        fz = getattr(it, 'fertilizer', None)
-        if not fz or qty <= 0:
-            continue
-        any_items = True
-        name = html.escape(getattr(fz, 'name', 'Удобрение'))
-        lines.append(f"• {name}: {qty} шт.")
-        keyboard.append([
-            InlineKeyboardButton(f"Применить", callback_data=f'fert_apply_pick_{fz.id}')
-        ])
-    if not any_items:
-        lines.append("\nУ вас нет удобрений.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_fertilizer_apply_pick_bed(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int):
-    """Выбор грядки для применения указанного удобрения."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    beds = db.get_player_beds(user.id) or []
-    lines = ["<b>🧪 Выберите грядку для удобрения</b>"]
-    keyboard = []
-    eligible = False
-    for b in beds:
-        idx = int(getattr(b, 'bed_index', 0) or 0)
-        state = str(getattr(b, 'state', ''))
-        if state != 'growing':
-            continue
-        eligible = True
-        st = getattr(b, 'seed_type', None)
-        name = html.escape(getattr(st, 'name', 'Растение')) if st else 'Растение'
-        lines.append(f"• Грядка {idx}: {name} — растёт")
-        keyboard.append([InlineKeyboardButton(f"Удобрить {idx}", callback_data=f'fert_apply_do_{idx}_{fertilizer_id}')])
-    if not eligible:
-        lines.append("\nНет растущих грядок для удобрения.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_fertilizers_inv')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int, fertilizer_id: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:fert_apply")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.apply_fertilizer(user.id, int(bed_index), int(fertilizer_id))
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'bed_not_growing':
-                await query.answer('Грядка не в состоянии роста', show_alert=True)
-            elif reason == 'already_fertilized':
-                await query.answer('На грядке уже активен эффект удобрения', show_alert=True)
-            elif reason == 'no_inventory':
-                await query.answer('Нет такого удобрения в инвентаре', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer('Удобрение применено!', show_alert=False)
-        await show_plantation_my_beds(update, context)
-
-async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
-    """Выбор удобрения из инвентаря для конкретной грядки."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    inv = db.get_fertilizer_inventory(user.id) or []
-    lines = [f"<b>🧪 Выберите удобрение для грядки {bed_index}</b>"]
-    keyboard = []
-    any_items = False
-    for it in inv:
-        qty = int(getattr(it, 'quantity', 0) or 0)
-        fz = getattr(it, 'fertilizer', None)
-        if not fz or qty <= 0:
-            continue
-        any_items = True
-        name = html.escape(getattr(fz, 'name', 'Удобрение'))
-        keyboard.append([InlineKeyboardButton(f"{name} ({qty})", callback_data=f'fert_apply_do_{bed_index}_{fz.id}')])
-    if not any_items:
-        lines.append("\nУ вас нет удобрений.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_my_beds')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def handle_plantation_buy_bed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:buy_bed")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.purchase_next_bed(user.id)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'limit_reached':
-                await query.answer('Лимит грядок достигнут', show_alert=True)
-            elif reason == 'not_enough_coins':
-                await query.answer('Недостаточно монет', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            idx = res.get('bed_index')
-            await query.answer(f"Грядка куплена! #{idx}. Баланс: {res.get('coins_left')}", show_alert=False)
-        await show_plantation_my_beds(update, context)
-
-# Placeholder handlers for buttons
-async def show_plantation_join_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
-
-async def show_plantation_my_contribution(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
-
-async def show_plantation_community_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
-
-async def show_plantation_water_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("🚧 Нечего поливать", show_alert=True)
-
-async def show_plantation_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
-
-
-def _fmt_time(seconds: int) -> str:
-    seconds = int(max(0, int(seconds or 0)))
-    if seconds < 60:
-        return f"{seconds}с"
-    m, s = divmod(seconds, 60)
-    if m < 60:
-        return f"{m}м {s}с" if s else f"{m}м"
-    h, m = divmod(m, 60)
-    return f"{h}ч {m}м"
-
-
-def _progress_bar(value: int, total: int, width: int = 10) -> str:
-    """Простой текстовый прогресс-бар."""
-    v = int(max(0, int(value or 0)))
-    t = int(max(0, int(total or 0)))
-    if t <= 0:
-        t = 1
-    filled = int((v * width) // t)
-    filled = max(0, min(width, filled))
-    bar = "█" * filled + "░" * (width - filled)
-    return f"[{bar}]"
-
-async def handle_community_join(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:community_join")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.join_community_project(project_id, user.id)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'no_project':
-                await query.answer('Проект не найден', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer('Вы присоединились к проекту!', show_alert=False)
-        await show_community_project(update, context, project_id)
-
-async def handle_community_contrib(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int, amount: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:community_contrib")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.contribute_to_community_project(project_id, user.id, int(amount))
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'invalid_amount':
-                await query.answer('Неверная сумма взноса', show_alert=True)
-            elif reason == 'not_enough_coins':
-                await query.answer('Недостаточно монет', show_alert=True)
-            elif reason == 'completed':
-                await query.answer('Проект уже завершён', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer(f"Взнос принят: {int(amount)}. Баланс: {res.get('coins_left')}", show_alert=False)
-        await show_community_project(update, context, project_id)
-
-async def handle_community_claim(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:community_claim")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.claim_community_reward(project_id, user.id)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'not_completed':
-                await query.answer('Проект ещё не завершён', show_alert=True)
-            elif reason == 'not_participant':
-                await query.answer('Вы не участник проекта', show_alert=True)
-            elif reason == 'already_claimed':
-                await query.answer('Награда уже получена', show_alert=True)
-            elif reason == 'no_progress':
-                await query.answer('Нечего распределять', show_alert=True)
-            elif reason == 'no_contribution':
-                await query.answer('У вас нет вклада в проект', show_alert=True)
-            elif reason == 'no_state':
-                await query.answer('Состояние проекта не найдено', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer(f"Начислено: {res.get('claimed_coins', 0)}. Баланс: {res.get('coins_after')}", show_alert=True)
-        await show_community_project(update, context, project_id)
-
-async def show_plantation_choose_seed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    inv = db.get_seed_inventory(user.id) or []
-    lines = [f"<b>🌱 Выбор семян для грядки {bed_index}</b>"]
-    keyboard = []
-    available = [(it.seed_type, int(getattr(it, 'quantity', 0) or 0)) for it in inv if int(getattr(it, 'quantity', 0) or 0) > 0 and it.seed_type]
-    if available:
-        lines.append("\nДоступно к посадке:")
-        for st, qty in available:
-            name = html.escape(getattr(st, 'name', 'Семена'))
-            lines.append(f"• {name}: {qty} шт.")
-            keyboard.append([InlineKeyboardButton(f"Посадить {name}", callback_data=f'plantation_plant_{bed_index}_{st.id}')])
-    else:
-        lines.append("\nУ вас нет семян. Купите их в магазине.")
-        keyboard.append([InlineKeyboardButton("🛒 Открыть магазин", callback_data='plantation_shop')])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_my_beds')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-
-async def handle_plantation_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, seed_type_id: int, quantity: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:plantation_buy")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.purchase_seeds(user.id, seed_type_id, quantity)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'not_enough_coins':
-                await query.answer('Недостаточно монет', show_alert=True)
-            elif reason == 'no_such_seed':
-                await query.answer('Семена не найдены', show_alert=True)
-            elif reason == 'invalid_quantity':
-                await query.answer('Неверное количество', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer(f"Куплено: {quantity}. Остаток: {res.get('coins_left')}", show_alert=False)
-        await show_plantation_shop(update, context)
-
-
-async def handle_plantation_plant(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int, seed_type_id: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:plantation_plant")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.plant_seed(user.id, bed_index, seed_type_id)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'no_seeds':
-                await query.answer('Нет семян этого типа', show_alert=True)
-            elif reason == 'bed_not_empty':
-                await query.answer('Грядка занята', show_alert=True)
-            elif reason == 'no_such_bed':
-                await query.answer('Грядка не найдена', show_alert=True)
-            elif reason == 'no_such_seed':
-                await query.answer('Семена не найдены', show_alert=True)
-            else:
-                await query.answer('Ошибка при посадке', show_alert=True)
-        else:
-            await query.answer('Посажено!', show_alert=False)
-        await show_plantation_my_beds(update, context)
-
-
-async def handle_plantation_water(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:plantation_water")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.water_bed(user.id, bed_index)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'too_early_to_water':
-                nxt = int(res.get('next_water_in') or 0)
-                await query.answer(f"Рано. Через { _fmt_time(nxt) }", show_alert=True)
-            elif reason == 'not_growing':
-                await query.answer('Сейчас нечего поливать', show_alert=True)
-            elif reason == 'no_such_bed':
-                await query.answer('Грядка не найдена', show_alert=True)
-            else:
-                await query.answer('Ошибка при поливе', show_alert=True)
-        else:
-            await query.answer('Полито!', show_alert=False)
-        await show_plantation_my_beds(update, context)
-
-
-async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:plantation_harvest")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.harvest_bed(user.id, bed_index)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'not_ready':
-                await query.answer('Ещё не созрело', show_alert=True)
-            elif reason == 'no_seed':
-                await query.answer('Пустая грядка', show_alert=True)
-            elif reason == 'no_such_bed':
-                await query.answer('Грядка не найдена', show_alert=True)
-            else:
-                await query.answer('Ошибка при сборе', show_alert=True)
-        else:
-            amount = int(res.get('yield') or 0)
-            items_added = int(res.get('items_added') or 0)
-            drink_id = int(res.get('drink_id') or 0)
-            rarity_counts = res.get('rarity_counts') or {}
-
-            # Короткое подтверждение
-            await query.answer(f"Собрано: {items_added}", show_alert=False)
-
-            # Детальный отчёт с фото и эффектами
-            try:
-                drink = db.get_drink_by_id(drink_id)
-            except Exception:
-                drink = None
-            name = html.escape(getattr(drink, 'name', 'Энергетик'))
-
-            lines = [
-                "<b>🥕 Урожай собран</b>",
-                f"{name}: <b>{items_added}</b>" + (f" из {amount}" if items_added != amount else ""),
-            ]
-            for r in RARITY_ORDER:
-                cnt = int((rarity_counts.get(r) or 0))
-                if cnt > 0:
-                    emoji = COLOR_EMOJIS.get(r, '')
-                    lines.append(f"{emoji} {r}: <b>{cnt}</b>")
-
-            # Эффекты (полив, удобрение, негативные статусы, множитель)
-            eff = res.get('effects') or {}
-            wc = int(eff.get('water_count') or 0)
-            fert_active = bool(eff.get('fertilizer_active'))
-            fert_name = eff.get('fertilizer_name') or ''
-            status_raw = (eff.get('status_effect') or '').lower()
-            yield_mult = float(eff.get('yield_multiplier') or 1.0)
-            status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
-            status_h = status_map.get(status_raw, '—' if not status_raw else status_raw)
-            lines.append("")
-            lines.append("<i>Эффекты</i>:")
-            lines.append(f"• Поливов: {wc}")
-            if fert_active:
-                if fert_name:
-                    lines.append(f"• Удобрение: активно ({html.escape(str(fert_name))})")
-                else:
-                    lines.append("• Удобрение: активно")
-            else:
-                lines.append("• Удобрение: нет")
-            lines.append(f"• Негативный статус: {status_h}")
-            lines.append(f"• Множитель урожая: x{yield_mult:.2f}")
-
-            text = "\n".join(lines)
-            image_full_path = os.path.join(ENERGY_IMAGES_DIR, getattr(drink, 'image_path', None)) if drink and getattr(drink, 'image_path', None) else None
-            try:
-                if image_full_path and os.path.exists(image_full_path):
-                    with open(image_full_path, 'rb') as photo:
-                        await context.bot.send_photo(chat_id=user.id, photo=photo, caption=text, parse_mode='HTML')
-                else:
-                    await context.bot.send_message(chat_id=user.id, text=text, parse_mode='HTML')
-            except Exception:
-                # Если отправка фото не удалась — пробуем текст
-                try:
-                    await context.bot.send_message(chat_id=user.id, text=text, parse_mode='HTML')
-                except Exception:
-                    pass
-        await show_plantation_my_beds(update, context)
-
-async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:plantation_harvest")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        beds = db.get_player_beds(user.id) or []
-        ready = [b for b in beds if str(getattr(b, 'state', '')) == 'ready']
-        if not ready:
-            await query.answer('Пока нет готового урожая', show_alert=True)
-            return
-
-        total_items = 0
-        total_amount = 0
-        agg_rarity: dict[str, int] = {}
-        per_drink: dict[int, dict] = {}
-
-        for b in ready:
-            idx = int(getattr(b, 'bed_index', 0) or 0)
-            res = db.harvest_bed(user.id, idx)
-            if not res.get('ok'):
-                continue
-
-            amount = int(res.get('yield') or 0)
-            items_added = int(res.get('items_added') or 0)
-            drink_id = int(res.get('drink_id') or 0)
-            rarity_counts = res.get('rarity_counts') or {}
-            eff = res.get('effects') or {}
-
-            total_items += items_added
-            total_amount += amount
-            for k, v in (rarity_counts or {}).items():
-                try:
-                    agg_rarity[k] = int(agg_rarity.get(k, 0) or 0) + int(v or 0)
-                except Exception:
-                    pass
-
-            if drink_id not in per_drink:
-                try:
-                    d = db.get_drink_by_id(drink_id)
-                except Exception:
-                    d = None
-                per_drink[drink_id] = {
-                    'name': html.escape(getattr(d, 'name', 'Энергетик')),
-                    'items_added': 0,
-                    'amount': 0,
-                    'rarity_counts': {}
-                }
-            per_drink[drink_id]['items_added'] += items_added
-            per_drink[drink_id]['amount'] += amount
-            for k, v in (rarity_counts or {}).items():
-                try:
-                    per_drink[drink_id]['rarity_counts'][k] = int(per_drink[drink_id]['rarity_counts'].get(k, 0) or 0) + int(v or 0)
-                except Exception:
-                    pass
-
-            # Отправляем детальное сообщение по каждой грядке с фото
-            try:
-                drink = db.get_drink_by_id(drink_id)
-            except Exception:
-                drink = None
-            name = html.escape(getattr(drink, 'name', 'Энергетик'))
-
-            lines = [
-                f"<b>🥕 Сбор: грядка {idx}</b>",
-                f"{name}: <b>{items_added}</b>" + (f" из {amount}" if items_added != amount else ""),
-            ]
-            for r in RARITY_ORDER:
-                cnt = int((rarity_counts.get(r) or 0))
-                if cnt > 0:
-                    emoji = COLOR_EMOJIS.get(r, '')
-                    lines.append(f"{emoji} {r}: <b>{cnt}</b>")
-
-            wc = int(eff.get('water_count') or 0)
-            fert_active = bool(eff.get('fertilizer_active'))
-            fert_name = eff.get('fertilizer_name') or ''
-            status_raw = (eff.get('status_effect') or '').lower()
-            yield_mult = float(eff.get('yield_multiplier') or 1.0)
-            status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
-            status_h = status_map.get(status_raw, '—' if not status_raw else status_raw)
-            lines.append("")
-            lines.append("<i>Эффекты</i>:")
-            lines.append(f"• Поливов: {wc}")
-            if fert_active:
-                if fert_name:
-                    lines.append(f"• Удобрение: активно ({html.escape(str(fert_name))})")
-                else:
-                    lines.append("• Удобрение: активно")
-            else:
-                lines.append("• Удобрение: нет")
-            lines.append(f"• Негативный статус: {status_h}")
-            lines.append(f"• Множитель урожая: x{yield_mult:.2f}")
-            text = "\n".join(lines)
-
-            image_full_path = os.path.join(ENERGY_IMAGES_DIR, getattr(drink, 'image_path', None)) if drink and getattr(drink, 'image_path', None) else None
-            try:
-                if image_full_path and os.path.exists(image_full_path):
-                    with open(image_full_path, 'rb') as photo:
-                        await context.bot.send_photo(chat_id=user.id, photo=photo, caption=text, parse_mode='HTML')
-                else:
-                    await context.bot.send_message(chat_id=user.id, text=text, parse_mode='HTML')
-            except Exception:
-                try:
-                    await context.bot.send_message(chat_id=user.id, text=text, parse_mode='HTML')
-                except Exception:
-                    pass
-
-        # Короткое сводное уведомление
-        await query.answer(f"Собрано: {total_items}", show_alert=False)
-
-        # Сводный отчёт
-        lines = [
-            "<b>🥕 Сбор завершён</b>",
-            f"Итого собрано: <b>{total_items}</b>" + (f" из {total_amount}" if total_items != total_amount else ""),
-        ]
-        for r in RARITY_ORDER:
-            cnt = int((agg_rarity.get(r) or 0))
-            if cnt > 0:
-                emoji = COLOR_EMOJIS.get(r, '')
-                lines.append(f"{emoji} {r}: <b>{cnt}</b>")
-        if per_drink:
-            lines.append("")
-            lines.append("<b>По напиткам:</b>")
-            for _did, info in per_drink.items():
-                d_name = info.get('name', 'Напиток')
-                ia = int(info.get('items_added') or 0)
-                am = int(info.get('amount') or 0)
-                lines.append(f"• {d_name}: <b>{ia}</b>" + (f" из {am}" if ia != am else ""))
-        text = "\n".join(lines)
-        try:
-            await context.bot.send_message(chat_id=user.id, text=text, parse_mode='HTML')
-        except Exception:
-            pass
-
-        await show_plantation_my_beds(update, context)
-
 async def show_market_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подменю Рынок: Магазин, Приёмник."""
+    """Подменю Рынок: Магазин, Прилавки, Приёмник."""
     query = update.callback_query
     await query.answer()
 
@@ -2228,71 +1098,9 @@ async def show_market_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "<b>🛒 Рынок</b>\nВыберите раздел:"
     keyboard = [
         [InlineKeyboardButton("🏬 Магазин", callback_data='market_shop')],
+        [InlineKeyboardButton("🧺 Прилавки", callback_data='market_stalls')],
         [InlineKeyboardButton("♻️ Приёмник", callback_data='market_receiver')],
         [InlineKeyboardButton("🌱 Плантация", callback_data='market_plantation')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message = query.message
-    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
-        try:
-            await message.delete()
-        except BadRequest:
-            pass
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        except BadRequest:
-            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
- 
-async def show_cities_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню Города: список доступных городов."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    _ = player.language
-
-    text = "<b>🏙️ Города</b>\nВыберите город:"
-    keyboard = [
-        [InlineKeyboardButton("🏰 Город ХайТаун", callback_data='city_hightown')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message = query.message
-    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
-        try:
-            await message.delete()
-        except BadRequest:
-            pass
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        except BadRequest:
-            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-
-
-async def show_city_hightown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Город ХайТаун: разделы города (бывший Рынок)."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    _ = player.language
-
-    text = "<b>🏰 Город ХайТаун</b>\nВыберите раздел:"
-    keyboard = [
-        [InlineKeyboardButton("🏬 Магазин", callback_data='market_shop')],
-        [InlineKeyboardButton("♻️ Приёмник", callback_data='market_receiver')],
-        [InlineKeyboardButton("🌱 Плантация", callback_data='market_plantation')],
-        [InlineKeyboardButton("🎰 Казино", callback_data='city_casino')],
-        [InlineKeyboardButton("🔙 К городам", callback_data='cities_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2312,7 +1120,7 @@ async def show_city_hightown(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_market_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экран Магазина: 50 офферов из БД, автообновление каждые 4 часа, покупка с ценой."""
+    """Экран Магазина (заглушка)."""
     query = update.callback_query
     await query.answer()
 
@@ -2320,89 +1128,13 @@ async def show_market_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    # Определяем страницу: из callback или из user_data (после покупки)
-    data = query.data or 'market_shop'
-    forced_page = context.user_data.pop('shop_page_override', None)
-    page = 1
-    if forced_page:
-        try:
-            page = max(1, int(forced_page))
-        except Exception:
-            page = 1
-    elif data.startswith('shop_p_'):
-        try:
-            page = max(1, int(data.split('_')[-1]))
-        except Exception:
-            page = 1
-
-    # Получаем персистентные офферы
-    offers, last_ts = db.get_or_refresh_shop_offers()
-    if not offers:
-        text = "<b>🏬 Магазин</b>\nПока нет доступных товаров."
-        keyboard = [
-            [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-            [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        message = query.message
-        if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
-            try:
-                await message.delete()
-            except BadRequest:
-                pass
-            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-        else:
-            try:
-                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-            except BadRequest:
-                await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-        return
-
-    total = len(offers)
-    page_size = 10
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    if page > total_pages:
-        page = total_pages
-    start = (page - 1) * page_size
-    end = min(total, start + page_size)
-
-    now_ts = int(time.time())
-    next_in = max(0, (int(last_ts or 0) + 4 * 60 * 60) - now_ts)
-
-    # Текст
-    lines = [
-        "<b>🏬 Магазин</b>",
-        f"Доступно предложений: <b>{total}</b>",
-        f"Страница <b>{page}</b> из <b>{total_pages}</b>",
-        (f"Обновление через: <i>{_fmt_time(next_in)}</i>" if next_in > 0 else "Обновляется..."),
-        "",
+    text = "<b>🏬 Магазин</b>\nСкоро здесь появятся товары."
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад", callback_data='market_menu')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
-    for off in offers[start:end]:
-        rarity = str(off.rarity)
-        price = int(SHOP_PRICES.get(rarity, 0))
-        emoji = COLOR_EMOJIS.get(rarity, '⚪')
-        name = html.escape(getattr(off.drink, 'name', 'Энергетик'))
-        lines.append(f"{off.offer_index}. {emoji} {rarity} — <b>{name}</b> — <b>{price}🪙</b>")
-    text = "\n".join(lines)
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Кнопки
-    kb = []
-    # Пагинация
-    if total_pages > 1:
-        prev_cb = f"shop_p_{page-1}" if page > 1 else 'noop'
-        next_cb = f"shop_p_{page+1}" if page < total_pages else 'noop'
-        kb.append([InlineKeyboardButton("⬅️", callback_data=prev_cb), InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'), InlineKeyboardButton("➡️", callback_data=next_cb)])
-    # Кнопки покупки для текущей страницы
-    for off in offers[start:end]:
-        rarity = str(off.rarity)
-        price = int(SHOP_PRICES.get(rarity, 0))
-        kb.append([InlineKeyboardButton(f"Купить {off.offer_index} ({price}🪙)", callback_data=f"shop_buy_{off.offer_index}_p{page}")])
-    # Навигация
-    kb.append([InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')])
-    kb.append([InlineKeyboardButton("🔙 В меню", callback_data='menu')])
-    reply_markup = InlineKeyboardMarkup(kb)
-
-    # Отрисовка
     message = query.message
     if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
         try:
@@ -2417,28 +1149,8 @@ async def show_market_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def handle_shop_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, offer_index: int, page: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:shop_buy")
-    async with lock:
-        res = db.purchase_shop_offer(user.id, int(offer_index))
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'not_enough_coins':
-                await query.answer("Недостаточно монет", show_alert=True)
-            elif reason == 'no_offer':
-                await query.answer("Оффер недоступен", show_alert=True)
-            else:
-                await query.answer("Ошибка покупки", show_alert=True)
-        else:
-            dn = res.get('drink_name')
-            rr = res.get('rarity')
-            coins = res.get('coins_left')
-            await query.answer(f"Куплено: {dn} ({rr}). Баланс: {coins}", show_alert=True)
- 
-async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экран Приёмника: прайс-лист продажи и переход в инвентарь."""
+async def show_market_stalls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран Прилавков (заглушка)."""
     query = update.callback_query
     await query.answer()
 
@@ -2446,25 +1158,39 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    # Собираем прайс-лист (выплата за 1 шт. с учётом комиссии)
-    lines = [
-        "<b>♻️ Приёмник</b>",
-        "Сдавайте лишние энергетики и получайте монеты.",
-        f"Комиссия: {int(RECEIVER_COMMISSION*100)}% (выплата = {100-int(RECEIVER_COMMISSION*100)}% от цены)",
-        "",
-        "<b>Прайс-лист (за 1 шт.)</b>",
-    ]
-    for r in RARITY_ORDER:
-        if r in RECEIVER_PRICES:
-            base = int(RECEIVER_PRICES[r])
-            payout = int(base * (1.0 - float(RECEIVER_COMMISSION)))
-            emoji = COLOR_EMOJIS.get(r, '⚫')
-            lines.append(f"{emoji} {r}: {payout} монет")
-    text = "\n".join(lines)
-
+    text = "<b>🧺 Прилавки</b>\nСкоро здесь можно будет смотреть предложения других игроков."
     keyboard = [
-        [InlineKeyboardButton("📦 Открыть инвентарь", callback_data='inventory')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='market_menu')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран Приёмника (заглушка)."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    _ = player.language
+
+    text = "<b>♻️ Приёмник</b>\nСдавайте лишние энергетики и получайте монеты. Скоро!"
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад", callback_data='market_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3237,156 +1963,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_stats(update, context)
     elif data == 'extra_bonuses':
         await show_extra_bonuses(update, context)
-    elif data == 'cities_menu':
-        await show_cities_menu(update, context)
-    elif data == 'city_hightown' or data == 'market_menu':
-        await show_city_hightown(update, context)
-    elif data == 'city_casino':
-        await show_city_casino(update, context)
+    elif data == 'market_menu':
+        await show_market_menu(update, context)
     elif data == 'market_shop':
         await show_market_shop(update, context)
+    elif data == 'market_stalls':
+        await show_market_stalls(update, context)
     elif data == 'market_receiver':
         await show_market_receiver(update, context)
     elif data == 'market_plantation':
         await show_market_plantation(update, context)
-    elif data.startswith('shop_p_'):
-        await show_market_shop(update, context)
-    elif data.startswith('shop_buy_'):
-        # shop_buy_{offerIndex}_p{page}
-        try:
-            _, _, idx, p = data.split('_')
-            page = int(p[1:]) if p.startswith('p') else 1
-            await handle_shop_buy(update, context, int(idx), int(page))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'plantation_my_beds':
-        await show_plantation_my_beds(update, context)
-    elif data == 'plantation_shop':
-        await show_plantation_shop(update, context)
-    elif data == 'plantation_fertilizers_shop':
-        await show_plantation_fertilizers_shop(update, context)
-    elif data == 'plantation_fertilizers_inv':
-        await show_plantation_fertilizers_inventory(update, context)
-    elif data == 'plantation_harvest':
-        await show_plantation_harvest(update, context)
-    elif data == 'plantation_harvest_all':
-        await handle_plantation_harvest_all(update, context)
-    elif data == 'plantation_community':
-        await show_plantation_community(update, context)
-    elif data == 'plantation_water':
-        await show_plantation_water(update, context)
-    elif data == 'plantation_stats':
-        await show_plantation_stats(update, context)
-    elif data == 'plantation_buy_bed':
-        await handle_plantation_buy_bed(update, context)
-    elif data == 'plantation_join_project':
-        await show_plantation_join_project(update, context)
-    elif data == 'plantation_my_contribution':
-        await show_plantation_my_contribution(update, context)
-    elif data == 'plantation_community_rewards':
-        await show_plantation_community_rewards(update, context)
-    elif data == 'plantation_water_all':
-        await show_plantation_water_all(update, context)
-    elif data == 'plantation_leaderboard':
-        await show_plantation_leaderboard(update, context)
-    elif data == 'community_seed_demo':
-        await handle_community_seed_demo(update, context)
-    elif data.startswith('community_view_'):
-        try:
-            pid = int(data.split('_')[-1])
-            await show_community_project(update, context, pid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('community_join_'):
-        try:
-            pid = int(data.split('_')[-1])
-            await handle_community_join(update, context, pid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('community_contrib_'):
-        # community_contrib_{pid}_{amount}
-        try:
-            _, _, pid, amount = data.split('_')
-            await handle_community_contrib(update, context, int(pid), int(amount))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('community_claim_'):
-        try:
-            pid = int(data.split('_')[-1])
-            await handle_community_claim(update, context, pid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('casino_bet_'):
-        try:
-            amount = int(data.split('_')[-1])
-            await handle_casino_bet(update, context, amount)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'casino_rules':
-        await show_casino_rules(update, context)
-    elif data.startswith('plantation_buy_'):
-        # plantation_buy_{seed_id}_{qty}
-        try:
-            _, _, sid, qty = data.split('_')
-            await handle_plantation_buy(update, context, int(sid), int(qty))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_buy_'):
-        # fert_buy_{fert_id}_{qty}
-        try:
-            _, _, fid, qty = data.split('_')
-            await handle_fertilizer_buy(update, context, int(fid), int(qty))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_apply_pick_'):
-        # fert_apply_pick_{fert_id}
-        try:
-            fid = int(data.split('_')[-1])
-            await show_fertilizer_apply_pick_bed(update, context, fid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_apply_do_'):
-        # fert_apply_do_{bed}_{fert}
-        try:
-            _, _, _, bed, fid = data.split('_')
-            await handle_fertilizer_apply(update, context, int(bed), int(fid))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_pick_for_bed_'):
-        # fert_pick_for_bed_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await show_fertilizer_pick_for_bed(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_choose_'):
-        # plantation_choose_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await show_plantation_choose_seed(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_plant_'):
-        # plantation_plant_{bed}_{seed}
-        try:
-            _, _, bed, seed = data.split('_')
-            await handle_plantation_plant(update, context, int(bed), int(seed))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_water_'):
-        # plantation_water_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await handle_plantation_water(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_harvest_bed_'):
-        # plantation_harvest_bed_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await handle_plantation_harvest(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'bonus_tg_premium':
         await show_bonus_tg_premium(update, context)
     elif data == 'buy_tg_premium':
@@ -3420,18 +2006,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     elif data == 'my_receipts':
         await my_receipts_handler(update, context)
-    elif data.startswith('sellall_'):
-        try:
-            item_id = int(data.split('_')[1])
-            await handle_sell_action(update, context, item_id, sell_all=True)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('sell_'):
-        try:
-            item_id = int(data.split('_')[1])
-            await handle_sell_action(update, context, item_id, sell_all=False)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('view_receipt_'):
         await view_receipt_handler(update, context)
     elif data.startswith('view_'):
@@ -4505,34 +3079,12 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminder_state = t(lang, 'on') if player.remind else t(lang, 'off')
     auto_state = t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else t(lang, 'off')
 
-    # Доп. информация: когда сбросится автопоиск VIP и сколько попыток осталось сегодня (показывать всегда)
-    reset_info = ""
-    now_ts = int(time.time())
-    reset_ts = int(getattr(player, 'auto_search_reset_ts', 0) or 0)
-    count = int(getattr(player, 'auto_search_count', 0) or 0)
-    try:
-        daily_limit = int(db.get_auto_search_daily_limit(user_id))
-    except Exception:
-        daily_limit = 0
-    left_today = max(0, daily_limit - count) if daily_limit > 0 else 0
-    if reset_ts > now_ts:
-        left = reset_ts - now_ts
-        prefix = "⏳ До сброса автопоиска: " if lang == 'ru' else "⏳ Auto-search resets in: "
-        usage_ru = f" (осталось {left_today}/{daily_limit})" if lang == 'ru' else ""
-        usage_en = f" (left {left_today}/{daily_limit} today)" if lang == 'en' else ""
-        reset_info = f"{prefix}{_fmt_time(left)}{usage_ru or usage_en}\n"
-    else:
-        reset_info = ("⏳ До сброса автопоиска: —\n" if lang == 'ru' else "⏳ Auto-search reset: —\n")
-
     text = (
         f"<b>{t(lang, 'settings_title')}</b>\n\n"
         f"{t(lang, 'current_language')}: {lang_readable}\n"
         f"{t(lang, 'auto_reminder')}: {reminder_state}\n"
         f"{t(lang, 'auto_search')}: {auto_state}\n"
     )
-
-    if reset_info:
-        text += reset_info
 
     keyboard = [
         [InlineKeyboardButton(t(lang, 'btn_change_lang'), callback_data='settings_lang')],
@@ -4695,7 +3247,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 🔎 <b>Найти энергетик</b> — раз в {search_minutes} мин. можно испытать удачу и найти случайный энергетик.\n"
         f"• 🎁 <b>Ежедневный бонус</b> — раз в {bonus_hours} ч. гарантированный энергетик.\n"
         "• 📦 <b>Инвентарь</b> — все ваши найденные напитки (есть пагинация).\n"
-        "• 🏙️ <b>Города</b> — выбор города (ХайТаун: Магазин, Приёмник, Плантация).\n"
+        "• 🛒 <b>Рынок</b> — Магазин, Прилавки и Приёмник.\n"
         "• 📊 <b>Статистика</b> — личные показатели.\n"
         "• ⚙️ <b>Настройки</b> — выбор языка и сброс прогресса.\n\n"
         "<b>Команды:</b>\n"
@@ -4767,12 +3319,8 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     incoming = msg.text or ""
     normalized = "".join(ch for ch in incoming.lower() if ch.isalnum() or ch.isspace()).strip()
     # Поддержка вариантов ввода и пунктуации
-    casino_triggers = {"найти казино", "найди казино", "casino"}
-    if any(trigger in normalized for trigger in casino_triggers):
-        await open_casino_from_text(update, context)
-        return
-    find_triggers = {"найти энергетик", "найди энергетик", "получить энергетик", "find energy", "получить по ебалу энергетиком"}
-    if not any(trigger in normalized for trigger in find_triggers):
+    triggers = {"найти энергетик", "найди энергетик", "получить энергетик", "find energy"}
+    if not any(trigger in normalized for trigger in triggers):
         return
 
     user = update.effective_user
@@ -5152,16 +3700,6 @@ async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYP
 def main():
     """Запускает бота."""
     db.ensure_schema()
-    # Инициализируем дефолтные типы семян для плантации (идемпотентно)
-    try:
-        db.ensure_default_seed_types()
-    except Exception as e:
-        logger.warning(f"[PLANTATION] Failed to ensure default seed types: {e}")
-    # Инициализируем дефолтные удобрения для плантации (идемпотентно)
-    try:
-        db.ensure_default_fertilizers()
-    except Exception as e:
-        logger.warning(f"[PLANTATION] Failed to ensure default fertilizers: {e}")
     log_existing_drinks()
     
     # application = ApplicationBuilder().token(TOKEN).build()
