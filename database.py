@@ -202,6 +202,69 @@ class BoostHistory(Base):
     )
 
 
+# --- Модели для Города Шёлка ---
+
+class SilkPlantation(Base):
+    __tablename__ = 'silk_plantations'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    plantation_name = Column(String, nullable=True)  # Название плантации (задается игроком)
+    silk_trees_count = Column(Integer, default=0)  # Количество шёлковых деревьев
+    planted_at = Column(Integer, default=0)  # Дата посадки (timestamp)
+    harvest_ready_at = Column(Integer, default=0)  # Дата готовности урожая (timestamp)
+    status = Column(String, default='growing', index=True)  # growing | ready | harvesting | completed
+    investment_cost = Column(Integer, default=0)  # Стоимость инвестиции в септимах
+    expected_yield = Column(Integer, default=0)  # Ожидаемый урожай
+    investment_level = Column(String, default='starter', index=True)  # starter | standard | premium | master
+    quality_modifier = Column(Integer, default=100)  # Модификатор качества (в процентах, 80-120)
+    weather_modifier = Column(Integer, default=100)  # Модификатор погоды (в процентах, 90-110)
+    
+    player = relationship('Player')
+    
+    __table_args__ = (
+        Index('idx_silk_plantation_player', 'player_id'),
+        Index('idx_silk_plantation_status', 'status'),
+        Index('idx_silk_plantation_harvest_time', 'harvest_ready_at'),
+    )
+
+class SilkInventory(Base):
+    __tablename__ = 'silk_inventory'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    silk_type = Column(String, index=True)  # raw | refined | premium
+    quantity = Column(Integer, default=0)
+    quality_grade = Column(Integer, default=300)  # Оценка качества (100-500, где 300 - среднее)
+    produced_at = Column(Integer, default=lambda: int(time.time()))  # Дата производства
+    
+    player = relationship('Player')
+    
+    __table_args__ = (
+        Index('idx_silk_inventory_player', 'player_id'),
+        Index('idx_silk_inventory_type', 'silk_type'),
+    )
+
+class SilkTransaction(Base):
+    __tablename__ = 'silk_transactions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    seller_id = Column(BigInteger, ForeignKey('players.user_id'), nullable=True)  # ID продавца (может быть NPC)
+    buyer_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)  # ID покупателя
+    transaction_type = Column(String, index=True)  # buy | sell | trade | npc_sale
+    silk_type = Column(String)  # raw | refined | premium
+    amount = Column(Integer, default=0)  # Количество товара
+    price_per_unit = Column(Integer, default=0)  # Цена за единицу в септимах
+    total_price = Column(Integer, default=0)  # Общая стоимость сделки
+    created_at = Column(Integer, default=lambda: int(time.time()), index=True)  # Дата транзакции
+    
+    seller = relationship('Player', foreign_keys=[seller_id])
+    buyer = relationship('Player', foreign_keys=[buyer_id])
+    
+    __table_args__ = (
+        Index('idx_silk_transaction_seller', 'seller_id'),
+        Index('idx_silk_transaction_buyer', 'buyer_id'),
+        Index('idx_silk_transaction_type', 'transaction_type'),
+        Index('idx_silk_transaction_date', 'created_at'),
+    )
+
 # --- Плантация: модели ---
 
 class Fertilizer(Base):
@@ -3058,3 +3121,108 @@ def format_time_remaining(seconds: int) -> str:
         return f"{hours}ч {minutes}м"
     else:
         return f"{minutes}м"
+
+# --- Функции для системы шёлка ---
+
+def get_silk_plantation(plantation_id: int, user_id: int = None) -> SilkPlantation | None:
+    """Получить плантацию по ID. Опционально проверить владельца."""
+    dbs = SessionLocal()
+    try:
+        query = dbs.query(SilkPlantation).filter(SilkPlantation.id == plantation_id)
+        if user_id is not None:
+            query = query.filter(SilkPlantation.player_id == user_id)
+        return query.first()
+    finally:
+        dbs.close()
+
+def get_player_silk_plantations(user_id: int, status: str = None) -> list[SilkPlantation]:
+    """Получить все плантации игрока. Опционально фильтр по статусу."""
+    dbs = SessionLocal()
+    try:
+        query = dbs.query(SilkPlantation).filter(SilkPlantation.player_id == user_id)
+        if status:
+            query = query.filter(SilkPlantation.status == status)
+        return list(query.order_by(SilkPlantation.id.asc()).all())
+    finally:
+        dbs.close()
+
+def get_player_silk_inventory(user_id: int) -> list[SilkInventory]:
+    """Получить инвентарь шёлка игрока."""
+    dbs = SessionLocal()
+    try:
+        return list(
+            dbs.query(SilkInventory)
+            .filter(SilkInventory.player_id == user_id)
+            .filter(SilkInventory.quantity > 0)
+            .order_by(SilkInventory.silk_type.asc())
+            .all()
+        )
+    finally:
+        dbs.close()
+
+def update_silk_plantation_status(plantation_id: int, status: str, **kwargs) -> bool:
+    """Обновить статус плантации."""
+    dbs = SessionLocal()
+    try:
+        plantation = dbs.query(SilkPlantation).filter(SilkPlantation.id == plantation_id).first()
+        if not plantation:
+            return False
+        
+        plantation.status = status
+        for key, value in kwargs.items():
+            if hasattr(plantation, key):
+                setattr(plantation, key, value)
+        
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        dbs.close()
+
+def add_silk_to_player_inventory(user_id: int, silk_type: str, quantity: int, quality_grade: int = None) -> bool:
+    """Добавить шёлк в инвентарь игрока."""
+    if quantity <= 0:
+        return False
+    
+    dbs = SessionLocal()
+    try:
+        # Поиск существующей записи
+        existing = (
+            dbs.query(SilkInventory)
+            .filter(SilkInventory.player_id == user_id, SilkInventory.silk_type == silk_type)
+            .first()
+        )
+        
+        if existing:
+            existing.quantity += quantity
+            # Обновить качество средним взвешенным
+            if quality_grade is not None:
+                total_old = existing.quantity - quantity
+                if total_old > 0:
+                    existing.quality_grade = int((existing.quality_grade * total_old + quality_grade * quantity) / existing.quantity)
+                else:
+                    existing.quality_grade = quality_grade
+        else:
+            new_item = SilkInventory(
+                player_id=user_id,
+                silk_type=silk_type,
+                quantity=quantity,
+                quality_grade=quality_grade or 300
+            )
+            dbs.add(new_item)
+        
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        dbs.close()

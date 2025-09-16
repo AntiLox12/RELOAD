@@ -61,7 +61,9 @@ from constants import (
     RECEIVER_PRICES,
     RECEIVER_COMMISSION,
     SHOP_PRICES,
+    SILK_EMOJIS,
 )
+import silk_ui
 # --- Настройки ---
 # Константы импортируются из constants.py
 
@@ -495,6 +497,77 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+async def silk_harvest_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Периодическая проверка готовности урожая шёлка."""
+    try:
+        import silk_city
+        # Обновить статусы всех плантаций
+        updated_count = silk_city.update_plantation_statuses()
+        
+        if updated_count > 0:
+            logger.info(f"[SILK] Updated {updated_count} plantations to ready status")
+            
+            # Получить все готовые плантации и отправить уведомления
+            ready_plantations = db.get_ready_silk_plantations()
+            
+            # Группировать по пользователям
+            users_ready = {}
+            for plantation in ready_plantations:
+                user_id = plantation.player_id
+                if user_id not in users_ready:
+                    users_ready[user_id] = []
+                users_ready[user_id].append(plantation)
+            
+            # Отправить уведомления
+            for user_id, plantations in users_ready.items():
+                await send_silk_harvest_notification(context, user_id, plantations)
+    
+    except Exception as e:
+        logger.error(f"[SILK] Error in silk harvest reminder job: {e}")
+
+async def send_silk_harvest_notification(context: ContextTypes.DEFAULT_TYPE, user_id: int, plantations: list):
+    """Отправить уведомление о готовности урожая."""
+    try:
+        count = len(plantations)
+        if count == 0:
+            return
+        
+        if count == 1:
+            plantation = plantations[0]
+            text = (
+                f"{SILK_EMOJIS['ready']} **Урожай готов!**\n\n"
+                f"{SILK_EMOJIS['plantation']} Плантация: **{plantation.plantation_name}**\n"
+                f"{SILK_EMOJIS['coins']} Ожидаемый доход: **{plantation.expected_yield:,}** септимов\n\n"
+                f"Пора собирать шёлк!"
+            )
+        else:
+            text = (
+                f"{SILK_EMOJIS['ready']} **Урожай готов!**\n\n"
+                f"{SILK_EMOJIS['plantation']} Готово к сбору: **{count} плантаций**\n\n"
+            )
+            
+            total_expected = sum(p.expected_yield for p in plantations)
+            for plantation in plantations:
+                text += f"• {plantation.plantation_name} ({plantation.expected_yield:,} септимов)\n"
+            
+            text += f"\n{SILK_EMOJIS['coins']} Общий ожидаемый доход: **{total_expected:,}** септимов"
+        
+        keyboard = [
+            [InlineKeyboardButton(f"{SILK_EMOJIS['plantation']} Мои плантации", callback_data='silk_plantations')],
+            [InlineKeyboardButton(f"{SILK_EMOJIS['city']} Город Шёлка", callback_data='city_silk')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode='HTML'
+        )
+        
+    except Exception as e:
+        logger.warning(f"[SILK] Failed to send harvest notification to user {user_id}: {e}")
 
 async def _perform_energy_search(user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -2259,6 +2332,7 @@ async def show_cities_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "<b>🏙️ Города</b>\nВыберите город:"
     keyboard = [
         [InlineKeyboardButton("🏰 Город ХайТаун", callback_data='city_hightown')],
+        [InlineKeyboardButton("🧵 Город Шёлка", callback_data='city_silk')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3241,6 +3315,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_cities_menu(update, context)
     elif data == 'city_hightown' or data == 'market_menu':
         await show_city_hightown(update, context)
+    elif data == 'city_silk':
+        await silk_ui.show_city_silk(update, context)
+    elif data == 'silk_plantations':
+        await silk_ui.show_silk_plantations(update, context)
+    elif data == 'silk_market':
+        await silk_ui.show_silk_market(update, context)
+    elif data == 'silk_inventory':
+        await silk_ui.show_silk_inventory(update, context)
+    elif data == 'silk_stats':
+        await silk_ui.show_silk_stats(update, context)
+    elif data == 'silk_create_plantation':
+        await silk_ui.show_silk_create_plantation(update, context)
+    elif data.startswith('silk_plant_'):
+        level = data.split('_')[-1]
+        await silk_ui.handle_silk_plant(update, context, level)
+    elif data.startswith('silk_harvest_'):
+        plantation_id = int(data.split('_')[-1])
+        await silk_ui.handle_silk_harvest(update, context, plantation_id)
+    elif data.startswith('silk_sell_'):
+        # silk_sell_{silk_type}_{quantity}
+        try:
+            _, _, silk_type, quantity_str = data.split('_')
+            await silk_ui.handle_silk_sell(update, context, silk_type, quantity_str)
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'city_casino':
         await show_city_casino(update, context)
     elif data == 'market_shop':
@@ -5389,6 +5488,11 @@ def main():
         boost_monitor_interval = 30 * 60  # 30 минут
         boost_monitor_delay = 120  # начинаем через 2 минуты после старта
         application.job_queue.run_repeating(boost_expiration_monitoring_job, interval=boost_monitor_interval, first=boost_monitor_delay)
+        
+        # Мониторинг плантаций шёлка (каждые 5 минут)
+        silk_monitor_interval = 5 * 60  # 5 минут
+        silk_monitor_delay = 45  # начинаем через 45 секунд после старта
+        application.job_queue.run_repeating(silk_harvest_reminder_job, interval=silk_monitor_interval, first=silk_monitor_delay)
 
         # --- Восстановление задач автопоиска VIP после рестарта ---
         try:
