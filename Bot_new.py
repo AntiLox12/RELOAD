@@ -1806,11 +1806,11 @@ async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_
         res = db.apply_fertilizer(user.id, int(bed_index), int(fertilizer_id))
         if not res.get('ok'):
             reason = res.get('reason')
-            if reason == 'bed_not_growing':
+            if reason == 'not_growing':
                 await query.answer('Грядка не в состоянии роста', show_alert=True)
-            elif reason == 'already_fertilized':
+            elif reason == 'fertilizer_active':
                 await query.answer('На грядке уже активен эффект удобрения', show_alert=True)
-            elif reason == 'no_inventory':
+            elif reason == 'no_fertilizer_in_inventory':
                 await query.answer('Нет такого удобрения в инвентаре', show_alert=True)
             else:
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
