@@ -2946,6 +2946,74 @@ def sell_inventory_item(user_id: int, item_id: int, quantity: int) -> dict:
     finally:
         dbs.close()
 
+def sell_all_but_one(user_id: int, item_id: int) -> dict:
+    """Продажа всех предметов из инвентаря кроме одного через Приёмник.
+    - Уменьшает количество до 1, начисляет монеты.
+    Возвращает dict: {ok, reason?, unit_payout, quantity_sold, total_payout, coins_after, item_left_qty}
+    """
+    dbs = SessionLocal()
+    try:
+        item = (
+            dbs.query(InventoryItem)
+            .filter(InventoryItem.id == item_id)
+            .first()
+        )
+        if not item:
+            return {"ok": False, "reason": "not_found"}
+        if int(item.player_id) != int(user_id):
+            return {"ok": False, "reason": "forbidden"}
+
+        # Проверяем количество - должно быть больше 1
+        qty_available = int(item.quantity or 0)
+        if qty_available <= 1:
+            return {"ok": False, "reason": "not_enough_items"}
+        
+        qty_to_sell = qty_available - 1  # Продаём все кроме одного
+
+        unit_payout = get_receiver_unit_payout(item.rarity)
+        if unit_payout <= 0:
+            return {"ok": False, "reason": "unsupported_rarity"}
+
+        total_payout = int(unit_payout) * int(qty_to_sell)
+
+        # Начисляем монеты
+        player = (
+            dbs.query(Player)
+            .filter(Player.user_id == user_id)
+            .with_for_update(read=False)
+            .first()
+        )
+        if not player:
+            # Создаём игрока, если внезапно отсутствует
+            player = Player(user_id=user_id, username=str(user_id))
+            dbs.add(player)
+            dbs.commit()
+            dbs.refresh(player)
+
+        player.coins = int(player.coins or 0) + int(total_payout)
+
+        # Списываем из инвентаря (оставляем только 1)
+        item.quantity = 1
+        item_left_qty = 1
+
+        dbs.commit()
+        return {
+            "ok": True,
+            "unit_payout": int(unit_payout),
+            "quantity_sold": int(qty_to_sell),
+            "total_payout": int(total_payout),
+            "coins_after": int(player.coins),
+            "item_left_qty": int(item_left_qty),
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
 # --- Автопоиск буст: расширенные функции ---
 
 def get_players_with_active_boosts() -> list[Player]:

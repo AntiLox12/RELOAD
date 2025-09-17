@@ -1012,6 +1012,15 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
                     callback_data=f"sellall_{inventory_item.id}"
                 )
             ])
+        # Добавляем кнопку "Продать все кроме одного" только если предметов больше 1
+        if inventory_item.quantity > 1:
+            total_payout_all_but_one = unit_payout * (int(inventory_item.quantity) - 1)
+            rows.append([
+                InlineKeyboardButton(
+                    f"♻️ Продать все кроме одного ({inventory_item.quantity - 1}) (+{total_payout_all_but_one})",
+                    callback_data=f"sellallbutone_{inventory_item.id}"
+                )
+            ])
     rows.append([InlineKeyboardButton("🔙 Назад", callback_data='inventory')])
     keyboard = InlineKeyboardMarkup(rows)
 
@@ -1084,6 +1093,54 @@ async def handle_sell_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
         # Уведомляем об успехе отдельным сообщением (не alert, чтобы избежать двойного answer)
         success_text = (
             f"♻️ Продажа успешна: {qsold} шт. × {unit} = +{total} монет.\n"
+            f"Баланс: {coins_after}. Осталось: {left}."
+        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text=success_text)
+        except Exception:
+            pass
+
+# --- Приёмник: обработка продажи всех кроме одного ---
+async def handle_sell_all_but_one(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int):
+    """Обрабатывает продажу всех предметов кроме одного через Приёмник."""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    # Блокировка на (user_id, item_id), чтобы избежать двойных кликов
+    lock = _get_lock(f"sell_all_but_one:{user_id}:{item_id}")
+    async with lock:
+        try:
+            result = db.sell_all_but_one(user_id, item_id)
+        except Exception:
+            await query.answer("Ошибка при продаже. Попробуйте позже.", show_alert=True)
+            return
+
+        if not result or not result.get("ok"):
+            reason = (result or {}).get("reason")
+            reason_map = {
+                "not_found": "Предмет не найден",
+                "forbidden": "Этот предмет принадлежит другому игроку",
+                "not_enough_items": "Недостаточно предметов (нужно больше 1)",
+                "unsupported_rarity": "Эта редкость пока не принимается",
+                "exception": "Произошла ошибка. Повторите попытку",
+            }
+            msg = reason_map.get(reason, "Не удалось выполнить продажу. Повторите попытку позже.")
+            await query.answer(msg, show_alert=True)
+            return
+
+        # Успешная продажа: обновляем экран инвентаря и шлём инфо-сообщение
+        qsold = int(result.get("quantity_sold", 0))
+        unit = int(result.get("unit_payout", 0))
+        total = int(result.get("total_payout", 0))
+        coins_after = int(result.get("coins_after", 0))
+        left = int(result.get("item_left_qty", 0))
+
+        # Обновляем инвентарь (внутри будет ответ на callback_query)
+        await show_inventory(update, context)
+
+        # Уведомляем об успехе отдельным сообщением
+        success_text = (
+            f"♻️ Продажа всех кроме одного успешна: {qsold} шт. × {unit} = +{total} монет.\n"
             f"Баланс: {coins_after}. Осталось: {left}."
         )
         try:
@@ -3534,6 +3591,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             item_id = int(data.split('_')[1])
             await handle_sell_action(update, context, item_id, sell_all=True)
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('sellallbutone_'):
+        try:
+            item_id = int(data.split('_')[1])
+            await handle_sell_all_but_one(update, context, item_id)
         except Exception:
             await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('sell_'):
