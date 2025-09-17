@@ -81,29 +81,29 @@ SILK_INVESTMENT_LEVELS = {
         'cost': 1000,
         'trees': 10,
         'grow_time': 24 * 60 * 60,  # 24 часа
-        'min_yield': 1200,
-        'max_yield': 1400,
+        'min_yield': 35,
+        'max_yield': 45,
     },
     'standard': {
         'cost': 5000,
         'trees': 50,
         'grow_time': 48 * 60 * 60,  # 48 часов
-        'min_yield': 6500,
-        'max_yield': 7500,
+        'min_yield': 170,
+        'max_yield': 200,
     },
     'premium': {
         'cost': 15000,
         'trees': 150,
         'grow_time': 72 * 60 * 60,  # 72 часа
-        'min_yield': 20000,
-        'max_yield': 25000,
+        'min_yield': 520,
+        'max_yield': 580,
     },
     'master': {
         'cost': 50000,
         'trees': 500,
         'grow_time': 96 * 60 * 60,  # 96 часов
-        'min_yield': 70000,
-        'max_yield': 90000,
+        'min_yield': 1700,
+        'max_yield': 1900,
     },
 }
 
@@ -112,19 +112,19 @@ SILK_TYPES = {
     'raw': {
         'name': 'Сырой шёлк',
         'emoji': '🧵',
-        'base_price': 50,
+        'base_price': 30,
         'probability': 70,  # вероятность получения в %
     },
     'refined': {
         'name': 'Рафинированный шёлк',
         'emoji': '🪡',
-        'base_price': 65,  # +30% к базовой стоимости
+        'base_price': 40,  # +33% к базовой стоимости
         'probability': 25,
     },
     'premium': {
         'name': 'Премиум шёлк',
         'emoji': '✨',
-        'base_price': 80,  # +60% к базовой стоимости
+        'base_price': 50,  # +67% к базовой стоимости
         'probability': 5,
     },
 }
@@ -148,9 +148,9 @@ SILK_NOTIFICATION_TIME = 30
 
 # Рыночные цены на шёлк (базовая стоимость может колебаться)
 SILK_MARKET_PRICES = {
-    'raw': {'min': 45, 'max': 55},
-    'refined': {'min': 60, 'max': 70},
-    'premium': {'min': 75, 'max': 85},
+    'raw': {'min': 25, 'max': 35},
+    'refined': {'min': 35, 'max': 45},
+    'premium': {'min': 45, 'max': 55},
 }
 
 # Эмодзи для системы шёлка
