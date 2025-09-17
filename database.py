@@ -1123,16 +1123,16 @@ def ensure_default_fertilizers() -> int:
         if existing > 0:
             return 0
         data = [
-            {"name": "Азотное",       "description": "Ускоряет вегетацию",           "effect": "+рост",       "duration_sec": 7200,  "price_coins": 50},
-            {"name": "Фосфорное",     "description": "Усиливает образование плодов", "effect": "+урожай",     "duration_sec": 7200,  "price_coins": 60},
-            {"name": "Калийное",      "description": "Повышает устойчивость",        "effect": "+качество",   "duration_sec": 7200,  "price_coins": 70},
-            {"name": "Комплексное",   "description": "Сбалансированная смесь",       "effect": "+всё",        "duration_sec": 10800, "price_coins": 90},
-            {"name": "Биоактив",      "description": "Органический стимулятор",      "effect": "+био",        "duration_sec": 7200,  "price_coins": 80},
-            {"name": "Стимул-Х",      "description": "Мощный стимулятор роста",       "effect": "+рост+кач",   "duration_sec": 7200,  "price_coins": 110},
-            {"name": "Минерал+",      "description": "Минеральный комплекс",         "effect": "+качество",   "duration_sec": 7200,  "price_coins": 95},
-            {"name": "Гумат",         "description": "Гуминовый концентрат",          "effect": "+питание",    "duration_sec": 7200,  "price_coins": 85},
-            {"name": "СуперРост",     "description": "Сокращает время роста",         "effect": "-время",      "duration_sec": 5400,  "price_coins": 120},
-            {"name": "МегаУрожай",    "description": "Повышает выход урожая",         "effect": "+урожай++",   "duration_sec": 10800, "price_coins": 150},
+            {"name": "Азотное",       "description": "Ускоряет вегетацию",           "effect": "+рост",       "duration_sec": 21600,  "price_coins": 30},  # 6 часов, +40%
+            {"name": "Фосфорное",     "description": "Усиливает образование плодов", "effect": "+урожай",     "duration_sec": 21600,  "price_coins": 35},  # 6 часов, +50%
+            {"name": "Калийное",      "description": "Повышает устойчивость",        "effect": "+качество",   "duration_sec": 25200,  "price_coins": 40},  # 7 часов, +редкость
+            {"name": "Комплексное",   "description": "Сбалансированная смесь",       "effect": "+всё",        "duration_sec": 28800, "price_coins": 60},  # 8 часов, +40% урожай +редкость
+            {"name": "Биоактив",      "description": "Органический стимулятор",      "effect": "+био",        "duration_sec": 21600,  "price_coins": 50},  # 6 часов, +45%
+            {"name": "Стимул-Х",      "description": "Мощный стимулятор роста",       "effect": "+рост+кач",   "duration_sec": 25200,  "price_coins": 70},  # 7 часов, +55%
+            {"name": "Минерал+",      "description": "Минеральный комплекс",         "effect": "+качество",   "duration_sec": 25200,  "price_coins": 55},  # 7 часов, +редкость
+            {"name": "Гумат",         "description": "Гуминовый концентрат",          "effect": "+питание",    "duration_sec": 21600,  "price_coins": 45},  # 6 часов, +40%
+            {"name": "СуперРост",     "description": "Сокращает время роста",         "effect": "-время",      "duration_sec": 32400,  "price_coins": 80},  # 9 часов, +60%
+            {"name": "МегаУрожай",    "description": "Повышает выход урожая",         "effect": "+урожай++",   "duration_sec": 43200, "price_coins": 100}, # 12 часов, +60%
         ]
         created = 0
         for d in data:
@@ -1316,13 +1316,72 @@ def get_player_beds(user_id: int) -> list[PlantationBed]:
     try:
         return list(
             dbs.query(PlantationBed)
-            .options(joinedload(PlantationBed.seed_type))
+            .options(joinedload(PlantationBed.seed_type), joinedload(PlantationBed.fertilizer))
             .filter(PlantationBed.owner_id == user_id)
             .order_by(PlantationBed.bed_index.asc())
             .all()
         )
     finally:
         dbs.close()
+
+
+def get_fertilizer_status(bed: PlantationBed) -> dict:
+    """Возвращает информацию о статусе удобрения на грядке.
+    Returns: {active: bool, fertilizer_name: str, time_left: int, multiplier: float, effect_type: str}
+    """
+    result = {
+        'active': False,
+        'fertilizer_name': None,
+        'time_left': 0,
+        'multiplier': 1.0,
+        'effect_type': 'none'
+    }
+    
+    try:
+        if not bed.fertilizer_id or not bed.fertilizer:
+            return result
+            
+        now_ts = int(time.time())
+        f_dur = int(getattr(bed.fertilizer, 'duration_sec', 0) or 0)
+        f_appl = int(getattr(bed, 'fertilizer_applied_at', 0) or 0)
+        
+        if f_dur > 0 and f_appl > 0:
+            time_left = max(0, f_dur - (now_ts - f_appl))
+            if time_left > 0:
+                result['active'] = True
+                result['fertilizer_name'] = getattr(bed.fertilizer, 'name', 'Удобрение')
+                result['time_left'] = time_left
+                
+                # Определяем тип эффекта по названию удобрения
+                fert_name = result['fertilizer_name'].lower()
+                effect = getattr(bed.fertilizer, 'effect', '') or ''
+                
+                if 'урожай++' in effect:
+                    result['multiplier'] = 1.6  # +60%
+                    result['effect_type'] = 'mega_yield'
+                elif 'урожай' in effect:
+                    result['multiplier'] = 1.5  # +50%
+                    result['effect_type'] = 'yield'
+                elif 'качество' in effect:
+                    result['multiplier'] = 1.0  # не влияет на количество, но улучшает редкость
+                    result['effect_type'] = 'quality'
+                elif 'всё' in effect:
+                    result['multiplier'] = 1.4  # +40%
+                    result['effect_type'] = 'complex'
+                elif 'рост+кач' in effect:
+                    result['multiplier'] = 1.55  # +55%
+                    result['effect_type'] = 'growth_quality'
+                elif 'время' in effect:
+                    result['multiplier'] = 1.6  # +60%
+                    result['effect_type'] = 'time'
+                else:
+                    result['multiplier'] = 1.4  # +40% базовые удобрения
+                    result['effect_type'] = 'basic'
+                
+    except Exception:
+        pass
+        
+    return result
 
 
 def _update_bed_ready_if_due(dbs, bed: PlantationBed) -> bool:
@@ -1469,19 +1528,20 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
         # Бонус от удобрения, если активно
         fert_active = False
         fertilizer_name = None
+        fert_effect_type = 'none'
+        fert_multiplier = 1.0
         try:
             if bed.fertilizer_id and bed.fertilizer:
-                f_dur = int(getattr(bed.fertilizer, 'duration_sec', 0) or 0)
-                f_appl = int(getattr(bed, 'fertilizer_applied_at', 0) or 0)
-                fert_active = (f_dur > 0 and f_appl > 0 and (now_ts - f_appl) <= f_dur)
-                try:
-                    fertilizer_name = (getattr(bed.fertilizer, 'name', None) or None)
-                except Exception:
-                    fertilizer_name = None
+                fert_status = get_fertilizer_status(bed)
+                fert_active = fert_status['active']
+                fertilizer_name = fert_status['fertilizer_name']
+                fert_effect_type = fert_status['effect_type']
+                fert_multiplier = fert_status['multiplier']
         except Exception:
             fert_active = False
+        
         if fert_active:
-            yield_mult *= 1.2  # +20% к урожаю
+            yield_mult *= fert_multiplier
         # Штрафы от негативных статусов
         try:
             se = (bed.status_effect or '').strip().lower()
@@ -1508,12 +1568,29 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
                 rarity_weights = {k: float(v) for k, v in RARITIES.items()}
                 # Смещения весов от удобрения и полива
                 if fert_active:
-                    # Слегка усиливаем высокие редкости, уменьшая Basic
-                    if 'Basic' in rarity_weights:
-                        rarity_weights['Basic'] *= 0.9
-                    for rk in ('Medium', 'Elite', 'Absolute', 'Majestic'):
-                        if rk in rarity_weights:
-                            rarity_weights[rk] *= (1.10 if rk == 'Medium' else 1.20)
+                    # Различные эффекты в зависимости от типа удобрения
+                    if fert_effect_type in ('quality', 'complex', 'growth_quality'):
+                        # Усиливаем высокие редкости, снижаем Basic
+                        if 'Basic' in rarity_weights:
+                            rarity_weights['Basic'] *= 0.7
+                        for rk in ('Medium', 'Elite', 'Absolute', 'Majestic'):
+                            if rk in rarity_weights:
+                                multiplier = 1.5 if rk == 'Medium' else 2.0 if rk == 'Elite' else 2.5
+                                rarity_weights[rk] *= multiplier
+                    elif fert_effect_type in ('yield', 'mega_yield', 'time'):
+                        # Меньше влияние на редкость, больше на количество
+                        if 'Basic' in rarity_weights:
+                            rarity_weights['Basic'] *= 0.9
+                        for rk in ('Medium', 'Elite'):
+                            if rk in rarity_weights:
+                                rarity_weights[rk] *= 1.2
+                    else:
+                        # Базовые удобрения
+                        if 'Basic' in rarity_weights:
+                            rarity_weights['Basic'] *= 0.8
+                        for rk in ('Medium', 'Elite'):
+                            if rk in rarity_weights:
+                                rarity_weights[rk] *= 1.3
                 if wc > 0:
                     # Полив чуть усиливает Medium/Elite
                     if 'Medium' in rarity_weights:

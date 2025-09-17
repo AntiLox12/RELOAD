@@ -1417,9 +1417,20 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
             last = int(getattr(b, 'last_watered_at', 0) or 0)
             interval = int(getattr(st, 'water_interval_sec', 0) or 0) if st else 0
             next_water = max(0, interval - (int(time.time()) - last)) if last and interval else 0
+            
+            # Проверяем статус удобрения
+            fert_status = db.get_fertilizer_status(b)
+            
             prog = f"⏳ До созревания: { _fmt_time(remain) }" if remain else "⏳ Проверка готовности…"
             water_info = "💧 Можно поливать" if not next_water else f"💧 Через { _fmt_time(next_water) }"
-            lines.append(f"🌱 Грядка {idx}: Растёт {name}\n{prog}\n{water_info}")
+            
+            # Добавляем информацию об удобрении
+            if fert_status['active']:
+                fert_info = f"🧪 {fert_status['fertilizer_name']}: { _fmt_time(fert_status['time_left']) }"
+            else:
+                fert_info = "🧪 Удобрения нет"
+            
+            lines.append(f"🌱 Грядка {idx}: Растёт {name}\n{prog}\n{water_info}\n{fert_info}")
             actions.append([
                 InlineKeyboardButton(f"💧 Полить {idx}", callback_data=f'plantation_water_{idx}'),
                 InlineKeyboardButton(f"🧪 Удобрить {idx}", callback_data=f'fert_pick_for_bed_{idx}')
