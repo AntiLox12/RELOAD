@@ -142,7 +142,8 @@ async def admin2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /incadd Название | Описание | [да/нет] — создать обычную заявку на добавление без пометок (для проверки модерации).\n"
         "• /inceditdrink <id> <name|description> <new_value> — создать обычную заявку на редактирование.\n"
         "• /incdelrequest <drink_id> [причина] — создать обычную заявку на удаление.\n\n"
-        "• /addcoins <amount> <user_id|@username> — начислить монеты пользователю (только Создатель). Можно ответом: /addcoins <amount>\n\n"
+        "• /addcoins <amount> <user_id|@username> — начислить монеты пользователю (только Создатель). Можно ответом: /addcoins <amount>\n"
+        "• /delmoney <amount> <user_id|@username> — списать монеты у пользователя (только Создатель). Можно ответом: /delmoney <amount>\n\n"
         "— Прочее:\n"
         "• /fullhelp — полная справка по боту.\n"
     )

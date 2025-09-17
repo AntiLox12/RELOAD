@@ -4764,6 +4764,97 @@ async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shown = f"@{target_username}" if target_username else str(target_id)
     await update.message.reply_text(f"✅ Начислено {amount} септимов пользователю {shown}.\nНовый баланс: {new_balance}")
 
+async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delmoney — только для Создателя. Списывает монеты у пользователя по ID или username.
+    Использование:
+    /delmoney <amount> <user_id|@username>
+    или ответом на сообщение: /delmoney <amount>
+    """
+    user = update.effective_user
+    if user.username not in ADMIN_USERNAMES:
+        await update.message.reply_text("Нет прав: команда доступна только Создателю.")
+        return
+
+    args = context.args or []
+    target_id = None
+    target_username = None
+    amount = None
+
+    # Вариант: ответ на сообщение
+    if update.message.reply_to_message:
+        if not args or not args[0].lstrip('+').isdigit():
+            await update.message.reply_text("Использование: ответом на сообщение — /delmoney <amount>")
+            return
+        amount = int(args[0])
+        target_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    else:
+        if len(args) < 2:
+            await update.message.reply_text("Использование: /delmoney <amount> <user_id|@username>")
+            return
+        a, b = args[0], args[1]
+        id_or_username = None
+        if a.lstrip('+').isdigit() and not b.lstrip('+').isdigit():
+            amount = int(a)
+            id_or_username = b
+        elif b.lstrip('+').isdigit() and not a.lstrip('+').isdigit():
+            amount = int(b)
+            id_or_username = a
+        elif a.lstrip('+').isdigit() and b.lstrip('+').isdigit():
+            amount = int(a)
+            id_or_username = b
+        else:
+            await update.message.reply_text("Не удалось распознать аргументы. Использование: /delmoney <amount> <user_id|@username>")
+            return
+        if id_or_username.startswith('@'):
+            target_username = id_or_username[1:]
+        elif id_or_username.isdigit():
+            target_id = int(id_or_username)
+        else:
+            target_username = id_or_username
+
+    if amount is None or amount <= 0:
+        await update.message.reply_text("Сумма должна быть положительным целым числом.")
+        return
+
+    # Разрешение username -> ID, если нужно
+    if target_id is None and target_username:
+        try:
+            chat_obj = await context.bot.get_chat(f"@{target_username}")
+            if getattr(chat_obj, 'id', None):
+                target_id = chat_obj.id
+        except Exception:
+            pass
+        if target_id is None:
+            player = db.get_player_by_username(target_username)
+            if player:
+                target_id = int(player.user_id)
+
+    if target_id is None:
+        await update.message.reply_text("Не удалось определить пользователя по указанному идентификатору/username.")
+        return
+
+    result = db.decrement_coins(target_id, amount)
+    if not result.get('ok'):
+        if result.get('insufficient'):
+            current = result.get('current_balance', 0)
+            requested = result.get('requested_amount', amount)
+            await update.message.reply_text(f"❌ Недостаточно средств у пользователя.\nТекущий баланс: {current} септимов\nЗапрошено: {requested} септимов")
+        else:
+            await update.message.reply_text("Не удалось обновить баланс. Попробуйте позже.")
+        return
+
+    # Аудит-лог (не критично при ошибке)
+    try:
+        db.insert_moderation_log(user.id, 'remove_coins', target_id=target_id, details=f"amount={amount}")
+    except Exception:
+        pass
+
+    shown = f"@{target_username}" if target_username else str(target_id)
+    new_balance = result.get('new_balance', 0)
+    removed_amount = result.get('removed_amount', amount)
+    await update.message.reply_text(f"✅ Списано {removed_amount} септимов у пользователя {shown}.\nНовый баланс: {new_balance}")
+
 async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Добавление отменено.")
     return ConversationHandler.END
@@ -4969,6 +5060,38 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 
+async def show_money_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает таблицу лидеров по деньгам."""
+    money_leaderboard_data = db.get_money_leaderboard()
+    
+    if not money_leaderboard_data:
+        text = "💰 Еще никто не накопил денег. Будь первым!"
+        await update.message.reply_text(text)
+        return
+
+    text = "💰 <b>Таблица лидеров по деньгам:</b>\n\n"
+    
+    medals = {1: '🥇', 2: '🥈', 3: '🥉'}
+    
+    for player_data in money_leaderboard_data:
+        position = player_data['position']
+        username = player_data['username']
+        coins = player_data['coins']
+        user_id = player_data['user_id']
+        
+        medal = medals.get(position, f" {position}.")
+        # Экранируем имя пользователя для HTML
+        safe_username = username.replace('<', '&lt;').replace('>', '&gt;')
+        
+        # Проверяем VIP статус
+        vip_until = db.get_vip_until(user_id)
+        vip_badge = f" {VIP_EMOJI}" if (vip_until and int(time.time()) < int(vip_until)) else ""
+        
+        text += f"{medal} {safe_username}{vip_badge} - <b>{coins:,} септимов</b>\n"
+
+    await update.message.reply_html(text)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет справочное сообщение."""
     user = update.effective_user
@@ -4987,7 +5110,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ⚙️ <b>Настройки</b> — выбор языка и сброс прогресса.\n\n"
         "<b>Команды:</b>\n"
         "/start — показать главное меню.\n"
-        "/leaderboard — таблица лидеров.\n"
+        "/leaderboard — таблица лидеров по энергетикам.\n"
+        "/moneyleaderboard — таблица лидеров по деньгам.\n"
         "/find — быстро найти энергетик (работает и в группах).\n"
         "/myreceipts — ваши последние чеки TG Premium.\n"
         "/myboosts — ваша история автопоиск бустов.\n"
@@ -5460,6 +5584,7 @@ def main():
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, debug_log_commands), group=2)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
+    application.add_handler(CommandHandler("moneyleaderboard", show_money_leaderboard))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("myboosts", myboosts_command))
     application.add_handler(CommandHandler("fullhelp", fullhelp_command))
@@ -5474,6 +5599,7 @@ def main():
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("register", register_command))
     application.add_handler(CommandHandler("addcoins", addcoins_command))
+    application.add_handler(CommandHandler("delmoney", delmoney_command))
     application.add_handler(CommandHandler("myreceipts", myreceipts_command))
     application.add_handler(CommandHandler("receipt", receipt_command))
     application.add_handler(CommandHandler("verifyreceipt", verifyreceipt_command))

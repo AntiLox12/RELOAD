@@ -2142,6 +2142,50 @@ def increment_coins(user_id: int, amount: int) -> int | None:
     finally:
         db.close()
 
+def decrement_coins(user_id: int, amount: int) -> dict:
+    """Уменьшает баланс монет игрока на amount. Не позволяет балансу стать отрицательным.
+    Возвращает dict: {ok: bool, reason?: str, new_balance?: int, insufficient?: bool}
+    """
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=user_id, username=str(user_id), coins=0)
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+        
+        current = int(player.coins or 0)
+        amount_to_remove = int(amount)
+        
+        if current < amount_to_remove:
+            return {
+                "ok": False,
+                "reason": "insufficient_funds",
+                "current_balance": current,
+                "requested_amount": amount_to_remove,
+                "insufficient": True
+            }
+        
+        player.coins = current - amount_to_remove
+        db.commit()
+        return {
+            "ok": True,
+            "new_balance": int(player.coins),
+            "removed_amount": amount_to_remove
+        }
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "reason": "exception"
+        }
+    finally:
+        db.close()
+
 def get_all_drinks():
     """Возвращает список всех существующих энергетиков."""
     db = SessionLocal()
@@ -3381,5 +3425,39 @@ def get_ready_silk_plantations() -> list[SilkPlantation]:
             .filter(SilkPlantation.status == 'ready')
             .all()
         )
+    finally:
+        dbs.close()
+
+def get_money_leaderboard(limit: int = 10) -> list[dict]:
+    """Получить топ игроков по количеству денег.
+    
+    Args:
+        limit: Количество игроков в топе (по умолчанию 10)
+        
+    Returns:
+        Список словарей с данными игроков: {'user_id', 'username', 'coins', 'position'}
+    """
+    dbs = SessionLocal()
+    try:
+        players = (
+            dbs.query(Player)
+            .filter(Player.coins > 0)
+            .order_by(Player.coins.desc())
+            .limit(limit)
+            .all()
+        )
+        
+        result = []
+        for position, player in enumerate(players, 1):
+            result.append({
+                'user_id': player.user_id,
+                'username': player.username or 'Неизвестный игрок',
+                'coins': player.coins,
+                'position': position
+            })
+        
+        return result
+    except Exception:
+        return []
     finally:
         dbs.close()
