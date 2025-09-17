@@ -971,6 +971,114 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(stats_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
+async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает инвентарь игрока с сортировкой по количеству (для Приёмника)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    inventory_items = db.get_player_inventory_with_details(user_id)
+
+    # Определяем страницу из callback_data: receiver_qty_p{num}
+    page = 1
+    try:
+        if query.data and query.data.startswith('receiver_qty_p'):
+            page = int(query.data.removeprefix('receiver_qty_p'))
+    except Exception:
+        page = 1
+    if page < 1:
+        page = 1
+
+    # Если пусто
+    if not inventory_items:
+        inventory_text = "Твой инвентарь пуст. Пора на поиски!"
+        keyboard_rows = []
+        total_pages = 1
+    else:
+        # Сортировка по количеству (от большего к меньшему) и пагинация
+        sorted_items = sorted(
+            inventory_items,
+            key=lambda i: (-i.quantity, i.drink.name.lower()),  # Сначала по количеству (убывание), потом по имени
+        )
+        total_items = len(sorted_items)
+        total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if page > total_pages:
+            page = total_pages
+        start_idx = (page - 1) * ITEMS_PER_PAGE
+        end_idx = start_idx + ITEMS_PER_PAGE
+        page_items = sorted_items[start_idx:end_idx]
+
+        # Текст с учетом страницы
+        inventory_text = (
+            f"<b>♻️ Приёмник: Инвентарь по количеству</b>\n"
+            f"📎 Отсортировано по убыванию количества\n"
+            f"Страница {page}/{total_pages}\n\n"
+        )
+        
+        for item in page_items:
+            rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
+            # Вычисляем стоимость продажи
+            unit_payout = int(RECEIVER_PRICES.get(item.rarity, 0) * (1.0 - RECEIVER_COMMISSION))
+            total_value = unit_payout * item.quantity
+            inventory_text += f"{rarity_emoji} <b>{item.drink.name}</b> — {item.quantity} шт. (~{total_value} монет)\n"
+
+        # Клавиатура с кнопками предметов (2 в строке)
+        keyboard_rows = []
+        current_row = []
+        for item in page_items:
+            btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {item.drink.name} ({item.quantity})"
+            callback = f"view_{item.id}"
+            current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
+            if len(current_row) == 2:
+                keyboard_rows.append(current_row)
+                current_row = []
+        if current_row:
+            keyboard_rows.append(current_row)
+
+    # Пагинация (кнопки навигации)
+    if total_pages > 1:
+        prev_page = max(1, page - 1)
+        next_page = min(total_pages, page + 1)
+        keyboard_rows.append([
+            InlineKeyboardButton("⬅️", callback_data=f"receiver_qty_p{prev_page}" if page > 1 else 'noop'),
+            InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
+            InlineKeyboardButton("➡️", callback_data=f"receiver_qty_p{next_page}" if page < total_pages else 'noop'),
+        ])
+
+    # Кнопки назад
+    keyboard_rows.append([
+        InlineKeyboardButton("📋 Обычный инвентарь", callback_data='inventory'),
+        InlineKeyboardButton("♻️ К Приёмнику", callback_data='market_receiver')
+    ])
+    keyboard_rows.append([InlineKeyboardButton("🔙 В меню", callback_data='menu')])
+    reply_markup = InlineKeyboardMarkup(keyboard_rows)
+
+    message = query.message
+    # Если текущий месседж содержит медиа, удаляем и отправляем новое
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=inventory_text,
+            reply_markup=reply_markup,
+            parse_mode='HTML'
+        )
+    else:
+        try:
+            await query.edit_message_text(inventory_text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            # На случай, если нельзя отредактировать (например, старое сообщение)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=inventory_text,
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+
+
 async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает подробности конкретного напитка из инвентаря."""
     query = update.callback_query
@@ -1021,7 +1129,7 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
                     callback_data=f"sellallbutone_{inventory_item.id}"
                 )
             ])
-    rows.append([InlineKeyboardButton("🔙 Назад", callback_data='inventory')])
+    rows.append([InlineKeyboardButton("🔙 Назад к инвентарю", callback_data='inventory')])
     keyboard = InlineKeyboardMarkup(rows)
 
     image_full_path = os.path.join(ENERGY_IMAGES_DIR, drink.image_path) if drink.image_path else None
@@ -2606,6 +2714,7 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard = [
         [InlineKeyboardButton("📦 Открыть инвентарь", callback_data='inventory')],
+        [InlineKeyboardButton("📊 По количеству", callback_data='receiver_by_quantity')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
@@ -3375,6 +3484,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('inventory_p'):
         # Пагинация инвентаря
         await show_inventory(update, context)
+    elif data.startswith('receiver_qty_p'):
+        # Пагинация инвентаря по количеству для Приёмника
+        await show_inventory_by_quantity(update, context)
     elif data == 'stats':
         await show_stats(update, context)
     elif data == 'extra_bonuses':
@@ -3414,6 +3526,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_market_shop(update, context)
     elif data == 'market_receiver':
         await show_market_receiver(update, context)
+    elif data == 'receiver_by_quantity':
+        await show_inventory_by_quantity(update, context)
     elif data == 'market_plantation':
         await show_market_plantation(update, context)
     elif data.startswith('shop_p_'):
