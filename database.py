@@ -28,6 +28,7 @@ class Player(Base):
     language = Column(String, default='ru')
     remind = Column(Boolean, default=False)
     vip_until = Column(Integer, default=0)
+    vip_plus_until = Column(Integer, default=0)  # VIP+ статус
     tg_premium_until = Column(Integer, default=0)
     # --- VIP автопоиск ---
     auto_search_enabled = Column(Boolean, default=False)
@@ -1691,7 +1692,7 @@ def get_players_with_auto_search_enabled() -> list[Player]:
 def get_auto_search_daily_limit(user_id: int) -> int:
     """
     Возвращает дневной лимит автопоиска для пользователя.
-    Базовый лимит + активный буст (если не истёк).
+    Базовый лимит + VIP+ удвоение + активный буст (если не истёк).
     """
     from constants import AUTO_SEARCH_DAILY_LIMIT
     dbs = SessionLocal()
@@ -1701,6 +1702,11 @@ def get_auto_search_daily_limit(user_id: int) -> int:
             return int(AUTO_SEARCH_DAILY_LIMIT)
         
         base_limit = int(AUTO_SEARCH_DAILY_LIMIT)
+        
+        # Проверяем VIP+ статус (удваивает базовый лимит)
+        if is_vip_plus(user_id):
+            base_limit *= 2
+        
         boost_count = int(getattr(player, 'auto_search_boost_count', 0) or 0)
         boost_until = int(getattr(player, 'auto_search_boost_until', 0) or 0)
         
@@ -2268,6 +2274,7 @@ def get_leaderboard(limit: int = 10):
                 Player.username,
                 func.sum(InventoryItem.quantity).label('total_drinks'),
                 Player.vip_until,
+                Player.vip_plus_until,
             )
             .join(InventoryItem, Player.user_id == InventoryItem.player_id)
             .group_by(Player.user_id)
@@ -2469,6 +2476,8 @@ def ensure_schema():
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN last_add INTEGER DEFAULT 0")
         if 'vip_until' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN vip_until INTEGER DEFAULT 0")
+        if 'vip_plus_until' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN vip_plus_until INTEGER DEFAULT 0")
         if 'tg_premium_until' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN tg_premium_until INTEGER DEFAULT 0")
         # Автопоиск VIP
@@ -2691,11 +2700,32 @@ def get_vip_until(user_id: int) -> int:
     finally:
         db.close()
 
+def get_vip_plus_until(user_id: int) -> int:
+    """Возвращает Unix-время истечения VIP+ (или 0/None)."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        return int(getattr(player, 'vip_plus_until', 0) or 0) if player else 0
+    finally:
+        db.close()
+
 def is_vip(user_id: int) -> bool:
-    """Возвращает True, если VIP активен на текущий момент."""
+    """Возвращает True, если VIP или VIP+ активен на текущий момент."""
     try:
         vip_ts = get_vip_until(user_id)
-        return bool(vip_ts and int(time.time()) < int(vip_ts))
+        vip_plus_ts = get_vip_plus_until(user_id)
+        import time
+        current_time = int(time.time())
+        return bool((vip_ts and current_time < int(vip_ts)) or (vip_plus_ts and current_time < int(vip_plus_ts)))
+    except Exception:
+        return False
+
+def is_vip_plus(user_id: int) -> bool:
+    """Возвращает True, если VIP+ активен на текущий момент."""
+    try:
+        vip_plus_ts = get_vip_plus_until(user_id)
+        import time
+        return bool(vip_plus_ts and int(time.time()) < int(vip_plus_ts))
     except Exception:
         return False
 
@@ -2731,6 +2761,47 @@ def purchase_vip(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
             pass
         db.commit()
         return {"ok": True, "vip_until": new_vip_until, "coins_left": int(player.coins)}
+    except Exception as ex:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        db.close()
+
+def purchase_vip_plus(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
+    """
+    Списывает монеты и устанавливает/продлевает VIP+.
+    Возвращает dict: {ok: bool, reason?: str, vip_plus_until?: int, coins_left?: int}
+    """
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            # Автосоздание игрока при редком коллизии
+            player = Player(user_id=user_id, username=str(user_id))
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        current_coins = int(player.coins or 0)
+        if current_coins < cost_coins:
+            return {"ok": False, "reason": "not_enough_coins"}
+
+        now_ts = int(time.time())
+        base_ts = int(player.vip_plus_until or 0)
+        start_ts = base_ts if base_ts and base_ts > now_ts else now_ts
+        new_vip_plus_until = start_ts + int(duration_seconds)
+
+        player.coins = current_coins - int(cost_coins)
+        try:
+            player.vip_plus_until = new_vip_plus_until
+        except Exception:
+            # На случай старой схемы без столбца
+            pass
+        db.commit()
+        return {"ok": True, "vip_plus_until": new_vip_plus_until, "coins_left": int(player.coins)}
     except Exception as ex:
         try:
             db.rollback()

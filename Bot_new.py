@@ -42,6 +42,13 @@ from admin2 import (
     booststats_command,
     boosthistory_command,
 )
+from vip_plus_handlers import (
+    show_vip_plus_menu,
+    show_vip_plus_1d,
+    show_vip_plus_7d,
+    show_vip_plus_30d,
+    buy_vip_plus,
+)
 from constants import (
     SEARCH_COOLDOWN,
     DAILY_BONUS_COOLDOWN,
@@ -53,6 +60,9 @@ from constants import (
     VIP_EMOJI,
     VIP_COSTS,
     VIP_DURATIONS_SEC,
+    VIP_PLUS_EMOJI,
+    VIP_PLUS_COSTS,
+    VIP_PLUS_DURATIONS_SEC,
     TG_PREMIUM_COST,
     TG_PREMIUM_DURATION_SEC,
     ADMIN_USERNAMES,
@@ -227,6 +237,36 @@ TEXTS = {
     'vip_auto_header': {'ru': '\n<b>🤖 Автопоиск</b>', 'en': '\n<b>🤖 Auto-search</b>'},
     'vip_auto_state': {'ru': 'Состояние: {state}', 'en': 'State: {state}'},
     'vip_auto_today': {'ru': 'Сегодня: {count}/{limit}', 'en': 'Today: {count}/{limit}'},
+    # --- VIP+ submenu ---
+    'vip_plus': {'ru': 'V.I.P+', 'en': 'V.I.P+'},
+    'vip_plus_title': {
+        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)',
+        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)'
+    },
+    'vip_plus_1d': {'ru': '1 День', 'en': '1 Day'},
+    'vip_plus_7d': {'ru': '7 дней', 'en': '7 days'},
+    'vip_plus_30d': {'ru': '30 дней', 'en': '30 days'},
+    'vip_plus_details_1d': {
+        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+    },
+    'vip_plus_details_7d': {
+        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+    },
+    'vip_plus_details_30d': {
+        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+    },
+    'vip_plus_buy': {'ru': 'Купить', 'en': 'Buy'},
+    'vip_plus_price': {'ru': 'Цена: {cost} септимов', 'en': 'Price: {cost} septims'},
+    'vip_plus_until': {'ru': 'V.I.P+ активен до: {dt}', 'en': 'V.I.P+ active until: {dt}'},
+    'vip_plus_not_enough': {'ru': 'Недостаточно монет.', 'en': 'Not enough coins.'},
+    'vip_plus_bought': {'ru': 'Покупка успешна! {emoji} До: {dt}\nБаланс: {coins}', 'en': 'Purchased! {emoji} Until: {dt}\nBalance: {coins}'},
+    'vip_plus_insufficient': {
+        'ru': '❗ Недостаточно монет: {coins}/{cost}',
+        'en': '❗ Not enough coins: {coins}/{cost}'
+    },
     # --- Stars submenu ---
     'stars': {'ru': '⭐ Звезды', 'en': '⭐ Stars'},
     'stars_title': {'ru': 'Выберите пакет звёзд:', 'en': 'Choose a stars pack:'},
@@ -922,11 +962,20 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # VIP статус
     vip_ts = db.get_vip_until(user_id)
+    vip_plus_ts = db.get_vip_plus_until(user_id)
     vip_active = bool(vip_ts and time.time() < vip_ts)
-    vip_line = (
-        f"{VIP_EMOJI} V.I.P до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_ts))}\n"
-        if vip_active else f"{VIP_EMOJI} V.I.P: нет\n"
-    )
+    vip_plus_active = bool(vip_plus_ts and time.time() < vip_plus_ts)
+    
+    if vip_plus_active:
+        vip_line = (
+            f"{VIP_PLUS_EMOJI} V.I.P+ до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_plus_ts))}\n"
+        )
+    elif vip_active:
+        vip_line = (
+            f"{VIP_EMOJI} V.I.P до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_ts))}\n"
+        )
+    else:
+        vip_line = f"{VIP_EMOJI} V.I.P: нет\n"
 
     stats_text = (
         f"<b>📊 Твоя статистика:</b>\n\n"
@@ -1284,6 +1333,8 @@ async def show_extra_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard.append([InlineKeyboardButton(t(lang, 'steam_game_500'), callback_data='bonus_steam_game')])
     # VIP доступен всегда
     keyboard.append([InlineKeyboardButton(t(lang, 'vip'), callback_data='vip_menu')])
+    # VIP+ доступен всегда
+    keyboard.append([InlineKeyboardButton(t(lang, 'vip_plus'), callback_data='vip_plus_menu')])
     # Показываем Звёзды, если есть остаток
     if stars_stock > 0:
         keyboard.append([InlineKeyboardButton(t(lang, 'stars'), callback_data='stars_menu')])
@@ -3680,18 +3731,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await buy_steam_game(update, context)
     elif data == 'vip_menu':
         await show_vip_menu(update, context)
+    elif data == 'vip_plus_menu':
+        await show_vip_plus_menu(update, context)
     elif data == 'vip_1d':
         await show_vip_1d(update, context)
     elif data == 'vip_7d':
         await show_vip_7d(update, context)
     elif data == 'vip_30d':
         await show_vip_30d(update, context)
+    elif data == 'vip_plus_1d':
+        await show_vip_plus_1d(update, context)
+    elif data == 'vip_plus_7d':
+        await show_vip_plus_7d(update, context)
+    elif data == 'vip_plus_30d':
+        await show_vip_plus_30d(update, context)
     elif data == 'buy_vip_1d':
         await buy_vip(update, context, '1d')
     elif data == 'buy_vip_7d':
         await buy_vip(update, context, '7d')
     elif data == 'buy_vip_30d':
         await buy_vip(update, context, '30d')
+    elif data == 'buy_vip_plus_1d':
+        await buy_vip_plus(update, context, '1d')
+    elif data == 'buy_vip_plus_7d':
+        await buy_vip_plus(update, context, '7d')
+    elif data == 'buy_vip_plus_30d':
+        await buy_vip_plus(update, context, '30d')
     elif data == 'stars_menu':
         await show_stars_menu(update, context)
     elif data == 'stars_500':
@@ -5049,12 +5114,24 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     medals = {0: '🥇', 1: '🥈', 2: '🥉'}
     
-    for i, (user_id, username, total_drinks, vip_until) in enumerate(leaderboard_data):
+    for i, (user_id, username, total_drinks, vip_until, vip_plus_until) in enumerate(leaderboard_data):
         place = i + 1
         medal = medals.get(i, f" {place}.")
         # Экранируем имя пользователя для HTML
         safe_username = username.replace('<', '&lt;').replace('>', '&gt;')
-        vip_badge = f" {VIP_EMOJI}" if (vip_until and int(time.time()) < int(vip_until)) else ""
+        
+        # Проверяем VIP статус с приоритетом VIP+
+        current_time = int(time.time())
+        vip_plus_active = vip_plus_until and current_time < vip_plus_until
+        vip_active = vip_until and current_time < vip_until
+        
+        if vip_plus_active:
+            vip_badge = f" {VIP_PLUS_EMOJI}"
+        elif vip_active:
+            vip_badge = f" {VIP_EMOJI}"
+        else:
+            vip_badge = ""
+            
         text += f"{medal} {safe_username}{vip_badge} - <b>{total_drinks} шт.</b>\n"
 
     await update.message.reply_html(text)
@@ -5085,7 +5162,17 @@ async def show_money_leaderboard(update: Update, context: ContextTypes.DEFAULT_T
         
         # Проверяем VIP статус
         vip_until = db.get_vip_until(user_id)
-        vip_badge = f" {VIP_EMOJI}" if (vip_until and int(time.time()) < int(vip_until)) else ""
+        vip_plus_until = db.get_vip_plus_until(user_id)
+        current_time = int(time.time())
+        vip_plus_active = vip_plus_until and current_time < vip_plus_until
+        vip_active = vip_until and current_time < vip_until
+        
+        if vip_plus_active:
+            vip_badge = f" {VIP_PLUS_EMOJI}"
+        elif vip_active:
+            vip_badge = f" {VIP_EMOJI}"
+        else:
+            vip_badge = ""
         
         text += f"{medal} {safe_username}{vip_badge} - <b>{coins:,} септимов</b>\n"
 
