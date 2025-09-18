@@ -897,14 +897,17 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if current_row:
             keyboard_rows.append(current_row)
 
-    # Пагинация (кнопки навигации)
+    # Пагинация (кнопки навигации) с циклической навигацией
     if total_pages > 1:
-        prev_page = max(1, page - 1)
-        next_page = min(total_pages, page + 1)
+        # Циклическая навигация: с первой страницы предыдущая - это последняя
+        prev_page = total_pages if page == 1 else page - 1
+        # Циклическая навигация: с последней страницы следующая - это первая
+        next_page = 1 if page == total_pages else page + 1
+        
         keyboard_rows.append([
-            InlineKeyboardButton("⬅️", callback_data=f"inventory_p{prev_page}" if page > 1 else 'noop'),
+            InlineKeyboardButton("⬅️", callback_data=f"inventory_p{prev_page}"),
             InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
-            InlineKeyboardButton("➡️", callback_data=f"inventory_p{next_page}" if page < total_pages else 'noop'),
+            InlineKeyboardButton("➡️", callback_data=f"inventory_p{next_page}"),
         ])
 
     # Кнопка назад в меню
@@ -1084,14 +1087,17 @@ async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAU
         if current_row:
             keyboard_rows.append(current_row)
 
-    # Пагинация (кнопки навигации)
+    # Пагинация (кнопки навигации) с циклической навигацией
     if total_pages > 1:
-        prev_page = max(1, page - 1)
-        next_page = min(total_pages, page + 1)
+        # Циклическая навигация: с первой страницы предыдущая - это последняя
+        prev_page = total_pages if page == 1 else page - 1
+        # Циклическая навигация: с последней страницы следующая - это первая
+        next_page = 1 if page == total_pages else page + 1
+        
         keyboard_rows.append([
-            InlineKeyboardButton("⬅️", callback_data=f"receiver_qty_p{prev_page}" if page > 1 else 'noop'),
+            InlineKeyboardButton("⬅️", callback_data=f"receiver_qty_p{prev_page}"),
             InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
-            InlineKeyboardButton("➡️", callback_data=f"receiver_qty_p{next_page}" if page < total_pages else 'noop'),
+            InlineKeyboardButton("➡️", callback_data=f"receiver_qty_p{next_page}"),
         ])
 
     # Кнопки назад
