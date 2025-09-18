@@ -9,6 +9,13 @@
 - [constants.py](file://constants.py)
 </cite>
 
+## Update Summary
+**Changes Made**   
+- No significant changes required to the documentation based on the provided commit analysis
+- The commits `4` and `5` updated administrative rules in the Biba rules documentation, specifically adding new task management guidelines and Russian language instructions, but these changes do not affect the content moderation workflow for energy drinks
+- All existing sections remain accurate and up-to-date
+- No new sections were added as the changes do not impact the documented workflow
+
 ## Table of Contents
 1. [Introduction](#introduction)
 2. [Submission Process](#submission-process)
@@ -46,10 +53,6 @@ AddDirectly --> End([Energy Drink Added])
 CreatePending --> End
 ReturnError --> End
 ```
-
-**Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L4141-L4171)
-- [database.py](file://database.py#L2573-L2604)
 
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L4141-L4171)
@@ -95,10 +98,6 @@ AdminUser --> ModerationLog : "creates"
 PendingAddition --> ModerationLog : "triggers"
 ```
 
-**Diagram sources**
-- [admin.py](file://admin.py#L1-L184)
-- [database.py](file://database.py#L74-L101)
-
 **Section sources**
 - [admin.py](file://admin.py#L1-L184)
 - [database.py](file://database.py#L74-L101)
@@ -132,10 +131,6 @@ reviewed_at, review_reason
 end note
 ```
 
-**Diagram sources**
-- [database.py](file://database.py#L2606-L2653)
-- [database.py](file://database.py#L2573-L2604)
-
 **Section sources**
 - [database.py](file://database.py#L2606-L2653)
 - [database.py](file://database.py#L2573-L2604)
@@ -157,10 +152,6 @@ Bot->>User : Send approval/rejection notice
 Bot->>Admins : Broadcast moderation decision
 Bot->>Bot : Log action in database
 ```
-
-**Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L4257-L4270)
-- [Bot_new.py](file://Bot_new.py#L4310-L4335)
 
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L4257-L4270)

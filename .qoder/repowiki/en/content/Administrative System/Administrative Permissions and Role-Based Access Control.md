@@ -6,7 +6,16 @@
 - [admin2.py](file://admin2.py)
 - [database.py](file://database.py)
 - [constants.py](file://constants.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit c3085cc*
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added new section for `/delmoney` command and money leaderboard functionality
+- Updated command access restrictions to include new Creator-only command
+- Enhanced security considerations with new financial operation risks
+- Added practical examples for new financial commands
+- Updated section sources to reflect changes in Bot_new.py
 
 ## Table of Contents
 1. [Introduction](#introduction)
@@ -103,11 +112,14 @@ end
 
 ## Command Access Restrictions by Role
 
-Administrative commands are meticulously restricted based on user roles, ensuring that sensitive operations are only accessible to appropriately privileged users. The `/admin` command provides a dynamic help menu that displays only the commands the user is authorized to use. Basic commands like `/admin list`, `/requests`, `/add`, `/delrequest`, and `/editdrink` are available to all administrators (Levels 1-3) and the Creator. Commands for managing other administrators (`/admin add`, `/admin remove`, `/admin level`) are restricted to the Creator and Level 3 administrators only. In `admin2.py`, the `/admin2` command and its associated suite of privileged commands (e.g., `/receipt`, `/verifyreceipt`, `/stock`, `/tgstock`, `/addvip`, `/addautosearch`) are exclusively available to the Creator and Level 3 administrators. Some commands, like `/addvip` and `/addautosearch`, have additional logic to apply changes to all users, further emphasizing the power delegated to these top-tier roles. This granular restriction ensures that the principle of least privilege is upheld throughout the system.
+Administrative commands are meticulously restricted based on user roles, ensuring that sensitive operations are only accessible to appropriately privileged users. The `/admin` command provides a dynamic help menu that displays only the commands the user is authorized to use. Basic commands like `/admin list`, `/requests`, `/add`, `/delrequest`, and `/editdrink` are available to all administrators (Levels 1-3) and the Creator. Commands for managing other administrators (`/admin add`, `/admin remove`, `/admin level`) are restricted to the Creator and Level 3 administrators only. In `admin2.py`, the `/admin2` command and its associated suite of privileged commands (e.g., `/receipt`, `/verifyreceipt`, `/stock`, `/tgstock`, `/addvip`, `/addautosearch`) are exclusively available to the Creator and Level 3 administrators. Some commands, like `/addvip` and `/addautosearch`, have additional logic to apply changes to all users, further emphasizing the power delegated to these top-tier roles. 
+
+The system has been recently enhanced with financial management capabilities. The new `/delmoney` command, implemented in `Bot_new.py`, allows the Creator to deduct coins from user accounts. This command follows the same strict permission model, being available only to users whose usernames are listed in the `ADMIN_USERNAMES` constant. The command supports flexible input methods, including direct user ID specification or reply-based invocation, and includes comprehensive input validation to prevent abuse.
 
 **Section sources**
 - [admin.py](file://admin.py#L1-L184)
 - [admin2.py](file://admin2.py#L1-L771)
+- [Bot_new.py](file://Bot_new.py#L4763-L4859) - *Updated in recent commit*
 
 ## Database Schema and AdminUser Model
 
@@ -142,14 +154,19 @@ The RBAC system integrates with the `constants.py` module to define bootstrap ad
 
 The RBAC implementation incorporates several key security principles to protect the system from unauthorized access and privilege escalation. The most critical is **privilege separation**, which ensures that no single administrator (except the Creator) has complete control over the system. For example, while a Level 3 administrator can manage other admins, they cannot directly modify the `ADMIN_USERNAMES` constant. The system also employs **defense in depth** by combining database checks with configuration checks for the highest privileges. **Input validation** is performed on all command arguments, such as ensuring user IDs are integers and levels are within the valid range (1-3). The system avoids storing sensitive information like passwords, relying instead on Telegram's user ID and username for authentication. A significant security consideration is the reliance on username matching for the Creator role; if a malicious user changes their username to match one in `ADMIN_USERNAMES`, they could gain elevated privileges. This risk is mitigated by the fact that the Creator role is intended for a small, trusted group, and the username is a relatively stable identifier on Telegram.
 
+The recent addition of financial commands like `/delmoney` introduces new security considerations. These operations are irreversible and affect user balances, making them high-risk. The implementation includes multiple safeguards: the command is restricted to the Creator role only, requires explicit amount specification, and performs balance validation to prevent overdrafts. Additionally, all financial operations are logged in the moderation log system, providing an audit trail for these sensitive actions. The system also implements transactional integrity, ensuring that balance updates and logging occur atomically to prevent data inconsistency.
+
 **Section sources**
 - [admin.py](file://admin.py#L1-L184)
 - [admin2.py](file://admin2.py#L1-L771)
 - [constants.py](file://constants.py#L1-L75)
+- [Bot_new.py](file://Bot_new.py#L4763-L4859) - *Updated in recent commit*
 
 ## Audit Logging and Moderation Logs
 
 The system includes a robust audit logging mechanism to track all administrative actions, providing accountability and a trail for forensic analysis. The `ModerationLog` model in `database.py` records key events such as `admin_add`, `admin_remove`, `admin_level_change`, `approve_add`, `reject_add`, and `create_edit_request`. Each log entry captures the timestamp (`ts`), the actor's user ID (`actor_id`), the action performed (`action`), and optional details (`details`) such as the target user ID or the new level assigned. These logs are inserted into the database within try-except blocks in the command handlers (e.g., in `admin.py` after `add_admin_user()` or `set_admin_level()`), ensuring that the primary operation is not blocked by a logging failure. This design provides a reliable record of administrative activity, which is crucial for maintaining trust and security in a multi-administrator environment. The logs can be used to review past decisions, identify potential misuse, and understand the history of changes to the system.
+
+Financial operations are also included in the audit trail. The `/delmoney` command logs each balance deduction in the moderation log with details about the amount removed and the target user, ensuring complete transparency for these sensitive operations. This comprehensive logging approach enables administrators to track all changes to user balances and investigate any suspicious activity.
 
 **Section sources**
 - [admin.py](file://admin.py#L1-L184)
@@ -167,9 +184,12 @@ Adding and modifying administrative roles is a privileged operation restricted t
 
 Practical examples of the RBAC system in action include the use of the `/admin` command to list all administrators, where the output is dynamically filtered and sorted based on the viewer's role. A Level 1 administrator will see a list of admins but will not have the option to add or remove them. In contrast, a Level 3 administrator will see the full management commands in the help text. Another example is the `/addautosearch` command in `admin2.py`, which can only be executed by the Creator or a Level 3 administrator. This command allows granting temporary boosts to users' daily search limits, a powerful feature that could be abused if available to lower-level admins. The command includes comprehensive input validation, checking that the count and days are positive integers, and provides detailed feedback upon success or failure. The system also demonstrates safe modification practices by using database transactions and rollback mechanisms in functions like `addvip_command`, ensuring data consistency even if an error occurs during batch operations.
 
+The new `/delmoney` command provides a practical example of financial operation security. When a Creator executes `/delmoney 1000 @username`, the system first verifies the user's Creator status through username matching against `ADMIN_USERNAMES`. It then validates that the amount is a positive integer and that the target user exists in the database. Before deducting the coins, the system checks that the user has sufficient balance to prevent overdrafts. Upon successful execution, the system updates the user's balance, logs the transaction in the moderation log, and provides confirmation to the administrator. This end-to-end process demonstrates the integration of permission checks, input validation, data integrity, and audit logging in a single command.
+
 **Section sources**
 - [admin.py](file://admin.py#L1-L184)
 - [admin2.py](file://admin2.py#L1-L771)
+- [Bot_new.py](file://Bot_new.py#L4763-L4859) - *Updated in recent commit*
 
 ## Conclusion
 

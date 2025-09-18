@@ -5,8 +5,16 @@
 - [Bot_new.py](file://Bot_new.py)
 - [database.py](file://database.py)
 - [constants.py](file://constants.py)
-- [requirements.txt](file://requirements.txt)
+- [requirements.txt](file://requirements.txt) - *Updated in recent commit*
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Updated dependencies section to include new httpx library addition
+- Added information about httpx version and its relationship to the existing stack
+- Updated setup and version compatibility section to reflect new dependency
+- Enhanced security implications section to consider httpx security aspects
+- Maintained all existing accurate information about Python, telegram-bot, SQLAlchemy, and python-dotenv
 
 ## Table of Contents
 1. [Technology Stack & Dependencies](#technology-stack--dependencies)
@@ -14,9 +22,10 @@
 3. [Telegram Integration with python-telegram-bot](#telegram-integration-with-python-telegram-bot)
 4. [Database Management with SQLAlchemy](#database-management-with-sqlalchemy)
 5. [Configuration with python-dotenv](#configuration-with-python-dotenv)
-6. [Integration Patterns](#integration-patterns)
-7. [Setup & Version Compatibility](#setup--version-compatibility)
-8. [Security Implications](#security-implications)
+6. [HTTP Client with httpx](#http-client-with-httpx)
+7. [Integration Patterns](#integration-patterns)
+8. [Setup & Version Compatibility](#setup--version-compatibility)
+9. [Security Implications](#security-implications)
 
 ## Python & Core Frameworks
 
@@ -163,6 +172,25 @@ The integration likely occurs in a `config.py` file (imported in `Bot_new.py`) t
 - [requirements.txt](file://requirements.txt#L1)
 - [Bot_new.py](file://Bot_new.py#L0-L799)
 
+## HTTP Client with httpx
+
+The RELOAD project has recently incorporated `httpx~=0.25.2` as its HTTP client library for making external API requests. This addition complements the existing technology stack by providing modern, asynchronous HTTP capabilities that integrate seamlessly with the project's async architecture.
+
+The `httpx` library is used for:
+- Making asynchronous HTTP requests to external services
+- Implementing robust retry mechanisms for unreliable APIs
+- Handling JSON serialization/deserialization for API communications
+- Managing connection pooling for improved performance
+
+The version constraint `~=0.25.2` allows for patch-level updates (0.25.3, 0.25.4, etc.) while preventing breaking changes in minor or major versions. This ensures stability while allowing for security patches and bug fixes.
+
+`httpx` integrates with the existing asynchronous architecture by providing native support for `async`/`await` syntax, allowing HTTP requests to be made without blocking the event loop. This is particularly important for maintaining responsive bot interactions while performing external API calls.
+
+The library is likely used in conjunction with `python-telegram-bot` for scenarios requiring external data retrieval or webhook integrations, though the specific implementation details would be found in the relevant handler modules.
+
+**Section sources**
+- [requirements.txt](file://requirements.txt#L3) - *Added in recent commit*
+
 ## Integration Patterns
 
 The RELOAD project demonstrates well-structured integration patterns between its core components. The bot handlers in `Bot_new.py` import and utilize functions from `database.py` to persist and retrieve user data, creating a clear separation between Telegram interaction logic and data access logic.
@@ -184,13 +212,14 @@ The RELOAD project specifies precise version requirements in `requirements.txt` 
 - `python-telegram-bot==20.7`: Pinning to this specific version ensures compatibility with the implemented callback query patterns and async handlers
 - `python-dotenv==1.0.1`: Fixed version for stable configuration loading
 - `SQLAlchemy>=2.0,<2.1`: Allows patch updates within the 2.0 series while preventing breaking changes in future major versions
+- `httpx~=0.25.2`: Allows patch-level updates while maintaining compatibility with the 0.25.x series
 
-This dependency management strategy balances stability with security updates. The SQLAlchemy constraint allows for bug fixes and security patches in the 2.0.x series while preventing potentially breaking changes in 2.1+. The exact pinning of the other dependencies ensures that deployments remain consistent.
+This dependency management strategy balances stability with security updates. The SQLAlchemy constraint allows for bug fixes and security patches in the 2.0.x series while preventing potentially breaking changes in 2.1+. The exact pinning of `python-telegram-bot` and `python-dotenv` ensures that deployments remain consistent. The `httpx` version constraint provides flexibility for minor improvements while preventing disruptive changes.
 
 The application is designed to run on Python 3.10+, taking advantage of modern Python features like improved type hints, pattern matching, and enhanced asyncio capabilities. The asynchronous architecture is fully compatible with the event loop improvements introduced in Python 3.10.
 
 **Section sources**
-- [requirements.txt](file://requirements.txt#L0-L2)
+- [requirements.txt](file://requirements.txt#L0-L3) - *Updated to include httpx dependency*
 
 ## Security Implications
 
@@ -202,10 +231,12 @@ Input validation is implemented through the use of typed parameters and careful 
 
 The bot's administrative interface restricts access based on user ID and username, with checks implemented in both `admin.py` and `admin2.py`. These checks prevent unauthorized users from executing privileged commands. The system also implements rate limiting through cooldown mechanisms, preventing abuse of features like energy drink searches.
 
+With the addition of `httpx`, the application now has enhanced capabilities for secure external communications, including support for TLS/SSL encryption, timeout configurations, and secure header management. However, proper configuration of these security features is essential to prevent vulnerabilities in external API communications.
+
 However, the application could improve security by implementing more comprehensive input sanitization, adding rate limiting at the network level, and using encrypted storage for the SQLite database. Additionally, the use of environment variables for configuration should be combined with proper access controls to prevent unauthorized access to the environment.
 
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L0-L799)
 - [database.py](file://database.py#L0-L3060)
 - [admin.py](file://admin.py#L0-L15)
-- [requirements.txt](file://requirements.txt#L0-L2)
+- [requirements.txt](file://requirements.txt#L0-L3) - *Updated to include httpx security considerations*

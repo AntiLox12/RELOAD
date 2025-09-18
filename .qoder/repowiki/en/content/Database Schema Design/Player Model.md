@@ -2,13 +2,22 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [database.py](file://database.py#L17-L46)
-- [database.py](file://database.py#L48-L62)
-- [database.py](file://database.py#L2517-L2539)
-- [Bot_new.py](file://Bot_new.py#L636-L660)
-- [constants.py](file://constants.py#L1-L76)
-- [admin2.py](file://admin2.py#L374-L456)
+- [database.py](file://database.py#L17-L46) - *Updated in recent commit*
+- [database.py](file://database.py#L206-L227) - *Added in recent commit*
+- [database.py](file://database.py#L245-L267) - *Added in recent commit*
+- [database.py](file://database.py#L292-L319) - *Added in recent commit*
+- [silk_city.py](file://silk_city.py) - *Added in recent commit*
+- [silk_ui.py](file://silk_ui.py) - *Added in recent commit*
+- [constants.py](file://constants.py#L1-L76) - *Updated with silk city features*
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added new section "Silk City Integration" to document new silk plantation, inventory, and transaction features
+- Updated "Relationships" section to include new relationships with SilkPlantation, SilkInventory, and SilkTransaction entities
+- Added new Mermaid diagram showing silk-related relationships
+- Updated "Integration with Core Features" section to include Silk City functionality
+- Added references to new files: silk_city.py, silk_ui.py, and updated database.py and constants.py
 
 ## Table of Contents
 1. [Introduction](#introduction)
@@ -23,6 +32,7 @@
 10. [Performance Optimization](#performance-optimization)
 11. [Transaction Safety](#transaction-safety)
 12. [Integration with Core Features](#integration-with-core-features)
+13. [Silk City Integration](#silk-city-integration)
 
 ## Introduction
 The Player model serves as the central entity in the RELOAD application, representing user accounts and tracking their game state, progress, and inventory. This document provides comprehensive documentation of the Player entity, detailing its structure, relationships, business rules, and integration points within the system.
@@ -122,11 +132,15 @@ Integer auto_search_boost_until
 - [database.py](file://database.py#L17-L46)
 
 ## Relationships
-The Player entity has a one-to-many relationship with the InventoryItem entity, representing the player's collection of energy drinks. This relationship is implemented through a foreign key constraint and is cascaded for deletion.
+The Player entity has a one-to-many relationship with the InventoryItem entity, representing the player's collection of energy drinks. This relationship is implemented through a foreign key constraint and is cascaded for deletion. Additionally, with the new silk city features, the Player entity now has relationships with SilkPlantation, SilkInventory, and SilkTransaction entities.
 
 ```mermaid
 erDiagram
 PLAYER ||--o{ INVENTORY_ITEM : owns
+PLAYER ||--o{ SILK_PLANTATION : owns
+PLAYER ||--o{ SILK_INVENTORY : owns
+PLAYER ||--o{ SILK_TRANSACTION : buyer
+PLAYER ||--o{ SILK_TRANSACTION : seller
 PLAYER {
 BigInteger user_id PK
 String username
@@ -139,15 +153,54 @@ Integer drink_id FK
 String rarity
 Integer quantity
 }
+SILK_PLANTATION {
+Integer id PK
+BigInteger player_id FK
+String plantation_name
+Integer silk_trees_count
+Integer planted_at
+Integer harvest_ready_at
+String status
+Integer investment_cost
+Integer expected_yield
+String investment_level
+Integer quality_modifier
+Integer weather_modifier
+}
+SILK_INVENTORY {
+Integer id PK
+BigInteger player_id FK
+String silk_type
+Integer quantity
+Integer quality_grade
+Integer produced_at
+}
+SILK_TRANSACTION {
+Integer id PK
+BigInteger seller_id FK
+BigInteger buyer_id FK
+String transaction_type
+String silk_type
+Integer amount
+Integer price_per_unit
+Integer total_price
+Integer created_at
+}
 ```
 
 **Diagram sources**
 - [database.py](file://database.py#L17-L46)
 - [database.py](file://database.py#L48-L62)
+- [database.py](file://database.py#L206-L227)
+- [database.py](file://database.py#L245-L267)
+- [database.py](file://database.py#L292-L319)
 
 **Section sources**
 - [database.py](file://database.py#L17-L46)
 - [database.py](file://database.py#L48-L62)
+- [database.py](file://database.py#L206-L227)
+- [database.py](file://database.py#L245-L267)
+- [database.py](file://database.py#L292-L319)
 
 ## VIP Status and Business Rules
 VIP status is managed through the vip_until field, which stores a Unix timestamp indicating when the status expires. VIP status affects several game mechanics:
@@ -311,3 +364,81 @@ style Player fill:#f9f,stroke:#333
 **Section sources**
 - [constants.py](file://constants.py#L1-L76)
 - [admin2.py](file://admin2.py#L374-L456)
+
+## Silk City Integration
+The Player entity now integrates with the new Silk City feature, which includes silk plantations, inventory management, and trading. This integration adds several new relationships and business rules to the Player model.
+
+The Silk City system allows players to:
+- Create and manage silk plantations with different investment levels
+- Harvest silk of various types (raw, refined, premium)
+- Sell silk to NPC traders for coins
+- Track silk inventory with quality grades
+- View market prices that fluctuate over time
+
+VIP players receive bonuses in the Silk City system:
+- 20% increase in silk yield
+- 10% bonus to quality modifier
+- 10% reduction in growth time
+
+Players can have up to 5 active plantations simultaneously. Each plantation has a growth period that varies by investment level (24-96 hours), after which players can harvest their crop.
+
+```mermaid
+classDiagram
+class Player {
++BigInteger user_id
++String username
++Integer coins
+}
+class SilkPlantation {
++Integer id
++BigInteger player_id
++String plantation_name
++Integer silk_trees_count
++Integer planted_at
++Integer harvest_ready_at
++String status
++Integer investment_cost
++Integer expected_yield
++String investment_level
++Integer quality_modifier
++Integer weather_modifier
+}
+class SilkInventory {
++Integer id
++BigInteger player_id
++String silk_type
++Integer quantity
++Integer quality_grade
++Integer produced_at
+}
+class SilkTransaction {
++Integer id
++BigInteger seller_id
++BigInteger buyer_id
++String transaction_type
++String silk_type
++Integer amount
++Integer price_per_unit
++Integer total_price
++Integer created_at
+}
+Player "1" -- "0..*" SilkPlantation : owns
+Player "1" -- "0..*" SilkInventory : owns
+Player "1" -- "0..*" SilkTransaction : buyer
+Player "1" -- "0..*" SilkTransaction : seller
+```
+
+**Diagram sources**
+- [database.py](file://database.py#L206-L227)
+- [database.py](file://database.py#L245-L267)
+- [database.py](file://database.py#L292-L319)
+- [silk_city.py](file://silk_city.py)
+- [silk_ui.py](file://silk_ui.py)
+
+**Section sources**
+- [database.py](file://database.py#L206-L227)
+- [database.py](file://database.py#L245-L267)
+- [database.py](file://database.py#L292-L319)
+- [silk_city.py](file://silk_city.py)
+- [silk_ui.py](file://silk_ui.py)
+- [constants.py](file://constants.py#L1-L76)

@@ -2,497 +2,223 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [Bot_new.py](file://Bot_new.py)
-- [database.py](file://database.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit*
+- [database.py](file://database.py) - *Updated in recent commit*
 - [constants.py](file://constants.py)
-- [admin.py](file://admin.py)
-- [admin2.py](file://admin2.py)
-- [fullhelp.py](file://fullhelp.py)
+- [silk_city.py](file://silk_city.py) - *Added in recent commit*
+- [silk_ui.py](file://silk_ui.py) - *Added in recent commit*
 </cite>
 
+## Update Summary
+- Added new section on Silk City features including plantations, harvest notifications, and market system
+- Added new section on Silk City inventory and statistics
+- Updated Table of Contents to include new Silk City sections
+- Added sources for new features and updated code references
+- Removed outdated diagram sources where diagrams were conceptual
+
 ## Table of Contents
-1. [Introduction](#introduction)
-2. [Project Structure](#project-structure)
-3. [Core Components](#core-components)
-4. [Architecture Overview](#architecture-overview)
-5. [Detailed Component Analysis](#detailed-component-analysis)
-6. [Dependency Analysis](#dependency-analysis)
-7. [Performance Considerations](#performance-considerations)
-8. [Troubleshooting Guide](#troubleshooting-guide)
-9. [Conclusion](#conclusion)
+1. [Energy Drink Collection System](#energy-drink-collection-system)
+2. [Inventory Management](#inventory-management)
+3. [Search Command Implementation](#search-command-implementation)
+4. [Integration with VIP System and Economic Model](#integration-with-vip-system-and-economic-model)
+5. [Concurrency and Race Condition Handling](#concurrency-and-race-condition-handling)
+6. [Silk City Features](#silk-city-features)
+7. [Silk City Inventory and Statistics](#silk-city-inventory-and-statistics)
 
-## Introduction
-The RELOAD application is a Telegram-based bot designed for energy drink collection and management. This document provides comprehensive architectural documentation for the core system, focusing on its modular design, separation of concerns, asynchronous event-driven architecture, and key design decisions. The system is orchestrated by Bot_new.py which integrates specialized modules for administration, help, and data management. The architecture follows a clean separation between presentation (Telegram commands), business logic (in Bot_new.py), data access (database.py using Repository pattern), and configuration (constants.py). The system leverages asyncio and the python-telegram-bot framework for asynchronous event handling.
+## Energy Drink Collection System
 
-## Project Structure
-The RELOAD application follows a modular structure with clear separation of concerns. The main components are organized as individual Python files, each responsible for specific functionality. The core orchestrator (Bot_new.py) imports and integrates specialized modules for administration, help, and data management. Configuration is centralized in constants.py, while data access is handled through database.py which implements the Repository pattern. Administrative functions are split between admin.py and admin2.py based on privilege levels, and help functionality is encapsulated in fullhelp.py.
+The RELOAD bot implements a cooldown-based energy drink collection system that governs how frequently users can search for new items. The core mechanic is defined by the `SEARCH_COOLDOWN` constant in `constants.py`, which sets the base cooldown period at 300 seconds (5 minutes). This value is dynamically adjusted for VIP users, who benefit from a 50% reduced cooldown due to their subscription status.
 
-```mermaid
-graph TD
-Bot_new[Bot_new.py<br/>Main Orchestrator] --> database[database.py<br/>Data Access Layer]
-Bot_new --> constants[constants.py<br/>Configuration]
-Bot_new --> admin[admin.py<br/>Admin Commands]
-Bot_new --> admin2[admin2.py<br/>Privileged Admin Commands]
-Bot_new --> fullhelp[fullhelp.py<br/>Help System]
-Bot_new --> add_energy[add_energy_drink_new.py<br/>Energy Drink Management]
-Bot_new --> export[export_user_ids.py<br/>User Data Export]
-Bot_new --> migrate[migrate_data.py<br/>Data Migration]
-```
+When a user initiates a search via the `/find` command or the "Find energy" button, the system first checks whether the user is within their cooldown period by comparing the current time with the `last_search` timestamp stored in the database. If the cooldown has not expired, the request is rejected with an appropriate message. For VIP users, the effective cooldown (`eff_search_cd`) is calculated as `SEARCH_COOLDOWN / 2`, providing a significant gameplay advantage.
 
-**Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L1-L50)
-- [database.py](file://database.py#L1-L50)
-- [constants.py](file://constants.py#L1-L10)
+Upon successful cooldown validation, the system selects a random energy drink from the available pool using `db.get_all_drinks()`. The rarity of the found item is determined through a weighted random selection based on the `RARITIES` dictionary, where rarer items have lower probability weights. Special items bypass this system and are automatically assigned the 'Special' rarity.
+
+Users are rewarded with a random amount of septims (5-10 coins) upon finding an energy drink, with VIP users receiving double the reward. This economic incentive encourages regular engagement with the collection system. The entire process is logged for monitoring and analytics purposes, capturing details such as user ID, found item, rarity, and coin rewards.
 
 **Section sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-- [constants.py](file://constants.py#L1-L76)
+- [Bot_new.py](file://Bot_new.py#L490-L539)
+- [constants.py](file://constants.py#L5-L7)
 
-## Core Components
-The RELOAD application's core system consists of several key components that work together to provide a seamless user experience. The main orchestrator (Bot_new.py) handles Telegram command routing and business logic execution. The data access layer (database.py) implements the Repository pattern for database operations, providing a clean abstraction between the business logic and data storage. Configuration is managed through constants.py which contains global constants used throughout the application. Administrative functionality is divided between admin.py (basic admin commands) and admin2.py (privileged admin commands), while help functionality is provided by fullhelp.py.
+## Inventory Management
+
+The inventory management system implements both pagination and sorting mechanisms to provide an organized and user-friendly interface for viewing collected energy drinks. The inventory display is accessible through the "Inventory" button in the main menu and shows items across multiple pages when necessary.
+
+Pagination is controlled by the `ITEMS_PER_PAGE` constant, which is set to 10 items per page. When displaying the inventory, the system calculates the total number of pages based on the user's inventory size and implements navigation buttons (previous, next) to allow users to browse through their collection. The current page number and total page count are displayed to provide context.
+
+Items can be sorted in multiple ways depending on the viewing context. The standard inventory view sorts items according to a predefined rarity hierarchy specified in `RARITY_ORDER`, which ranks items from most to least valuable: Special, Majestic, Absolute, Elite, Medium, Basic. Within each rarity tier, items are further sorted alphabetically by name. This dual-sorting mechanism ensures a consistent and logical presentation of the user's collection.
+
+Additionally, a new inventory view sorted by quantity has been implemented for the Receiver interface. This view sorts items primarily by quantity in descending order, allowing users to easily identify their most abundant items for potential sale. The sorting is implemented with the key function `lambda i: (-i.quantity, i.drink.name.lower())`, which first sorts by negative quantity (to achieve descending order) and then alphabetically by name for items with the same quantity.
+
+The interface groups items by rarity, displaying a header for each rarity tier with its corresponding emoji indicator from `COLOR_EMOJIS`. Each item is presented with its name and quantity, allowing users to quickly assess their collection composition. Navigation is intuitive, with dedicated buttons for moving between pages and returning to the main menu.
 
 **Section sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-- [constants.py](file://constants.py#L1-L76)
-- [admin.py](file://admin.py#L1-L100)
-- [admin2.py](file://admin2.py#L1-L100)
-- [fullhelp.py](file://fullhelp.py#L1-L100)
+- [Bot_new.py](file://Bot_new.py#L811-L844)
+- [Bot_new.py](file://Bot_new.py#L991-L1008)
+- [constants.py](file://constants.py#L15-L16)
 
-## Architecture Overview
-The RELOAD application follows a layered architecture with clear separation of concerns. The system is built on an asynchronous event-driven model using asyncio and the python-telegram-bot framework. The architecture consists of four main layers: presentation layer (Telegram commands), business logic layer (in Bot_new.py), data access layer (database.py using Repository pattern), and configuration layer (constants.py). This separation ensures maintainability and scalability of the application.
+### New Inventory Sorting by Quantity for Receiver
+A new inventory view has been added specifically for the Receiver interface that sorts items by quantity in descending order. This feature helps users quickly identify which items they have in abundance and may want to sell. The implementation uses Python's built-in sorting with a custom key function that prioritizes quantity over alphabetical order.
 
-```mermaid
-graph TD
-subgraph "Presentation Layer"
-Telegram[Telegram Commands<br/>/start, /find, /inventory]
-end
-subgraph "Business Logic Layer"
-Bot_new[Bot_new.py<br/>Command Handlers<br/>Business Logic<br/>State Management]
-end
-subgraph "Data Access Layer"
-database[database.py<br/>Repository Pattern<br/>SQLAlchemy ORM]
-end
-subgraph "Configuration Layer"
-constants[constants.py<br/>Global Constants<br/>Game Parameters]
-end
-Telegram --> Bot_new
-Bot_new --> database
-Bot_new --> constants
-database --> SQLite[(SQLite Database)]
+The sorting logic is implemented in the `show_receiver_inventory` function, which processes the inventory items with:
+```python
+sorted_items = sorted(
+    inventory_items,
+    key=lambda i: (-i.quantity, i.drink.name.lower()),
+)
 ```
 
-**Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-- [constants.py](file://constants.py#L1-L76)
+This creates a descending order by quantity (using negative values) and then sorts alphabetically within each quantity group. The pagination system works identically to the standard inventory view, with the same `ITEMS_PER_PAGE` limit and navigation controls.
 
-## Detailed Component Analysis
-This section provides a thorough analysis of each key component in the RELOAD application, including their interactions, design patterns, and implementation details.
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L991-L1008)
 
-### Bot_new.py Analysis
-Bot_new.py serves as the main orchestrator of the RELOAD application, handling all Telegram command routing and implementing the core business logic. It follows an event-driven architecture using the python-telegram-bot framework's callback system. The module imports and integrates specialized modules for administration, help, and data management, creating a cohesive system from modular components.
+### 'Sell All But One' Inventory Functionality
+A new 'sell all but one' option has been added to the inventory management system, allowing users to sell multiple copies of an item while retaining one for their collection. This feature provides greater flexibility in inventory management and helps users optimize their coin earnings without completely depleting rare items.
 
-#### For Object-Oriented Components:
-```mermaid
-classDiagram
-class Bot_new {
-+dict ADMIN_USER_IDS
-+dict PENDING_ADDITIONS
-+dict GIFT_OFFERS
-+dict _LOCKS
-+dict REJECT_PROMPTS
-+dict TEXTS
-+function _get_lock(key)
-+function t(lang, key)
-+function show_menu(update, context)
-+function search_reminder_job(context)
-+function auto_search_job(context)
-+function _perform_energy_search(user_id, username, context)
-+function find_energy(update, context)
-+function claim_daily_bonus(update, context)
-+function show_inventory(update, context)
-+function show_stats(update, context)
-+function settings_menu(update, context)
-+function toggle_auto_search(update, context)
-+function skip_photo(update, context)
-}
-class database {
-+function create_db_and_tables()
-+function get_or_create_player(user_id, username)
-+function get_all_drinks()
-+function get_player_inventory_with_details(user_id)
-+function add_drink_to_inventory(user_id, drink_id, rarity)
-+function update_player(user_id, **kwargs)
-+function is_vip(user_id)
-+function get_vip_until(user_id)
-+function get_auto_search_daily_limit(user_id)
-+function get_receipts_by_user_id(user_id)
-+function get_tg_premium_stock()
-+function add_tg_premium_stock(delta)
-+function set_tg_premium_stock(value)
-+function get_bonus_stock(kind)
-+function add_bonus_stock(kind, delta)
-+function set_bonus_stock(kind, value)
-+function get_admin_users()
-+function is_admin(user_id)
-+function get_admin_level(user_id)
-+function add_admin_user(user_id, username, level)
-+function set_admin_level(user_id, level)
-+function remove_admin_user(user_id)
-+function insert_moderation_log(actor_id, action, request_id, target_id, details)
-+function get_receipt_by_id(receipt_id)
-+function verify_receipt(receipt_id, verified_by)
-+function get_player_by_username(username)
-+function add_auto_search_boost(user_id, count, days)
-+function add_auto_search_boost_to_all(count, days)
-+function get_boost_info(user_id)
-+function get_boost_statistics()
-+function get_expiring_boosts(hours_ahead)
-+function get_user_boost_history(user_id, limit)
-+function add_boost_history_record(user_id, username, action, boost_count, boost_days, granted_by, granted_by_username, details)
-}
-class constants {
-+int SEARCH_COOLDOWN
-+int DAILY_BONUS_COOLDOWN
-+str ENERGY_IMAGES_DIR
-+dict RARITIES
-+dict COLOR_EMOJIS
-+list RARITY_ORDER
-+int ITEMS_PER_PAGE
-+str VIP_EMOJI
-+dict VIP_COSTS
-+dict VIP_DURATIONS_SEC
-+int TG_PREMIUM_COST
-+int TG_PREMIUM_DURATION_SEC
-+set ADMIN_USERNAMES
-+int AUTO_SEARCH_DAILY_LIMIT
-+float RECEIVER_COMMISSION
-+dict RECEIVER_PRICES
-+int SHOP_PRICE_MULTIPLIER
-+dict SHOP_PRICES
-}
-Bot_new --> database : "uses"
-Bot_new --> constants : "imports"
-Bot_new --> admin : "imports"
-Bot_new --> admin2 : "imports"
-Bot_new --> fullhelp : "imports"
-```
+The functionality is implemented through a new button callback handler `handle_sell_all_but_one` that processes the sale request. When triggered, it calls the `db.sell_all_but_one` function in the database module, which performs the following operations:
+- Validates that the user owns the item and has more than one copy
+- Calculates the quantity to sell (total quantity minus one)
+- Determines the payout based on the item's rarity and the `RECEIVER_PRICES` with commission applied
+- Updates the inventory by reducing the quantity and credits the user's coin balance
+- Returns detailed transaction information including unit payout, quantity sold, and total payout
 
-**Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-- [constants.py](file://constants.py#L1-L76)
+The feature includes proper locking mechanisms to prevent race conditions during concurrent operations, using a user-specific lock identified by `f"sell_all_but_one:{user_id}:{item_id}"`.
 
-#### For API/Service Components:
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L1197-L1223)
+- [database.py](file://database.py#L2992-L3020)
+
+## Search Command Implementation
+
+The `/find` command serves as the primary interface for energy drink collection, triggering a comprehensive sequence of operations across multiple components. When invoked, the command first acquires a user-specific lock (`_get_lock(f"user:{user.id}:search")`) to prevent concurrent searches and potential race conditions.
+
+The command handler performs an initial cooldown check using the user's `last_search` timestamp and the current `SEARCH_COOLDOWN` value, adjusted for VIP status. If the cooldown period has not elapsed, the user receives a notification with the remaining time. Upon passing the cooldown check, the system displays a loading animation with rotating search indicators to provide visual feedback during processing.
+
+The core search logic is encapsulated in the `_perform_energy_search` function, which coordinates the selection of a random energy drink, determination of its rarity, updating of the user's inventory, and calculation of coin rewards. The selected drink is added to the user's inventory via `db.add_drink_to_inventory`, while the user's coin balance is updated through `db.update_player` with the appropriate reward amount.
+
+For successful searches, the system generates a detailed response message that includes the drink's name, rarity (with emoji indicator), reward amount, and description. If the drink has an associated image, it is displayed alongside the text. The user's `last_search` timestamp is updated to enforce the cooldown period for future searches.
+
 ```mermaid
 sequenceDiagram
-participant User as "Telegram User"
-participant Bot as "Bot_new.py"
-participant DB as "database.py"
-participant Constants as "constants.py"
-User->>Bot : /start command
-Bot->>DB : get_or_create_player(user_id, username)
-Bot->>Constants : t(lang, 'menu_title')
-Bot->>Bot : show_menu(update, context)
-Bot->>User : Display main menu with buttons
-User->>Bot : Click "Find energy" button
-Bot->>Bot : find_energy(update, context)
-Bot->>Bot : _get_lock(f"user : {user.id} : search")
-Bot->>DB : get_or_create_player(user_id, username)
-Bot->>DB : is_vip(user_id)
-Bot->>DB : get_all_drinks()
-Bot->>Bot : Randomly select drink and determine rarity
-Bot->>DB : add_drink_to_inventory(user_id, drink_id, rarity)
-Bot->>DB : update_player(user_id, last_search, coins)
-Bot->>Bot : Format result message with image and caption
-Bot->>User : Send found energy drink with details
-```
-
-**Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-
-**Section sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-- [constants.py](file://constants.py#L1-L76)
-
-### database.py Analysis
-The database.py module implements the data access layer of the RELOAD application using the Repository pattern with SQLAlchemy ORM. It defines the database schema through declarative base classes and provides a comprehensive set of functions for data manipulation. The module handles all database operations, including player management, energy drink inventory, administrative functions, and bonus tracking.
-
-#### For Object-Oriented Components:
-```mermaid
-classDiagram
-class Player {
-+BigInteger user_id
-+String username
-+Integer coins
-+Integer last_search
-+Integer last_bonus_claim
-+Integer last_add
-+String language
-+Boolean remind
-+Integer vip_until
-+Integer tg_premium_until
-+Boolean auto_search_enabled
-+Integer auto_search_count
-+Integer auto_search_reset_ts
-+Integer auto_search_boost_count
-+Integer auto_search_boost_until
-+relationship inventory
-}
-class EnergyDrink {
-+Integer id
-+String name
-+String description
-+String image_path
-+Boolean is_special
-}
-class InventoryItem {
-+Integer id
-+BigInteger player_id
-+Integer drink_id
-+String rarity
-+Integer quantity
-+relationship owner
-+relationship drink
-}
-class ShopOffer {
-+Integer id
-+Integer offer_index
-+Integer drink_id
-+String rarity
-+Integer batch_ts
-+relationship drink
-}
-class AdminUser {
-+BigInteger user_id
-+String username
-+Integer level
-+Integer created_at
-}
-class PendingAddition {
-+Integer id
-+BigInteger proposer_id
-+String name
-+String description
-+Boolean is_special
-+String file_id
-+String status
-+Integer created_at
-+BigInteger reviewed_by
-+Integer reviewed_at
-+String review_reason
-}
-class PendingDeletion {
-+Integer id
-+BigInteger proposer_id
-+Integer drink_id
-+String reason
-+String status
-+Integer created_at
-+BigInteger reviewed_by
-+Integer reviewed_at
-+String review_reason
-}
-class PendingEdit {
-+Integer id
-+BigInteger proposer_id
-+Integer drink_id
-+String field
-+String new_value
-+String status
-+Integer created_at
-+BigInteger reviewed_by
-+Integer reviewed_at
-+String review_reason
-}
-class ModerationLog {
-+Integer id
-+Integer ts
-+BigInteger actor_id
-+String action
-+Integer request_id
-+BigInteger target_id
-+String details
-}
-class GroupChat {
-+BigInteger chat_id
-+String title
-+Boolean is_enabled
-+Integer last_notified
-}
-class TgPremiumStock {
-+Integer id
-+Integer stock
-}
-class PurchaseReceipt {
-+Integer id
-+BigInteger user_id
-+String kind
-+Integer amount_coins
-+Integer duration_seconds
-+Integer purchased_at
-+Integer valid_until
-+String status
-+BigInteger verified_by
-+Integer verified_at
-+String extra
-}
-class BonusStock {
-+Integer id
-+String kind
-+Integer stock
-}
-class BoostHistory {
-+Integer id
-+BigInteger user_id
-+String username
-+String action
-+Integer boost_count
-+Integer boost_days
-+BigInteger granted_by
-+String granted_by_username
-+Integer timestamp
-+String details
-}
-Player "1" --> "*" InventoryItem : "has"
-EnergyDrink "1" --> "*" InventoryItem : "contained in"
-EnergyDrink "1" --> "*" ShopOffer : "available in"
-Player "1" --> "*" PendingAddition : "proposes"
-Player "1" --> "*" PendingDeletion : "requests"
-Player "1" --> "*" PendingEdit : "submits"
-AdminUser "1" --> "*" ModerationLog : "performs"
-Player "1" --> "*" PurchaseReceipt : "purchases"
-Player "1" --> "*" BoostHistory : "receives"
-```
-
-**Diagram sources**
-- [database.py](file://database.py#L1-L100)
-
-#### For API/Service Components:
-```mermaid
-sequenceDiagram
-participant Service as "Business Logic"
-participant DB as "database.py"
-participant SQLite as "SQLite Database"
-Service->>DB : get_or_create_player(user_id, username)
-DB->>SQLite : SELECT * FROM players WHERE user_id = ?
-alt Player exists
-SQLite-->>DB : Return player record
-DB-->>Service : Return Player object
-else Player doesn't exist
-SQLite-->>DB : No results
-DB->>SQLite : INSERT INTO players (user_id, username) VALUES (?, ?)
-DB->>SQLite : SELECT * FROM players WHERE user_id = ?
-SQLite-->>DB : Return new player record
-DB-->>Service : Return new Player object
+participant User
+participant Bot_new
+participant Database
+participant Constants
+User->>Bot_new : /find command
+Bot_new->>Bot_new : Acquire search lock
+Bot_new->>Database : Check last_search timestamp
+alt Cooldown active
+Bot_new-->>User : "Wait, cooldown active"
+else Cooldown expired
+Bot_new->>Bot_new : Show loading animation
+Bot_new->>Database : Get all drinks
+Bot_new->>Bot_new : Select random drink
+Bot_new->>Bot_new : Determine rarity (weighted)
+Bot_new->>Database : Add to inventory
+Bot_new->>Bot_new : Calculate coin reward
+Bot_new->>Database : Update player (coins, last_search)
+Bot_new->>User : Display found item with details
 end
-Service->>DB : add_drink_to_inventory(user_id, drink_id, rarity)
-DB->>SQLite : SELECT * FROM inventory_items WHERE player_id = ? AND drink_id = ? AND rarity = ?
-alt Item exists
-SQLite-->>DB : Return inventory item
-DB->>SQLite : UPDATE inventory_items SET quantity = quantity + 1 WHERE id = ?
-else Item doesn't exist
-SQLite-->>DB : No results
-DB->>SQLite : INSERT INTO inventory_items (player_id, drink_id, rarity, quantity) VALUES (?, ?, ?, 1)
-end
-DB->>SQLite : COMMIT
-DB-->>Service : Success
-Service->>DB : update_player(user_id, last_search=current_time, coins=new_coins)
-DB->>SQLite : UPDATE players SET last_search = ?, coins = ? WHERE user_id = ?
-DB->>SQLite : COMMIT
-DB-->>Service : Success
+Bot_new->>Bot_new : Release search lock
 ```
 
 **Diagram sources**
-- [database.py](file://database.py#L1-L100)
+- [Bot_new.py](file://Bot_new.py#L563-L598)
+- [database.py](file://database.py#L2044-L2074)
 
 **Section sources**
-- [database.py](file://database.py#L1-L100)
+- [Bot_new.py](file://Bot_new.py#L3353-L3386)
+- [Bot_new.py](file://Bot_new.py#L490-L539)
 
-### constants.py Analysis
-The constants.py module serves as the central configuration point for the RELOAD application, containing global constants used throughout the system. This approach ensures consistency across the application and makes configuration changes easier to manage. The module defines game parameters, cooldown times, rarity distributions, pricing models, and administrative settings.
+## Integration with VIP System and Economic Model
 
-#### For Object-Oriented Components:
-```mermaid
-classDiagram
-class constants {
-+int SEARCH_COOLDOWN
-+int DAILY_BONUS_COOLDOWN
-+str ENERGY_IMAGES_DIR
-+dict RARITIES
-+dict COLOR_EMOJIS
-+list RARITY_ORDER
-+int ITEMS_PER_PAGE
-+str VIP_EMOJI
-+dict VIP_COSTS
-+dict VIP_DURATIONS_SEC
-+int TG_PREMIUM_COST
-+int TG_PREMIUM_DURATION_SEC
-+set ADMIN_USERNAMES
-+int AUTO_SEARCH_DAILY_LIMIT
-+float RECEIVER_COMMISSION
-+dict RECEIVER_PRICES
-+int SHOP_PRICE_MULTIPLIER
-+dict SHOP_PRICES
-}
-```
+The energy drink collection system is deeply integrated with the VIP subscription system and broader economic model of the RELOAD bot. VIP status, determined by `db.is_vip(user.id)`, provides multiple advantages that enhance the user experience and create a compelling value proposition for subscription.
 
-**Diagram sources**
-- [constants.py](file://constants.py#L1-L76)
+VIP users benefit from a 50% reduction in both the search cooldown (`SEARCH_COOLDOWN / 2`) and daily bonus cooldown (`DAILY_BONUS_COOLDOWN / 2`), allowing them to collect rewards more frequently. Additionally, they receive double the coin rewards from searches, significantly accelerating their accumulation of in-game currency. These multiplier effects create a positive feedback loop where VIP status enables faster progression and greater earning potential.
+
+The economic model is further reinforced through the autosearch feature, which allows VIP users to automatically perform searches up to a daily limit (`AUTO_SEARCH_DAILY_LIMIT`). This passive income mechanism operates through scheduled jobs in the Telegram bot framework, with the system automatically triggering searches at appropriate intervals. The autosearch functionality respects the same cooldown mechanics as manual searches but operates in the background, providing continuous rewards without requiring active user participation.
+
+The system also integrates with the marketplace economy through defined pricing structures. The `RECEIVER_PRICES` dictionary establishes base values for selling energy drinks, while `SHOP_PRICES` determines purchase costs with a multiplier applied. This creates a balanced economy where users can buy and sell items at predictable rates, with the `RECEIVER_COMMISSION` ensuring the system retains a percentage of transaction value.
 
 **Section sources**
-- [constants.py](file://constants.py#L1-L76)
+- [constants.py](file://constants.py#L20-L37)
+- [Bot_new.py](file://Bot_new.py#L361-L393)
+- [database.py](file://database.py#L1629-L1668)
 
-## Dependency Analysis
-The RELOAD application follows a clear dependency hierarchy with well-defined relationships between components. The main orchestrator (Bot_new.py) depends on all other modules, while specialized modules have minimal dependencies on each other. This design promotes modularity and makes the system easier to maintain and extend.
+## Concurrency and Race Condition Handling
+
+The RELOAD bot implements robust mechanisms to prevent race conditions and ensure data consistency during concurrent operations, particularly for critical actions like searching and inventory management. The primary defense against race conditions is the use of asyncio locks, with each user having a dedicated search lock identified by `f"user:{user.id}:search"`.
+
+When a user initiates a search, the system first checks if the lock is already acquired. If so, the request is immediately rejected with a "Search already in progress" message, preventing multiple simultaneous searches that could lead to inconsistent state or unfair advantages. This locking mechanism is applied consistently across all search entry points, including the `/find` command, button presses, and autosearch jobs.
+
+For database operations, the system employs transactional integrity through SQLAlchemy's session management. Operations that modify multiple related records, such as adding an item to inventory and updating player statistics, are wrapped in atomic transactions. If any part of the operation fails, the entire transaction is rolled back, ensuring that the database remains in a consistent state.
+
+The autosearch system includes additional safeguards to prevent conflicts with manual searches. Before executing an autosearch job, the system checks if the user's search lock is held, indicating an ongoing manual search. If a conflict is detected, the autosearch is rescheduled for a short delay, allowing the manual search to complete first. This coordination ensures that users cannot exploit timing differences between automated and manual actions.
 
 ```mermaid
-graph TD
-Bot_new[Bot_new.py] --> database[database.py]
-Bot_new --> constants[constants.py]
-Bot_new --> admin[admin.py]
-Bot_new --> admin2[admin2.py]
-Bot_new --> fullhelp[fullhelp.py]
-Bot_new --> add_energy[add_energy_drink_new.py]
-admin[admin.py] --> database[database.py]
-admin2[admin2.py] --> database[database.py]
-fullhelp[fullhelp.py] --> database[database.py]
-fullhelp --> constants[constants.py]
+flowchart TD
+Start([Search Initiated]) --> CheckLock["Check user search lock"]
+CheckLock --> LockHeld{"Lock Held?"}
+LockHeld --> |Yes| Reject["Reject: Search in progress"]
+LockHeld --> |No| AcquireLock["Acquire lock"]
+AcquireLock --> CheckCooldown["Check cooldown period"]
+CheckCooldown --> CooldownActive{"Cooldown Active?"}
+CooldownActive --> |Yes| NotifyCooldown["Notify: Wait for cooldown"]
+CooldownActive --> |No| PerformSearch["Perform search logic"]
+PerformSearch --> UpdateDB["Update database (atomic)"]
+UpdateDB --> ReleaseLock["Release lock"]
+ReleaseLock --> End([Search Complete])
+Reject --> End
+NotifyCooldown --> End
 ```
 
 **Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
-- [constants.py](file://constants.py#L1-L76)
-- [admin.py](file://admin.py#L1-L100)
-- [admin2.py](file://admin2.py#L1-L100)
-- [fullhelp.py](file://fullhelp.py#L1-L100)
-
-## Performance Considerations
-The RELOAD application is designed with performance in mind, leveraging asynchronous programming patterns to handle multiple concurrent users efficiently. The use of asyncio and the python-telegram-bot framework allows the bot to handle multiple user interactions simultaneously without blocking. Database operations are optimized through the use of SQLAlchemy ORM with appropriate indexing on frequently queried fields. The system implements caching patterns where appropriate, such as maintaining player state in memory during active sessions. The repository pattern in database.py provides a clean abstraction that allows for future optimization of data access patterns without affecting business logic.
-
-## Troubleshooting Guide
-When troubleshooting issues with the RELOAD application, consider the following common scenarios and their solutions:
-
-1. **Database Connection Issues**: Ensure the SQLite database file (bot_data.db) exists and has proper read/write permissions. The database is created automatically on first run if it doesn't exist.
-
-2. **Command Not Responding**: Check if the bot has been granted necessary permissions in the Telegram group or channel. Verify that the python-telegram-bot library is properly installed and configured.
-
-3. **Authentication Problems**: Ensure that admin users are properly registered in the database. The bootstrap admin usernames are defined in constants.py under ADMIN_USERNAMES.
-
-4. **Image Display Issues**: Verify that the energy_images directory exists and contains the required image files. Check that the image paths in the database match the actual file locations.
-
-5. **Asynchronous Operation Failures**: Review the asyncio event loop configuration and ensure that long-running operations are properly awaited. Check for potential race conditions in shared state.
-
-6. **Memory Leaks**: Monitor the application for increasing memory usage over time. The use of global dictionaries (PENDING_ADDITIONS, GIFT_OFFERS, _LOCKS, REJECT_PROMPTS) should be periodically cleaned up to prevent memory bloat.
+- [Bot_new.py](file://Bot_new.py#L563-L598)
+- [Bot_new.py](file://Bot_new.py#L361-L393)
 
 **Section sources**
-- [Bot_new.py](file://Bot_new.py#L1-L100)
-- [database.py](file://database.py#L1-L100)
+- [Bot_new.py](file://Bot_new.py#L311-L329)
+- [database.py](file://database.py#L2044-L2074)
 
-## Conclusion
-The RELOAD application demonstrates a well-architected modular design with clear separation of concerns between presentation, business logic, data access, and configuration layers. The system leverages asynchronous programming patterns through asyncio and the python-telegram-bot framework to efficiently handle concurrent user interactions. The use of the Repository pattern in database.py provides a clean abstraction between business logic and data storage, enhancing maintainability and testability. Key design decisions such as the use of global constants, singleton-like patterns in database session management, and state handling via callback data contribute to the system's robustness and scalability. The architecture supports easy extension through its modular design, allowing new features to be added with minimal impact on existing functionality.
+## Silk City Features
+
+The Silk City feature introduces a new economic layer to the RELOAD bot, centered around silk plantations, market trading, and resource management. This system allows players to invest in plantations, grow silk, and participate in a dynamic market economy.
+
+The core of the Silk City system is the plantation management, where players can create plantations at different investment levels (starter, standard, premium, master). Each level has different costs, growth times, and expected yields. When creating a plantation, players must have sufficient coins, and the creation process deducts the investment cost from their balance.
+
+Plantations have a growth cycle that transitions through states: growing, ready, and completed. The growth time is determined by the investment level and can be reduced for VIP users through the `SILK_VIP_BONUSES['growth_speedup']` multiplier. During growth, the plantation's progress can be monitored through a progress bar in the UI.
+
+When a plantation is ready for harvest, the system automatically updates its status through the periodic `update_plantation_statuses` job. Players receive notifications about ready plantations through the `silk_harvest_reminder_job`, which checks for ready plantations and sends notifications to players.
+
+The harvest process yields different types of silk (raw, refined, premium) based on weighted probabilities defined in `SILK_TYPES`. The actual yield is calculated by considering the plantation's expected yield, quality modifier, and weather modifier. VIP users receive additional bonuses to yield and quality through `SILK_VIP_BONUSES`.
+
+Players can sell their harvested silk on the market, where prices fluctuate based on market dynamics defined in `SILK_MARKET_PRICES`. The selling price is influenced by the silk's quality grade, with higher quality silk fetching better prices. The market interface shows current prices and allows players to sell 1, 5, or all units of a particular silk type.
+
+**Section sources**
+- [silk_city.py](file://silk_city.py#L100-L300)
+- [silk_ui.py](file://silk_ui.py#L150-L250)
+- [constants.py](file://constants.py#L100-L150)
+
+## Silk City Inventory and Statistics
+
+The Silk City system provides comprehensive inventory and statistics tracking to help players manage their silk resources and monitor their economic activities.
+
+The silk inventory system allows players to view all their silk items, including quantity, quality grade, and production date. The inventory is accessed through the "Silk Inventory" button in the Silk City menu and displays items with their corresponding emojis, names, quantities, quality descriptions, and production dates.
+
+Quality grades are categorized as follows: Superior (≥400), Excellent (≥350), Good (≥300), Average (≥250), and Low (<250). This quality system affects the selling price of silk, creating an incentive for players to optimize their plantation management for higher quality yields.
+
+The statistics system provides a comprehensive overview of a player's Silk City activities, including:
+- Plantation statistics: active and completed plantations, total invested coins
+- Silk inventory: total silk units and breakdown by type
+- Trading statistics: number of sales, total earnings, and profit (earnings minus investment)
+
+The statistics are calculated by querying the database for relevant records and aggregating the data. The `get_silk_city_stats` function in `silk_city.py` retrieves plantation, inventory, and transaction data to generate the complete statistics report.
+
+The UI for statistics presents this information in a clear, organized format with appropriate emojis and formatting. Players can access their statistics from the main Silk City menu, and the information is updated in real-time to reflect their current status.
+
+The inventory and statistics systems are integrated with the rest of the Silk City features, providing players with the information they need to make strategic decisions about their plantations and market activities. This transparency enhances the gameplay experience by allowing players to track their progress and optimize their strategies.
+
+**Section sources**
+- [silk_city.py](file://silk_city.py#L400-L450)
+- [silk_ui.py](file://silk_ui.py#L250-L330)
+- [database.py](file://database.py#L229-L243)

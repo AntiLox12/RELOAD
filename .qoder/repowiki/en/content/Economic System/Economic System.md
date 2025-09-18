@@ -2,10 +2,21 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [Bot_new.py](file://Bot_new.py)
-- [database.py](file://database.py)
-- [constants.py](file://constants.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit c3085cc*
+- [database.py](file://database.py) - *Updated in recent commit c3085cc*
+- [constants.py](file://constants.py) - *Updated in recent commit 758097260*
+- [admin2.py](file://admin2.py) - *Updated in recent commit c3085cc*
+- [fullhelp.py](file://fullhelp.py) - *Updated in recent commit c3085cc*
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added new section on money leaderboard and administrative coin management
+- Updated constants section with revised silk investment yields and market prices
+- Added documentation for new /delmoney command and leaderboard functionality
+- Added documentation for new "sell all but one" inventory feature
+- Updated diagram sources to reflect new command handlers
+- Enhanced transaction safety section with additional lock details
 
 ## Table of Contents
 1. [Introduction](#introduction)
@@ -16,7 +27,8 @@
 6. [Integration with VIP and Community Features](#integration-with-vip-and-community-features)
 7. [Transaction Safety and Race Condition Prevention](#transaction-safety-and-race-condition-prevention)
 8. [Constants and Pricing Configuration](#constants-and-pricing-configuration)
-9. [Conclusion](#conclusion)
+9. [Money Leaderboard and Administrative Commands](#money-leaderboard-and-administrative-commands)
+10. [Conclusion](#conclusion)
 
 ## Introduction
 The RELOAD application implements a comprehensive in-game economy centered around the "septims" currency. This system enables players to earn, spend, and trade virtual currency through various gameplay mechanics such as searching for energy drinks, claiming daily bonuses, purchasing premium features, and selling items through the receiver system. The economic model is designed to balance player progression, reward engagement, and maintain currency stability through carefully calibrated pricing, cooldowns, and transaction safeguards.
@@ -99,6 +111,8 @@ The receiver system enables players to sell energy drinks from their inventory i
 
 The sell_inventory_item function in database.py handles the transaction process, which includes validating ownership, calculating payouts, updating the player's coin balance, and adjusting inventory quantities. The system supports selling multiple units of the same item in a single transaction, with appropriate quantity validation to prevent overselling. After a successful sale, players receive detailed feedback including the unit payout, quantity sold, total earnings, and updated coin balance. This system creates an economic loop where players can acquire items through gameplay and convert them to currency, which can then be used for premium purchases or other in-game transactions.
 
+A new "sell all but one" feature has been added, allowing players to sell multiple units while retaining one item in their inventory. This functionality is implemented through the sell_all_but_one function in database.py and is accessible via the inventory interface. The feature is particularly useful for players who want to monetize their excess inventory while maintaining a representative item for collection purposes.
+
 ```mermaid
 flowchart TD
 A([Sell Item Request]) --> B{Validate Ownership}
@@ -124,6 +138,7 @@ Z --> M([Transaction Rejected])
 **Section sources**
 - [database.py](file://database.py#L2733-L2808)
 - [constants.py](file://constants.py#L60-L70)
+- [Bot_new.py](file://Bot_new.py#L1197-L1223)
 
 ## Economic Flow Examples
 The RELOAD application demonstrates several key economic flows that illustrate how players interact with the currency system. One common flow involves purchasing a premium feature: a player with sufficient septims navigates to the extras menu, selects a premium offering like TG Premium, and confirms the purchase. The system then verifies stock availability and player balance before executing the transaction through the purchase_tg_premium function, which deducts 600,000 septims, extends the player's TG Premium status by 90 days, reduces stock by one unit, and generates a purchase receipt.
@@ -221,6 +236,41 @@ The DAILY_BONUS_AMOUNT is effectively implemented through the search reward syst
 **Section sources**
 - [constants.py](file://constants.py#L0-L75)
 - [database.py](file://database.py#L810-L837)
+
+## Money Leaderboard and Administrative Commands
+Recent updates have introduced new economic features including a money leaderboard and administrative coin management commands. The show_money_leaderboard function in Bot_new.py displays the top players by septim balance, with VIP players identified by a special badge. The leaderboard shows the top players with medal indicators (gold, silver, bronze) for the top three positions, followed by numbered rankings for others.
+
+Administrative commands have been enhanced with the new /delmoney command, which allows administrators to remove septims from player accounts. This command requires administrator privileges and can be executed by specifying a target user ID or username along with the amount to remove. The command supports both direct invocation with parameters and reply-to-message functionality. When executed, the system validates the administrator's permissions, checks the target player's balance, and performs the transaction atomically through the decrement_coins method in database.py.
+
+```mermaid
+sequenceDiagram
+participant Admin
+participant Bot as Bot_new.py
+participant DB as database.py
+Admin->>Bot : Execute /delmoney command
+Bot->>Bot : Validate Admin Permissions
+alt Valid Admin
+Bot->>DB : Check Target Balance
+DB-->>Bot : Return Balance
+Bot->>DB : Deduct Coins
+DB->>DB : Update Player Record
+DB->>DB : Create Moderation Log
+DB-->>Bot : Return Result
+Bot-->>Admin : Confirm Transaction
+else Invalid Admin
+Bot-->>Admin : Show Permission Error
+end
+```
+
+**Diagram sources**
+- [Bot_new.py](file://Bot_new.py#L4763-L4859)
+- [database.py](file://database.py#L2809-L2850)
+
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L4763-L5091)
+- [database.py](file://database.py#L2809-L2850)
+- [admin2.py](file://admin2.py)
+- [fullhelp.py](file://fullhelp.py)
 
 ## Conclusion
 The RELOAD application's economic system creates a balanced and engaging virtual economy through its septims currency, premium feature purchases, and receiver-based item selling. By integrating these mechanics with VIP benefits and community features, the system encourages both individual progression and social interaction. The implementation demonstrates robust transaction safety through asyncio locks and atomic database operations, preventing race conditions and ensuring economic integrity. With its configurable constants and layered reward systems, the economy supports sustainable player engagement while maintaining balance between earning and spending opportunities.

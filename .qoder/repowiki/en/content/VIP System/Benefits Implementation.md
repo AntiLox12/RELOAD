@@ -2,10 +2,18 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [Bot_new.py](file://Bot_new.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit c3085cc*
+- [database.py](file://database.py) - *Updated in recent commit c3085cc*
 - [constants.py](file://constants.py)
-- [database.py](file://database.py)
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added documentation for VIP badge in money leaderboard functionality
+- Updated visual indicators section to include new money leaderboard implementation
+- Enhanced diagram sources to reflect updated leaderboard display logic
+- Added new section sources for money leaderboard functions
+- Maintained consistency with existing VIP benefit documentation
 
 ## Table of Contents
 1. [VIP Benefits Overview](#vip-benefits-overview)
@@ -185,7 +193,33 @@ ContinueLoop --> |No More Players| ReturnLeaderboard["Return formatted leaderboa
 ```
 
 **Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L4660-L4681)
+- [Bot_new.py](file://Bot_new.py#L5038-L5055)
+- [Bot_new.py](file://Bot_new.py#L5059-L5091)
+
+### VIP Badge in Money Leaderboard
+
+The system has been updated to include VIP badge support in the money leaderboard display. The `show_money_leaderboard` function implements similar VIP badge logic as the standard leaderboard but uses a different data structure:
+
+```mermaid
+flowchart TD
+Start([show_money_leaderboard Entry]) --> GetMoneyLeaderboard["Get money leaderboard data from database"]
+GetMoneyLeaderboard --> LoopThroughPlayers["For each player in money leaderboard"]
+LoopThroughPlayers --> CheckVIP["Check if vip_until > current time via db.get_vip_until()"]
+CheckVIP --> |VIP Active| AddBadge["Add VIP_EMOJI after username"]
+CheckVIP --> |VIP Inactive| NoBadge["No badge added"]
+AddBadge --> FormatPlayerLine["Format player line with badge and coin count"]
+NoBadge --> FormatPlayerLine
+FormatPlayerLine --> ContinueLoop["Continue to next player"]
+ContinueLoop --> |More Players| LoopThroughPlayers
+ContinueLoop --> |No More Players| ReturnMoneyLeaderboard["Return formatted money leaderboard"]
+```
+
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L5059-L5091) - *Added in recent commit c3085cc*
+- [database.py](file://database.py#L3430-L3462) - *Added in recent commit c3085cc*
+
+**Diagram sources**
+- [Bot_new.py](file://Bot_new.py#L5059-L5091) - *Added in recent commit c3085cc*
 
 ## Potential Issues and Debugging Strategies
 

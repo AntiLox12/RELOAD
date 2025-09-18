@@ -2,13 +2,22 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [admin2.py](file://admin2.py)
-- [database.py](file://database.py)
+- [admin2.py](file://admin2.py) - *Updated in recent commit*
+- [database.py](file://database.py) - *Updated in recent commit*
 - [export_user_ids.py](file://export_user_ids.py)
 - [constants.py](file://constants.py)
+- [Bot_new.py](file://Bot_new.py) - *Contains related command implementation*
 </cite>
 
-## Table of Contents
+## Update Summary
+**Changes Made**   
+- Added documentation for the new `/delmoney` command for deducting coins from user accounts
+- Updated the User Data Modification Operations section to include balance deduction functionality
+- Enhanced security and audit mechanisms to reflect coin removal operations
+- Added new sequence diagram for the `/delmoney` command workflow
+- Updated section sources to reflect changes in admin2.py and database.py
+
+**Table of Contents**
 1. [Introduction](#introduction)
 2. [Administrative Command Structure](#administrative-command-structure)
 3. [User Data Modification Operations](#user-data-modification-operations)
@@ -35,7 +44,7 @@ G --> H["Notify Affected Users"]
 ```
 
 **Diagram sources**
-- [admin2.py](file://admin2.py#L112-L128)
+- [admin2.py](file://admin2.py#L112-L149)
 - [constants.py](file://constants.py#L74)
 
 **Section sources**
@@ -46,30 +55,34 @@ G --> H["Notify Affected Users"]
 
 The system provides several commands for modifying user data through the Player model in the database. These operations include balance adjustments, VIP status changes, and inventory modifications, all implemented with proper validation and error handling. The addvip_command function allows administrators to grant VIP status to individual users or all users simultaneously, with the duration specified in days. The operation calculates the expiration timestamp by converting days to seconds and updating the vip_until field in the Player model. Similarly, the addautosearch_command enables administrators to grant additional auto-search boosts to users, increasing their daily search limit for a specified period.
 
+The system now includes the `/delmoney` command, which allows the Creator to deduct coins from user accounts. This functionality complements the existing `/addcoins` command and provides complete balance management capabilities. When executing `/delmoney`, administrators must specify the amount to deduct and the target user (by user ID or @username). The system validates that the user has sufficient funds before processing the transaction and returns an appropriate error message if the balance would become negative.
+
 ```mermaid
 sequenceDiagram
 participant Admin as "Administrator"
 participant Bot as "Telegram Bot"
 participant DB as "Database"
-Admin->>Bot : /addvip @username 7
+Admin->>Bot : /delmoney @username 100
 Bot->>Bot : Validate permissions
 Bot->>Bot : Parse arguments
 Bot->>DB : Query Player by username
 DB-->>Bot : Return Player record
-Bot->>Bot : Calculate new VIP expiration
-Bot->>DB : Update vip_until field
+Bot->>Bot : Check sufficient balance
+Bot->>DB : Update coins field (decrement)
 DB-->>Bot : Confirm update
 Bot->>Admin : Send success notification
-Bot->>User : Send VIP grant notification
+Bot->>User : Send balance deduction notification
 ```
 
 **Diagram sources**
 - [admin2.py](file://admin2.py#L300-L350)
 - [database.py](file://database.py#L19-L38)
+- [Bot_new.py](file://Bot_new.py#L4766-L4855)
 
 **Section sources**
 - [admin2.py](file://admin2.py#L300-L350)
 - [database.py](file://database.py#L19-L38)
+- [Bot_new.py](file://Bot_new.py#L4766-L4855)
 
 ## Data Export and Compliance
 
@@ -103,6 +116,8 @@ WriteTXT --> End
 ## Security and Audit Mechanisms
 
 The administrative system implements comprehensive security and audit mechanisms to ensure the integrity and traceability of all privileged operations. Every administrative action is logged in the database with details including the timestamp, actor ID, action type, and relevant details. The system maintains a hierarchical permission model where only the Creator (identified by username in ADMIN_USERNAMES) and Level 3 administrators can execute the most sensitive operations. All commands perform permission validation at execution time, preventing unauthorized access even if command syntax is known. The audit trail is stored in the ModerationLog table, which records critical information about each administrative action, enabling retrospective analysis and compliance verification.
+
+The system now logs coin deduction operations with the action type 'remove_coins' in the ModerationLog table. This ensures that all balance modifications, whether additions or deductions, are properly tracked and auditable. The log entry includes the amount deducted and the target user ID, providing complete transparency for financial operations.
 
 ```mermaid
 classDiagram
@@ -141,10 +156,13 @@ ModerationLog --> Player : "target_id references"
 **Section sources**
 - [database.py](file://database.py#L2430-L2470)
 - [admin.py](file://admin.py#L159-L183)
+- [database.py](file://database.py#L2144-L2186)
 
 ## Safeguards Against Misuse
 
-The system incorporates multiple safeguards to prevent misuse of administrative privileges and protect user data. These safeguards include permission validation, operation logging, and user notifications. When an administrator performs an action that affects a user, such as granting VIP status or removing a boost, the affected user receives a notification message through the Telegram bot. This transparency ensures that users are aware of changes to their account status. Additionally, the system implements parameter validation for all commands, preventing invalid inputs from causing unintended consequences. The hierarchical permission model restricts the most sensitive operations, such as adding coins, to the Creator role only, minimizing the risk of unauthorized balance modifications.
+The system incorporates multiple safeguards to prevent misuse of administrative privileges and protect user data. These safeguards include permission validation, operation logging, and user notifications. When an administrator performs an action that affects a user, such as granting VIP status or removing a boost, the affected user receives a notification message through the Telegram bot. This transparency ensures that users are aware of changes to their account status. Additionally, the system implements parameter validation for all commands, preventing invalid inputs from causing unintended consequences. The hierarchical permission model restricts the most sensitive operations, such as adding or removing coins, to the Creator role only, minimizing the risk of unauthorized balance modifications.
+
+The `/delmoney` command includes specific safeguards to prevent accidental or malicious balance depletion. The system checks that the user has sufficient funds before processing the transaction and returns a detailed error message if the requested amount exceeds the current balance. This prevents negative account balances and provides administrators with clear feedback about transaction failures.
 
 ```mermaid
 graph TD

@@ -2,10 +2,18 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [Bot_new.py](file://Bot_new.py)
-- [database.py](file://database.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit*
+- [database.py](file://database.py) - *Updated in recent commit*
 - [constants.py](file://constants.py)
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added documentation for new 'sell all but one' functionality
+- Updated inventory display section to include quantity-based sorting
+- Added new section for 'sell all but one' business logic
+- Updated sequence diagram to reflect new sell action types
+- Enhanced security section with new error code documentation
 
 ## Table of Contents
 1. [Introduction](#introduction)
@@ -24,15 +32,15 @@ The Receiver System enables players to sell energy drinks and other inventory it
 
 The Receiver System consists of three main components that work together to process item sales:
 
-1. **Command Handlers in Bot_new.py**: The `handle_sell_action` function processes sell requests from users, validates inputs, and coordinates with the database layer.
-2. **Database Operations in database.py**: The `sell_inventory_item` function performs atomic updates to inventory and balance records within a database transaction.
+1. **Command Handlers in Bot_new.py**: The `handle_sell_action` and `handle_sell_all_but_one` functions process sell requests from users, validate inputs, and coordinate with the database layer.
+2. **Database Operations in database.py**: The `sell_inventory_item` and `sell_all_but_one` functions perform atomic updates to inventory and balance records within a database transaction.
 3. **Pricing Configuration in constants.py**: The `RECEIVER_PRICES` and `RECEIVER_COMMISSION` constants define the economic model for item sales.
 
 The system uses callback queries to handle sell actions, with specific data patterns like `sell_{item_id}` and `sellall_{item_id}` to distinguish between selling one item or all items of a type.
 
 **Section sources**
-- [Bot_new.py](file://Bot_new.py#L952-L1008)
-- [database.py](file://database.py#L2733-L2763)
+- [Bot_new.py](file://Bot_new.py#L1161-L1359) - *Updated in recent commit*
+- [database.py](file://database.py#L2917-L3189) - *Updated in recent commit*
 - [constants.py](file://constants.py#L65-L72)
 
 ## Business Logic Flow
@@ -57,14 +65,34 @@ DB->>DB : Update inventory quantity
 DB-->>Bot : Return transaction result
 Bot->>User : Show success/failure notification
 Bot->>User : Refresh inventory display
+User->>Bot : Click "Sell All But One" button
+Bot->>Bot : Acquire lock (sell_all_but_one : user_id : item_id)
+Bot->>DB : sell_all_but_one(user_id, item_id)
+DB->>DB : Validate ownership and quantity > 1
+DB->>Constants : get_receiver_unit_payout(rarity)
+Constants-->>DB : Return payout amount
+DB->>DB : Calculate total payout
+DB->>DB : Update player coins (atomic)
+DB->>DB : Update inventory quantity to 1
+DB-->>Bot : Return transaction result
+Bot->>User : Show success/failure notification
+Bot->>User : Refresh inventory display
 ```
 
 **Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L952-L1008)
-- [database.py](file://database.py#L2733-L2763)
+- [Bot_new.py](file://Bot_new.py#L1161-L1359) - *Updated in recent commit*
+- [database.py](file://database.py#L2917-L3189) - *Updated in recent commit*
 - [constants.py](file://constants.py#L65-L72)
 
 When a player initiates a sale, the system first acquires a lock using `_get_lock(f"sell:{user_id}:{item_id}")` to prevent race conditions from double-clicking. The `handle_sell_action` function then calls `db.sell_inventory_item` with the user ID, item ID, and quantity to sell. For selling all items of a type, the quantity is set to a very large number (`10**9`), which the database layer normalizes to the available quantity.
+
+### Sell All But One Logic
+
+A new feature allows players to sell all items of a type except one. This is handled by the `handle_sell_all_but_one` function in `Bot_new.py`, which calls the `sell_all_but_one` function in `database.py`. The system validates that the player owns the item and has more than one item in their inventory. If valid, it calculates the payout for all items except one and updates the inventory to retain exactly one item.
+
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L1210-L1359) - *Added in recent commit*
+- [database.py](file://database.py#L2990-L3189) - *Added in recent commit*
 
 ## Pricing Mechanism
 
@@ -83,7 +111,7 @@ style ReturnPayout fill:#bbf,stroke:#333
 
 **Diagram sources**
 - [constants.py](file://constants.py#L65-L72)
-- [database.py](file://database.py#L2705-L2731)
+- [database.py](file://database.py#L2907-L2915)
 
 The `get_receiver_unit_payout` function in `database.py` calculates the payout per item by applying the commission rate to the base price. For example, with a 30% commission rate (`RECEIVER_COMMISSION = 0.30`), a Basic energy drink with a base price of 10 septims yields 7 septims when sold (10 × (1 - 0.30) = 7).
 
@@ -107,7 +135,7 @@ These examples demonstrate the dynamic pricing based on item attributes, where r
 
 **Section sources**
 - [constants.py](file://constants.py#L65-L72)
-- [database.py](file://database.py#L2705-L2731)
+- [database.py](file://database.py#L2907-L2915)
 
 ## Inventory and Economic Integration
 
@@ -161,8 +189,15 @@ The system returns detailed transaction results including:
 - `item_left_qty`: Remaining inventory quantity
 
 **Section sources**
-- [database.py](file://database.py#L2733-L2763)
-- [Bot_new.py](file://Bot_new.py#L986-L1008)
+- [database.py](file://database.py#L2917-L3189) - *Updated in recent commit*
+- [Bot_new.py](file://Bot_new.py#L1161-L1359) - *Updated in recent commit*
+
+### Inventory Sorting by Quantity
+
+A new inventory view has been added specifically for the Receiver system that sorts items by quantity. The `show_inventory_by_quantity` function in `Bot_new.py` displays the player's inventory sorted by item quantity in descending order. This helps players quickly identify items they have in large quantities and may want to sell.
+
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L790-L890) - *Added in recent commit*
 
 ## Security and Anti-Cheat Measures
 
@@ -180,6 +215,8 @@ The `sell_inventory_item` function includes specific checks for:
 - Ownership (`forbidden`)
 - Quantity validity (`bad_quantity`, `empty`)
 - Supported rarity (`unsupported_rarity`)
+
+The `sell_all_but_one` function adds an additional check for `not_enough_items` when the player has only one item.
 
 ### Atomic Updates
 All database operations are performed atomically within a single transaction. This prevents race conditions and ensures that inventory decrements and coin increments happen simultaneously. The use of `dbs.commit()` only after all operations are validated ensures data consistency.
@@ -210,12 +247,12 @@ J --> K
 ```
 
 **Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L952-L1008)
-- [database.py](file://database.py#L2733-L2763)
+- [Bot_new.py](file://Bot_new.py#L1161-L1359) - *Updated in recent commit*
+- [database.py](file://database.py#L2917-L3189) - *Updated in recent commit*
 
 **Section sources**
-- [Bot_new.py](file://Bot_new.py#L952-L1008)
-- [database.py](file://database.py#L2733-L2763)
+- [Bot_new.py](file://Bot_new.py#L1161-L1359) - *Updated in recent commit*
+- [database.py](file://database.py#L2917-L3189) - *Updated in recent commit*
 
 ## Configuration and Maintenance
 
@@ -273,10 +310,11 @@ This section addresses common issues encountered with the Receiver System and th
 - **bad_quantity**: Invalid quantity requested
 - **empty**: No items available to sell
 - **unsupported_rarity**: Rarity not configured for selling
+- **not_enough_items**: Not enough items to sell all but one (requires more than 1)
 - **exception**: Internal server error
 
-These errors are handled gracefully with user-friendly messages in the `handle_sell_action` function.
+These errors are handled gracefully with user-friendly messages in the `handle_sell_action` and `handle_sell_all_but_one` functions.
 
 **Section sources**
-- [Bot_new.py](file://Bot_new.py#L986-L1008)
-- [database.py](file://database.py#L2733-L2763)
+- [Bot_new.py](file://Bot_new.py#L1161-L1359) - *Updated in recent commit*
+- [database.py](file://database.py#L2917-L3189) - *Updated in recent commit*

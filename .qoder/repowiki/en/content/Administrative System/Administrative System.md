@@ -4,9 +4,19 @@
 **Referenced Files in This Document**   
 - [admin.py](file://admin.py)
 - [admin2.py](file://admin2.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit*
 - [database.py](file://database.py)
 - [constants.py](file://constants.py)
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added documentation for the new `/delmoney` command and money leaderboard functionality introduced in commit `c3085cc3569a1064f9bf4609c594c08d4882333f`
+- Updated **System Configuration Capabilities** section to include the new `/delmoney` command
+- Added new **Money Leaderboard Functionality** section under **System Configuration Capabilities**
+- Updated **Command Registration and Execution** section to reflect changes in command handling
+- Enhanced **Security Considerations** with additional context about the new financial command
+- Updated section sources to reflect newly analyzed files and modified sections
 
 ## Table of Contents
 1. [Multi-Level Permission Structure](#multi-level-permission-structure)
@@ -75,16 +85,19 @@ The administrative system provides extensive system configuration capabilities t
 
 The inventory management system centers around the `BonusStock` and `TgPremiumStock` database models, which track available quantities of various bonuses and Telegram Premium subscriptions. Administrators can query current stock levels using the `/stock` and `/tgstock` commands, which retrieve values from their respective database tables. The system supports both incremental adjustments (`/stockadd`, `/tgadd`) and absolute value setting (`/stockset`, `/tgset`), providing flexibility in inventory management.
 
-Financial operations are implemented through commands like `/addcoins`, which allows bootstrap creators to directly credit user accounts with coins. This command supports both direct user ID specification and reply-to-message functionality, making it convenient to reward users who have interacted with the bot. The system also manages purchase receipts through the `PurchaseReceipt` model, allowing administrators to verify transactions and update their status through commands like `/verifyreceipt`.
+Financial operations are implemented through commands like `/addcoins` and the newly added `/delmoney`, which allow bootstrap creators to directly credit or debit user accounts with coins. The `/delmoney` command supports both direct user ID specification and reply-to-message functionality, making it convenient to penalize users who have violated community guidelines. This command requires bootstrap creator status and includes comprehensive audit logging.
 
 The system includes specialized commands for managing user privileges and bonuses. The `/addvip` command grants VIP status to individual users or all users simultaneously, updating the `vip_until` field in the `players` table. Similarly, the `/addautosearch` command modifies the auto-search capabilities of users by adjusting the `auto_search_boost_count` and `auto_search_boost_until` fields, effectively granting temporary increases in daily search limits.
 
 Administrative oversight is enhanced through comprehensive reporting commands. The `/listboosts` command displays all users with active auto-search boosts, while `/booststats` provides statistical insights into boost usage patterns. The `/boosthistory` command offers detailed audit trails of boost grants and removals, including information about which administrator performed each action. These reporting capabilities enable administrators to monitor system usage and identify potential abuse patterns.
 
+Additionally, the system now includes money leaderboard functionality accessible through the `/money_leaderboard` command, which displays users ranked by their coin balances with appropriate visual indicators for VIP status.
+
 **Section sources**
 - [admin2.py](file://admin2.py#L235-L252)
 - [database.py](file://database.py#L1698-L1740)
 - [admin2.py](file://admin2.py#L112-L128)
+- [Bot_new.py](file://Bot_new.py#L5059-L5091) - *Updated in recent commit*
 
 ## Command Registration and Execution
 
@@ -104,6 +117,7 @@ All administrative actions that modify system state are accompanied by audit log
 - [admin.py](file://admin.py#L0-L15)
 - [admin2.py](file://admin2.py#L112-L128)
 - [admin.py](file://admin.py#L159-L183)
+- [Bot_new.py](file://Bot_new.py#L4763-L4859) - *Updated in recent commit*
 
 ## Database Schema Relationships
 
@@ -141,7 +155,7 @@ The database schema includes several security-oriented design elements. The `adm
 **Section sources**
 - [admin.py](file://admin.py#L76-L101)
 - [admin2.py](file://admin2.py#L112-L128)
-- [database.py](file://database.py#L2302-L2311)
+- [database.py](file://database.py#2302-L2311)
 
 ## Common Issues and Mitigation Strategies
 

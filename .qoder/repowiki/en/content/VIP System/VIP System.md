@@ -2,10 +2,18 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [Bot_new.py](file://Bot_new.py)
+- [Bot_new.py](file://Bot_new.py) - *Updated in recent commit*
 - [database.py](file://database.py)
 - [constants.py](file://constants.py)
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added documentation for VIP badge display in money leaderboard
+- Updated section on benefit calculation to include leaderboard integration
+- Enhanced economic integration section with new leaderboard functionality
+- Added new code examples from Bot_new.py showing VIP status validation in leaderboard functions
+- Updated section sources to reflect analyzed files
 
 ## Table of Contents
 1. [VIP Subscription Management](#vip-subscription-management)
@@ -39,10 +47,13 @@ Reward enhancement is implemented in the `_perform_energy_search` function, wher
 
 The VIP status is visually represented through the `VIP_EMOJI` (👑) which appears in various interfaces, including search results and the VIP status display. The VIP indicator is conditionally added to messages when the player's `vip_until` timestamp is greater than the current time.
 
+A recent enhancement adds VIP badge support to the money leaderboard display. In the `show_money_leaderboard` function in `Bot_new.py`, the system now checks each player's VIP status using `db.get_vip_until(user_id)` and displays the VIP emoji next to their name if their subscription is active. This provides additional visibility and prestige for VIP players in economic rankings.
+
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L361-L393)
 - [Bot_new.py](file://Bot_new.py#L426-L447)
 - [Bot_new.py](file://Bot_new.py#L628-L652)
+- [Bot_new.py](file://Bot_new.py#L5059-L5091)
 - [constants.py](file://constants.py#L20-L21)
 
 ## Auto-Search Functionality
@@ -87,11 +98,14 @@ The VIP menu interface in `Bot_new.py` integrates with the game's localization s
 
 The system includes integration with the auto-search boost functionality, which allows administrators to grant additional daily search limits through the `/addautosearch` command. This creates a tiered premium experience where VIP status provides the base auto-search capability, while additional boosts provide enhanced usage limits.
 
+A significant enhancement has been added to the economic system with VIP badge support in the money leaderboard. The `show_money_leaderboard` function now displays the VIP emoji (👑) next to players who have an active VIP subscription, providing additional prestige and visibility for premium players in financial rankings. This integration strengthens the economic value proposition of VIP status by extending its benefits to social recognition in multiple leaderboard systems.
+
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L1526-L1549)
 - [Bot_new.py](file://Bot_new.py#L1598-L1617)
 - [admin2.py](file://admin2.py#L374-L456)
 - [constants.py](file://constants.py#L30-L38)
+- [Bot_new.py](file://Bot_new.py#L5059-L5091)
 
 ## Common Issues and Solutions
 

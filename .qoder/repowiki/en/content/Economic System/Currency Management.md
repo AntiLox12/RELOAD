@@ -2,22 +2,33 @@
 
 <cite>
 **Referenced Files in This Document**   
-- [Bot_new.py](file://Bot_new.py)
-- [database.py](file://database.py)
+- [Bot_new.py](file://Bot_new.py) - *Added /delmoney command and money leaderboard functionality in commit c3085cc*
+- [database.py](file://database.py) - *Added decrement_coins and get_money_leaderboard methods in commit c3085cc*
 - [constants.py](file://constants.py)
 </cite>
+
+## Update Summary
+**Changes Made**   
+- Added new section: "Currency Administration and Moderation"
+- Added new section: "Money Leaderboard Integration"
+- Updated "Currency Spending and Transactions" to reflect new administrative transaction capabilities
+- Updated "Data Integrity and Race Condition Prevention" to include new decrement operation safeguards
+- Added new Mermaid diagram for money leaderboard flow
+- Enhanced source tracking with annotations for newly added and modified files
 
 ## Table of Contents
 1. [Introduction](#introduction)
 2. [Currency Earning Mechanisms](#currency-earning-mechanisms)
 3. [Currency Spending and Transactions](#currency-spending-and-transactions)
-4. [Economic Balance Constants](#economic-balance-constants)
-5. [Currency Flow Examples](#currency-flow-examples)
-6. [VIP System Integration](#vip-system-integration)
-7. [Leaderboard Integration](#leaderboard-integration)
-8. [Data Integrity and Race Condition Prevention](#data-integrity-and-race-condition-prevention)
-9. [Performance Optimization](#performance-optimization)
-10. [Troubleshooting Common Issues](#troubleshooting-common-issues)
+4. [Currency Administration and Moderation](#currency-administration-and-moderation)
+5. [Economic Balance Constants](#economic-balance-constants)
+6. [Currency Flow Examples](#currency-flow-examples)
+7. [VIP System Integration](#vip-system-integration)
+8. [Leaderboard Integration](#leaderboard-integration)
+9. [Money Leaderboard Integration](#money-leaderboard-integration)
+10. [Data Integrity and Race Condition Prevention](#data-integrity-and-race-condition-prevention)
+11. [Performance Optimization](#performance-optimization)
+12. [Troubleshooting Common Issues](#troubleshooting-common-issues)
 
 ## Introduction
 The septims currency system in the RELOAD application serves as the primary in-game economy, enabling players to earn, spend, and manage virtual currency through various gameplay mechanics. This document details the implementation of the currency system, focusing on earning mechanisms, spending opportunities, economic balance parameters, and technical safeguards that ensure data integrity. The system is implemented across multiple components, with core functionality residing in Bot_new.py for command handling, database.py for data persistence, and constants.py for economic parameters.
@@ -64,6 +75,36 @@ The septims currency can be spent on various in-game purchases and transactions,
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L1000-L1200)
 - [database.py](file://database.py#L1500-L1800)
+
+## Currency Administration and Moderation
+The RELOAD application now includes administrative commands for managing player currency balances. The /delmoney command allows authorized administrators (defined in ADMIN_USERNAMES) to deduct septims from player accounts. This command can be executed by specifying an amount and target user ID or username, or by replying to a user's message with the desired deduction amount. The system validates administrator privileges before processing any transaction. When executed, the command calls the decrement_coins function in database.py, which ensures the player's balance does not go negative by checking current funds before applying the deduction. Successful transactions are reflected in real-time balance updates and accompanied by audit logging through insert_moderation_log to maintain accountability. This administrative functionality provides game moderators with tools to correct balance errors or enforce game rules while maintaining economic integrity.
+
+```mermaid
+sequenceDiagram
+participant Admin
+participant Bot as Bot_new.py
+participant DB as database.py
+Admin->>Bot : Execute /delmoney <amount> <user>
+Bot->>Bot : Validate admin privileges
+Bot-->>Admin : Error if unauthorized
+Bot->>DB : Call decrement_coins(user_id, amount)
+DB->>DB : Begin transaction with row lock
+DB->>DB : Check current balance vs requested amount
+DB-->>Bot : Return insufficient funds error if needed
+DB->>DB : Deduct amount and update balance
+DB->>DB : Commit transaction
+DB-->>Bot : Return success with new balance
+Bot->>DB : Log moderation action
+Bot->>Admin : Confirm deduction and new balance
+```
+
+**Diagram sources**
+- [Bot_new.py](file://Bot_new.py#L4763-L4859)
+- [database.py](file://database.py#L2144-L2186)
+
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L4763-L4859)
+- [database.py](file://database.py#L2144-L2186)
 
 ## Economic Balance Constants
 The RELOAD application maintains economic balance through carefully calibrated constants that govern currency flow. Key constants include DAILY_BONUS_COOLDOWN (86400 seconds) which limits daily bonus claims to once per day, and SEARCH_COOLDOWN (300 seconds) which regulates the frequency of energy drink searches. The TRANSACTION_COOLDOWN is implicitly managed through these search and bonus cooldowns. VIP players benefit from reduced cooldowns (50% of standard) and doubled search rewards, creating a tiered economic system. Price structures for shop items and receiver payouts are defined in constants, with SHOP_PRICES determining purchase costs and RECEIVER_PRICES establishing base values for selling items. These constants work together to create a sustainable in-game economy that prevents inflation while rewarding active participation.
@@ -126,32 +167,33 @@ The currency system integrates with leaderboards to display player wealth rankin
 - [Bot_new.py](file://Bot_new.py#L200-L300)
 - [database.py](file://database.py#L100-L150)
 
-## Data Integrity and Race Condition Prevention
-The RELOAD application employs robust mechanisms to ensure data integrity and prevent race conditions during concurrent transactions. The system uses asyncio.Lock objects to serialize access to critical operations, with separate locks for different transaction types (e.g., user:{user_id}:search, user:{user_id}:bonus). Database operations are performed within transactions using SQLAlchemy's with_for_update() method, which applies row-level locks to prevent concurrent modifications. The increment_coins function in database.py demonstrates this approach by using a database-level lock to ensure atomic balance updates. Additionally, the application uses session management to maintain transactional consistency, with proper commit and rollback procedures. These measures collectively prevent common issues like double-spending, balance corruption, and inconsistent state that could arise from concurrent access.
+## Money Leaderboard Integration
+A dedicated money leaderboard has been implemented to showcase players with the highest septim balances. The /money_leaderboard command (handled by show_money_leaderboard in Bot_new.py) retrieves the top players based on their coin balances from the database. The get_money_leaderboard function in database.py queries the Player table, filtering for users with positive coin balances and ordering results in descending order. The leaderboard displays up to 10 players with position indicators (🥇, 🥈, 🥉 for top three), usernames, and their septim balances formatted with thousand separators. VIP players are denoted with the VIP_EMOJI (👑) next to their names. This leaderboard provides a clear visualization of economic success within the game, encouraging players to accumulate wealth and compete for top positions. The leaderboard is dynamically updated as transactions occur, ensuring real-time accuracy.
 
 ```mermaid
-sequenceDiagram
-participant Player
-participant Bot as Bot_new.py
-participant DB as database.py
-participant Lock as asyncio.Lock
-Player->>Bot : Initiate Transaction
-Bot->>Lock : Acquire user-specific lock
-Lock-->>Bot : Lock acquired
-Bot->>DB : Begin transaction with row lock
-DB-->>Bot : Row locked
-Bot->>DB : Update balance
-DB-->>Bot : Balance updated
-Bot->>DB : Commit transaction
-DB-->>Bot : Transaction committed
-Bot->>Lock : Release lock
-Lock-->>Bot : Lock released
-Bot->>Player : Transaction complete
+flowchart TD
+AdminOrPlayer["Player or Admin"] --> TriggerCommand["Trigger /money_leaderboard"]
+TriggerCommand --> CallHandler["Call show_money_leaderboard"]
+CallHandler --> QueryDB["Call get_money_leaderboard()"]
+QueryDB --> FilterPlayers["Filter Players with coins > 0"]
+FilterPlayers --> SortDescending["Sort by coins DESC"]
+SortDescending --> LimitResults["Limit to 10 players"]
+LimitResults --> FormatOutput["Format Output with Medals and VIP Badges"]
+FormatOutput --> DisplayLeaderboard["Display Leaderboard in Chat"]
+DisplayLeaderboard --> End
+NoPlayers["No Players with Coins"] --> DisplayEmpty["Show 'No one has accumulated money yet'"]
 ```
 
 **Diagram sources**
-- [Bot_new.py](file://Bot_new.py#L400-L500)
-- [database.py](file://database.py#L1981-L2002)
+- [Bot_new.py](file://Bot_new.py#L5059-L5091)
+- [database.py](file://database.py#L3430-L3462)
+
+**Section sources**
+- [Bot_new.py](file://Bot_new.py#L5059-L5091)
+- [database.py](file://database.py#L3430-L3462)
+
+## Data Integrity and Race Condition Prevention
+The RELOAD application employs robust mechanisms to ensure data integrity and prevent race conditions during concurrent transactions. The system uses asyncio.Lock objects to serialize access to critical operations, with separate locks for different transaction types (e.g., user:{user_id}:search, user:{user_id}:bonus). Database operations are performed within transactions using SQLAlchemy's with_for_update() method, which applies row-level locks to prevent concurrent modifications. The increment_coins function in database.py demonstrates this approach by using a database-level lock to ensure atomic balance updates. Additionally, the application uses session management to maintain transactional consistency, with proper commit and rollback procedures. These measures collectively prevent common issues like double-spending, balance corruption, and inconsistent state that could arise from concurrent access. The newly added decrement_coins function follows the same pattern, ensuring that balance deductions are also atomic and thread-safe.
 
 **Section sources**
 - [Bot_new.py](file://Bot_new.py#L400-L500)
