@@ -6,4 +6,7 @@ bot_data.db
 *.db
 
 # Кэш Python
-__pycache__/ 
+__pycache__/
+
+# IDE settings
+.qoder 
