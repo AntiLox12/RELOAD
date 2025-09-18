@@ -889,7 +889,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_row = []
         for item in page_items:
             btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {item.drink.name}"
-            callback = f"view_{item.id}"
+            callback = f"view_{item.id}_p{page}"
             current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
             if len(current_row) == 2:
                 keyboard_rows.append(current_row)
@@ -1076,7 +1076,7 @@ async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAU
         current_row = []
         for item in page_items:
             btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {item.drink.name} ({item.quantity})"
-            callback = f"view_{item.id}"
+            callback = f"view_{item.id}_rp{page}"
             current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
             if len(current_row) == 2:
                 keyboard_rows.append(current_row)
@@ -1134,7 +1134,23 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     try:
-        item_id = int(query.data.split('_')[1])
+        # Парсим callback_data: view_{item_id} или view_{item_id}_p{page} или view_{item_id}_rp{page}
+        parts = query.data.split('_')
+        item_id = int(parts[1])
+        
+        # Определяем страницу и тип инвентаря
+        page = 1
+        inventory_type = 'normal'  # normal или receiver
+        
+        if len(parts) > 2:
+            page_part = parts[2]
+            if page_part.startswith('p'):
+                page = int(page_part[1:])
+                inventory_type = 'normal'
+            elif page_part.startswith('rp'):
+                page = int(page_part[2:])
+                inventory_type = 'receiver'
+                
     except (IndexError, ValueError):
         await query.answer("Ошибка идентификатора предмета", show_alert=True)
         return
@@ -1178,7 +1194,16 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
                     callback_data=f"sellallbutone_{inventory_item.id}"
                 )
             ])
-    rows.append([InlineKeyboardButton("🔙 Назад к инвентарю", callback_data='inventory')])
+    
+    # Кнопка возврата с сохранением страницы
+    if inventory_type == 'receiver':
+        back_callback = f'receiver_qty_p{page}'
+        back_text = '🔙 Назад к Приёмнику'
+    else:
+        back_callback = f'inventory_p{page}' if page > 1 else 'inventory'
+        back_text = '🔙 Назад к инвентарю'
+        
+    rows.append([InlineKeyboardButton(back_text, callback_data=back_callback)])
     keyboard = InlineKeyboardMarkup(rows)
 
     image_full_path = os.path.join(ENERGY_IMAGES_DIR, drink.image_path) if drink.image_path else None
