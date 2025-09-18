@@ -1710,12 +1710,29 @@ async def show_plantation_shop(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         drinks = db.get_all_drinks() or []
         if drinks:
-            pick = random.sample(drinks, min(3, len(drinks)))
-            seed_types = db.ensure_seed_types_for_drinks([int(d.id) for d in pick]) or []
+            # Исключаем энергетики с is_special=True из семян для плантаций
+            non_special_drinks = [d for d in drinks if not getattr(d, 'is_special', False)]
+            if non_special_drinks:
+                pick = random.sample(non_special_drinks, min(3, len(non_special_drinks)))
+                seed_types = db.ensure_seed_types_for_drinks([int(d.id) for d in pick]) or []
+            else:
+                # Если нет обычных энергетиков, фильтруем существующие семена
+                all_seed_types = db.list_seed_types() or []
+                seed_types = [st for st in all_seed_types 
+                            if st.drink_id and st.drink 
+                            and not getattr(st.drink, 'is_special', False)]
         else:
-            seed_types = db.list_seed_types() or []
+            # Фильтруем существующие семена от Special энергетиков
+            all_seed_types = db.list_seed_types() or []
+            seed_types = [st for st in all_seed_types 
+                        if st.drink_id and st.drink 
+                        and not getattr(st.drink, 'is_special', False)]
     except Exception:
-        seed_types = db.list_seed_types() or []
+        # Фильтруем существующие семена от Special энергетиков
+        all_seed_types = db.list_seed_types() or []
+        seed_types = [st for st in all_seed_types 
+                    if st.drink_id and st.drink 
+                    and not getattr(st.drink, 'is_special', False)]
 
     lines = [f"<b>🛒 Магазин семян</b>", f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов"]
     keyboard = []
