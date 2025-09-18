@@ -58,7 +58,7 @@ VIP_PLUS_DURATIONS_SEC = {
 }
 
 # --- TG Premium ---
-TG_PREMIUM_COST = 600000
+TG_PREMIUM_COST = 600000 
 TG_PREMIUM_DURATION_SEC = 90 * 24 * 60 * 60  # ~90 дней
 
 # --- Администрирование (bootstrap) ---
@@ -94,29 +94,29 @@ SILK_INVESTMENT_LEVELS = {
         'cost': 1000,
         'trees': 10,
         'grow_time': 24 * 60 * 60,  # 24 часа
-        'min_yield': 35,
-        'max_yield': 45,
+        'min_yield': 30,
+        'max_yield': 38,
     },
     'standard': {
         'cost': 5000,
         'trees': 50,
         'grow_time': 48 * 60 * 60,  # 48 часов
-        'min_yield': 170,
-        'max_yield': 200,
+        'min_yield': 140,
+        'max_yield': 165,
     },
     'premium': {
         'cost': 15000,
         'trees': 150,
         'grow_time': 72 * 60 * 60,  # 72 часа
-        'min_yield': 520,
-        'max_yield': 580,
+        'min_yield': 420,
+        'max_yield': 480,
     },
     'master': {
         'cost': 50000,
         'trees': 500,
         'grow_time': 96 * 60 * 60,  # 96 часов
-        'min_yield': 1700,
-        'max_yield': 1900,
+        'min_yield': 1300,
+        'max_yield': 1500,
     },
 }
 
@@ -125,19 +125,19 @@ SILK_TYPES = {
     'raw': {
         'name': 'Сырой шёлк',
         'emoji': '🧵',
-        'base_price': 30,
+        'base_price': 25,
         'probability': 70,  # вероятность получения в %
     },
     'refined': {
         'name': 'Рафинированный шёлк',
         'emoji': '🪡',
-        'base_price': 40,  # +33% к базовой стоимости
+        'base_price': 32,  # было 40
         'probability': 25,
     },
     'premium': {
         'name': 'Премиум шёлк',
         'emoji': '✨',
-        'base_price': 50,  # +67% к базовой стоимости
+        'base_price': 40,  # было 50
         'probability': 5,
     },
 }
@@ -161,9 +161,9 @@ SILK_NOTIFICATION_TIME = 30
 
 # Рыночные цены на шёлк (базовая стоимость может колебаться)
 SILK_MARKET_PRICES = {
-    'raw': {'min': 25, 'max': 35},
-    'refined': {'min': 35, 'max': 45},
-    'premium': {'min': 45, 'max': 55},
+    'raw': {'min': 22, 'max': 28},
+    'refined': {'min': 28, 'max': 36},
+    'premium': {'min': 36, 'max': 44},
 }
 
 # Эмодзи для системы шёлка
