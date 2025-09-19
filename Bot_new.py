@@ -84,6 +84,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def safe_format_timestamp(timestamp, format_str='%d.%m.%Y %H:%M'):
+    """Безопасное форматирование временной метки."""
+    if not timestamp:
+        return None
+    try:
+        # Проверяем что таймстамп в разумных пределах
+        if timestamp < 0 or timestamp > 4102444800:  # максимум до 2100 года
+            return None
+        return time.strftime(format_str, time.localtime(timestamp))
+    except (OSError, ValueError, OverflowError) as e:
+        logger.warning(f"Invalid timestamp {timestamp}: {e}")
+        return None
+
 # --- Константы ---
 # см. constants.py
 
@@ -663,7 +676,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     # Формируем сообщение
     rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
     vip_ts = db.get_vip_until(user_id)
-    vip_line = f"\n{VIP_EMOJI} V.I.P до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_ts))}" if vip_ts and time.time() < vip_ts else ''
+    vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}" if vip_ts and time.time() < vip_ts and safe_format_timestamp(vip_ts) else ''
     # TODO: применить эффекты VIP (механика шансов/кд) по согласованию
     caption = (
         f"🎉 Ты нашел энергетик!{vip_line}\n\n"
@@ -798,7 +811,7 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Формируем сообщение
     rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
     vip_ts = db.get_vip_until(user.id)
-    vip_line = f"\n{VIP_EMOJI} V.I.P до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_ts))}" if vip_ts and time.time() < vip_ts else ''
+    vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}" if vip_ts and time.time() < vip_ts and safe_format_timestamp(vip_ts) else ''
     # TODO: применить эффекты VIP (механика шансов/доп. бонусов) по согласованию
     caption = (
         f"🎉 Ты получил свой ежедневный бонус!{vip_line}\n\n"
@@ -971,11 +984,11 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if vip_plus_active:
         vip_line = (
-            f"{VIP_PLUS_EMOJI} V.I.P+ до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_plus_ts))}\n"
+            f"{VIP_PLUS_EMOJI} V.I.P+ до: {safe_format_timestamp(vip_plus_ts) or 'Невалидная дата'}\n"
         )
     elif vip_active:
         vip_line = (
-            f"{VIP_EMOJI} V.I.P до: {time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_ts))}\n"
+            f"{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts) or 'Невалидная дата'}\n"
         )
     else:
         vip_line = f"{VIP_EMOJI} V.I.P: нет\n"
