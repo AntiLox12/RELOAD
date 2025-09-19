@@ -253,23 +253,23 @@ TEXTS = {
     # --- VIP+ submenu ---
     'vip_plus': {'ru': 'V.I.P+', 'en': 'V.I.P+'},
     'vip_plus_title': {
-        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)',
-        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)'
+        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)',
+        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)'
     },
     'vip_plus_1d': {'ru': '1 День', 'en': '1 Day'},
     'vip_plus_7d': {'ru': '7 дней', 'en': '7 days'},
     'vip_plus_30d': {'ru': '30 дней', 'en': '30 days'},
     'vip_plus_details_1d': {
-        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
     },
     'vip_plus_details_7d': {
-        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
     },
     'vip_plus_details_30d': {
-        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.5\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.5\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
     },
     'vip_plus_buy': {'ru': 'Купить', 'en': 'Buy'},
     'vip_plus_price': {'ru': 'Цена: {cost} септимов', 'en': 'Price: {cost} septims'},
@@ -422,9 +422,16 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
 
-        # Учитываем кулдаун (с VIP - x0.5)
-        vip_active = True  # уже проверили выше
-        eff_search_cd = SEARCH_COOLDOWN / 2 if vip_active else SEARCH_COOLDOWN
+        # Учитываем кулдаун (VIP+ - x0.25, VIP - x0.5)
+        vip_plus_active = db.is_vip_plus(user_id)
+        vip_active = db.is_vip(user_id)  # сначала проверяли VIP выше
+        
+        if vip_plus_active:
+            eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+        elif vip_active:
+            eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+        else:
+            eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
         time_since_last = time.time() - float(getattr(player, 'last_search', 0) or 0.0)
         if time_since_last < eff_search_cd:
             delay = max(1.0, eff_search_cd - time_since_last)
@@ -629,10 +636,17 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     """
     player = db.get_or_create_player(user_id, username)
 
-    # Проверка кулдауна (VIP — в 2 раза меньше)
+    # Проверка кулдауна (VIP — x0.5, VIP+ — x0.25)
     current_time = time.time()
+    vip_plus_active = db.is_vip_plus(user_id)
     vip_active = db.is_vip(user_id)
-    eff_search_cd = SEARCH_COOLDOWN / 2 if vip_active else SEARCH_COOLDOWN
+    
+    if vip_plus_active:
+        eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+    elif vip_active:
+        eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+    else:
+        eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
     if current_time - player.last_search < eff_search_cd:
         time_left = eff_search_cd - (current_time - player.last_search)
         return {"status": "cooldown", "time_left": time_left}
@@ -708,8 +722,15 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         # Предварительная проверка кулдауна для быстрого ответа
         player = db.get_or_create_player(user.id, user.username or user.first_name)
+        vip_plus_active = db.is_vip_plus(user.id)
         vip_active = db.is_vip(user.id)
-        eff_search_cd = SEARCH_COOLDOWN / 2 if vip_active else SEARCH_COOLDOWN
+        
+        if vip_plus_active:
+            eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+        elif vip_active:
+            eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+        else:
+            eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
         if time.time() - player.last_search < eff_search_cd:
             await query.answer("Ещё не время! Подожди немного.", show_alert=True)
             return
@@ -5403,11 +5424,18 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("Поиск уже выполняется…")
         return
     async with lock:
-        # Предварительная проверка кулдауна (учёт VIP), чтобы не показывать спиннер впустую
+        # Предварительная проверка кулдауна (учёт VIP+/VIP), чтобы не показывать спиннер впустую
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         now_ts = time.time()
+        vip_plus_active = db.is_vip_plus(user.id)
         vip_active = db.is_vip(user.id)
-        eff_search_cd = SEARCH_COOLDOWN / 2 if vip_active else SEARCH_COOLDOWN
+        
+        if vip_plus_active:
+            eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+        elif vip_active:
+            eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+        else:
+            eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
         if now_ts - player.last_search < eff_search_cd:
             time_left = eff_search_cd - (now_ts - player.last_search)
             await msg.reply_text(f"Ещё не время! Подожди немного (⏳ {int(time_left // 60)}:{int(time_left % 60):02d}).")
@@ -6039,9 +6067,16 @@ def main():
                         except Exception:
                             pass
                         continue
-                    # Рассчитываем задержку первого запуска с учётом кулдауна (для VIP)
-                    vip_active = True
-                    eff_search_cd = SEARCH_COOLDOWN / 2 if vip_active else SEARCH_COOLDOWN
+                    # Рассчитываем задержку первого запуска с учётом кулдауна (VIP+/VIP)
+                    vip_plus_active = db.is_vip_plus(user_id)
+                    vip_active = db.is_vip(user_id)
+                    
+                    if vip_plus_active:
+                        eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+                    elif vip_active:
+                        eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+                    else:
+                        eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
                     last_search_ts = float(getattr(p, 'last_search', 0) or 0.0)
                     time_since_last = max(0.0, time.time() - last_search_ts)
                     delay = eff_search_cd - time_since_last

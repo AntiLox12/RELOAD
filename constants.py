@@ -47,9 +47,9 @@ VIP_DURATIONS_SEC = {
 # --- VIP+ настройки ---
 VIP_PLUS_EMOJI = '💎'
 VIP_PLUS_COSTS = {
-    '1d': 1000,
-    '7d': 6000,
-    '30d': 20000,
+    '1d': 1500,
+    '7d': 9000,
+    '30d': 30000,
 }
 VIP_PLUS_DURATIONS_SEC = {
     '1d': 24 * 60 * 60,
