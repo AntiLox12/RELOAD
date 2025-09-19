@@ -17,10 +17,26 @@ import database as db
 from constants import (
     SILK_INVESTMENT_LEVELS, SILK_TYPES, SILK_QUALITY_RANGE, 
     SILK_WEATHER_RANGE, SILK_VIP_BONUSES, SILK_MAX_PLANTATIONS,
-    SILK_MARKET_PRICES
+    SILK_MARKET_PRICES, SILK_MAX_YIELD_PER_PLANTATION, 
+    SILK_MAX_QUALITY_GRADE, SILK_MIN_QUALITY_GRADE, SILK_MAX_SALE_AMOUNT
 )
 
 logger = logging.getLogger(__name__)
+
+# --- Функции безопасности ---
+
+def log_suspicious_activity(user_id: int, activity_type: str, details: Dict):
+    """Логирование подозрительной активности."""
+    logger.warning(f"[SILK_SECURITY] User {user_id} - {activity_type}: {details}")
+
+def validate_yield_amount(yield_amount: int, plantation_level: str) -> int:
+    """Проверка и ограничение количества урожая."""
+    max_expected = SILK_INVESTMENT_LEVELS[plantation_level]['max_yield'] * 3  # Макс с бонусами
+    return max(0, min(yield_amount, min(max_expected, SILK_MAX_YIELD_PER_PLANTATION)))
+
+def validate_quality_grade(quality_grade: int) -> int:
+    """Проверка и ограничение уровня качества."""
+    return max(SILK_MIN_QUALITY_GRADE, min(quality_grade, SILK_MAX_QUALITY_GRADE))
 
 # --- Основные функции управления плантациями ---
 
@@ -219,21 +235,30 @@ def harvest_plantation(user_id: int, plantation_id: int) -> Dict:
 
 def calculate_silk_harvest(plantation: SilkPlantation) -> Dict[str, int]:
     """Рассчитать количество и тип шёлка от урожая."""
-    total_yield = plantation.expected_yield
+    total_yield = max(0, min(plantation.expected_yield, 10000))  # Ограничиваем максимальный урожай
     silk_distribution = {}
     
     # Распределяем урожай по типам шёлка согласно вероятностям
-    remaining_yield = total_yield
+    allocated_yield = 0
     
     for silk_type, config in SILK_TYPES.items():
         probability = config['probability'] / 100.0
-        type_yield = int(remaining_yield * probability * random.uniform(0.8, 1.2))
-        silk_distribution[silk_type] = max(0, type_yield)
-        remaining_yield -= type_yield
+        # Фиксируем баг с отрицательным remaining_yield
+        base_amount = int(total_yield * probability)
+        variance = random.uniform(0.8, 1.2)
+        type_yield = int(base_amount * variance)
+        
+        # Убеждаемся, что не превышаем общий урожай
+        type_yield = max(0, min(type_yield, total_yield - allocated_yield))
+        
+        if type_yield > 0:
+            silk_distribution[silk_type] = type_yield
+            allocated_yield += type_yield
     
     # Остаток распределяем в сырой шёлк
-    if remaining_yield > 0:
-        silk_distribution['raw'] = silk_distribution.get('raw', 0) + remaining_yield
+    remaining = total_yield - allocated_yield
+    if remaining > 0:
+        silk_distribution['raw'] = silk_distribution.get('raw', 0) + remaining
     
     return silk_distribution
 
@@ -355,11 +380,25 @@ def sell_silk_to_npc(user_id: int, silk_type: str, quantity: int) -> Dict:
         market_range = SILK_MARKET_PRICES[silk_type]
         current_price = random.randint(market_range['min'], market_range['max'])
         
-        # Учесть качество шёлка
-        quality_bonus = (inventory_item.quality_grade - 300) / 300.0 * 0.2  # ±20% от качества
-        final_price = int(current_price * (1 + quality_bonus))
+        # Учесть качество шёлка с безопасными ограничениями
+        validated_quality = validate_quality_grade(inventory_item.quality_grade)
+        quality_bonus = (validated_quality - 300) / 300.0 * 0.2  # ±20% от качества
+        quality_bonus = max(-0.3, min(quality_bonus, 0.5))  # Ограничиваем бонус -30% до +50%
+        final_price = max(1, int(current_price * (1 + quality_bonus)))  # Минимум 1 монета
         
-        total_earnings = final_price * quantity
+        # Ограничиваем максимальную сумму продажи
+        max_total_earnings = SILK_MAX_SALE_AMOUNT  # Максимум за одну продажу
+        total_earnings = min(final_price * quantity, max_total_earnings)
+        
+        # Логируем подозрительные продажи
+        if total_earnings > 50000:
+            log_suspicious_activity(user_id, "high_silk_sale", {
+                "silk_type": silk_type,
+                "quantity": quantity,
+                "final_price": final_price,
+                "total_earnings": total_earnings,
+                "quality_grade": inventory_item.quality_grade
+            })
         
         # Убрать шёлк из инвентаря
         inventory_item.quantity -= quantity
