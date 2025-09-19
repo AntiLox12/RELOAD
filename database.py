@@ -3129,6 +3129,88 @@ def sell_all_but_one(user_id: int, item_id: int) -> dict:
     finally:
         dbs.close()
 
+def sell_absolutely_all_but_one(user_id: int) -> dict:
+    """Продажа АБСОЛЮТНО всех энергетиков кроме одного экземпляра каждого типа.
+    Возвращает dict: {ok, total_items_sold, total_earned, items_processed, coins_after}
+    """
+    dbs = SessionLocal()
+    try:
+        # Получаем все предметы пользователя
+        user_items = (
+            dbs.query(InventoryItem)
+            .filter(InventoryItem.player_id == user_id)
+            .all()
+        )
+        
+        if not user_items:
+            return {"ok": False, "reason": "no_items"}
+        
+        # Получаем игрока для обновления баланса
+        player = (
+            dbs.query(Player)
+            .filter(Player.user_id == user_id)
+            .with_for_update(read=False)
+            .first()
+        )
+        if not player:
+            # Создаём игрока, если внезапно отсутствует
+            player = Player(user_id=user_id, username=str(user_id))
+            dbs.add(player)
+            dbs.commit()
+            dbs.refresh(player)
+        
+        total_items_sold = 0
+        total_earned = 0
+        items_processed = 0
+        
+        # Обрабатываем каждый предмет
+        for item in user_items:
+            qty_available = int(item.quantity or 0)
+            
+            # Пропускаем предметы с количеством 1 или меньше
+            if qty_available <= 1:
+                continue
+                
+            # Получаем выплату за предмет
+            unit_payout = get_receiver_unit_payout(item.rarity)
+            if unit_payout <= 0:
+                continue  # Пропускаем неподдерживаемые редкости
+            
+            # Продаём все кроме одного
+            qty_to_sell = qty_available - 1
+            item_payout = int(unit_payout) * int(qty_to_sell)
+            
+            total_items_sold += qty_to_sell
+            total_earned += item_payout
+            items_processed += 1
+            
+            # Обновляем количество предмета (оставляем 1)
+            item.quantity = 1
+        
+        # Если ничего не продали
+        if total_items_sold == 0:
+            return {"ok": False, "reason": "nothing_to_sell"}
+        
+        # Начисляем заработанные монеты
+        player.coins = int(player.coins or 0) + int(total_earned)
+        
+        dbs.commit()
+        return {
+            "ok": True,
+            "total_items_sold": int(total_items_sold),
+            "total_earned": int(total_earned),
+            "items_processed": int(items_processed),
+            "coins_after": int(player.coins),
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
 # --- Автопоиск буст: расширенные функции ---
 
 def get_players_with_active_boosts() -> list[Player]:
