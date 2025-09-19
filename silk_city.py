@@ -18,7 +18,8 @@ from constants import (
     SILK_INVESTMENT_LEVELS, SILK_TYPES, SILK_QUALITY_RANGE, 
     SILK_WEATHER_RANGE, SILK_VIP_BONUSES, SILK_MAX_PLANTATIONS,
     SILK_MARKET_PRICES, SILK_MAX_YIELD_PER_PLANTATION, 
-    SILK_MAX_QUALITY_GRADE, SILK_MIN_QUALITY_GRADE, SILK_MAX_SALE_AMOUNT
+    SILK_MAX_QUALITY_GRADE, SILK_MIN_QUALITY_GRADE, SILK_MAX_SALE_AMOUNT,
+    SILK_PLANTATIONS_ENABLED, SILK_TRADING_ENABLED
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,10 @@ def create_plantation(user_id: int, username: str, investment_level: str, planta
     Returns:
         dict: {ok: bool, reason?: str, plantation_id?: int, coins_left?: int}
     """
+    # Проверить, разрешено ли создание новых плантаций
+    if not SILK_PLANTATIONS_ENABLED:
+        return {"ok": False, "reason": "plantations_disabled"}
+    
     if investment_level not in SILK_INVESTMENT_LEVELS:
         return {"ok": False, "reason": "invalid_level"}
     
@@ -359,6 +364,10 @@ def sell_silk_to_npc(user_id: int, silk_type: str, quantity: int) -> Dict:
     Returns:
         dict: {ok: bool, reason?: str, coins_earned?: int, price_per_unit?: int}
     """
+    # Проверить, разрешена ли торговля шёлком
+    if not SILK_TRADING_ENABLED:
+        return {"ok": False, "reason": "trading_disabled"}
+    
     if silk_type not in SILK_TYPES or quantity <= 0:
         return {"ok": False, "reason": "invalid_parameters"}
     

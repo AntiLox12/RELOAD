@@ -15,7 +15,7 @@ import database as db
 import silk_city
 from constants import (
     SILK_INVESTMENT_LEVELS, SILK_TYPES, SILK_EMOJIS, 
-    SILK_MAX_PLANTATIONS
+    SILK_MAX_PLANTATIONS, SILK_PLANTATIONS_ENABLED, SILK_TRADING_ENABLED
 )
 
 # --- Основные функции интерфейса ---
@@ -130,6 +130,19 @@ async def show_silk_create_plantation(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
 
+    # Проверить, разрешено ли создание плантаций
+    if not SILK_PLANTATIONS_ENABLED:
+        text = f"{SILK_EMOJIS['investment']} **СОЗДАНИЕ ПЛАНТАЦИЙ**\n\n"
+        text += "🚫 **Создание новых плантаций временно отключено**\n\n"
+        text += "Пожалуйста, завершите свои текущие плантации и соберите урожай.\n"
+        text += "Новые инвестиции будут доступны поле."
+        
+        keyboard = [[InlineKeyboardButton("🔙 Мои плантации", callback_data='silk_plantations')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await _edit_or_send_message(query, text, reply_markup)
+        return
+
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     is_vip = db.is_vip(user.id)
@@ -192,6 +205,12 @@ async def show_silk_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     silk_inventory = silk_city.get_silk_inventory(user.id)
     
     text = f"{SILK_EMOJIS['market']} **ШЁЛКОВЫЙ РЫНОК**\n\n"
+    
+    # Проверить, разрешена ли торговля
+    if not SILK_TRADING_ENABLED:
+        text += "🚫 **Торговля шёлком временно отключена**\n\n"
+        text += "Ожидайте восстановления рынка для продажи.\n\n"
+    
     text += "📊 **Текущие цены:**\n"
     
     for silk_type, price in current_prices.items():
@@ -204,7 +223,7 @@ async def show_silk_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = []
     
-    if silk_inventory:
+    if silk_inventory and SILK_TRADING_ENABLED:
         for item in silk_inventory:
             config = SILK_TYPES[item.silk_type]
             emoji = config['emoji']
@@ -240,6 +259,16 @@ async def show_silk_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         callback_data=f'silk_sell_{item.silk_type}_all'
                     )
                 ])
+    elif silk_inventory and not SILK_TRADING_ENABLED:
+        # Показать инвентарь без кнопок продажи
+        for item in silk_inventory:
+            config = SILK_TYPES[item.silk_type]
+            emoji = config['emoji']
+            name = config['name']
+            price = current_prices[item.silk_type]
+            total_value = price * item.quantity
+            
+            text += f"{emoji} {name}: {item.quantity} шт. (потенциал: {total_value:,} 🪙)\n"
     else:
         text += "Инвентарь пуст. Соберите урожай с плантаций!"
     
@@ -366,6 +395,11 @@ async def handle_silk_plant(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"Достигнут лимит плантаций ({SILK_MAX_PLANTATIONS}). Завершите существующие.",
                 show_alert=True
             )
+        elif reason == "plantations_disabled":
+            await query.answer(
+                "🚫 Создание новых плантаций временно отключено. Завершите свои текущие плантации.",
+                show_alert=True
+            )
         else:
             await query.answer("Ошибка создания плантации. Попробуйте позже.", show_alert=True)
     
@@ -415,6 +449,14 @@ async def handle_silk_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     query = update.callback_query
     user = query.from_user
     
+    # Проверить, разрешена ли торговля шёлком
+    if not SILK_TRADING_ENABLED:
+        await query.answer(
+            "🚫 Продажа шёлка временно отключена. Ожидайте восстановления рынка.",
+            show_alert=True
+        )
+        return
+    
     # Определить количество
     if quantity_str == "all":
         # Получить весь доступный шёлк этого типа
@@ -450,6 +492,11 @@ async def handle_silk_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         reason = result.get("reason")
         if reason == "insufficient_silk":
             await query.answer("Недостаточно шёлка в инвентаре.", show_alert=True)
+        elif reason == "trading_disabled":
+            await query.answer(
+                "🚫 Продажа шёлка временно отключена. Ожидайте восстановления рынка.",
+                show_alert=True
+            )
         else:
             await query.answer("Ошибка продажи. Попробуйте позже.", show_alert=True)
     
