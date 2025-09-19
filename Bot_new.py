@@ -300,9 +300,16 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
 
-    # Проверка кулдауна поиска (VIP — в 2 раза меньше)
+    # Проверка кулдауна поиска (VIP+ — x0.25, VIP — x0.5)
+    vip_plus_active = db.is_vip_plus(player.user_id)
     vip_active = db.is_vip(player.user_id)
-    search_cd = SEARCH_COOLDOWN / 2 if vip_active else SEARCH_COOLDOWN
+    
+    if vip_plus_active:
+        search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+    elif vip_active:
+        search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+    else:
+        search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
     search_time_left = max(0, search_cd - (time.time() - player.last_search))
     lang = player.language
 
@@ -312,8 +319,11 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         search_status = base_search
 
-    # Проверка кулдауна ежедневного бонуса (VIP — в 2 раза меньше)
-    bonus_cd = DAILY_BONUS_COOLDOWN / 2 if vip_active else DAILY_BONUS_COOLDOWN
+    # Проверка кулдауна ежедневного бонуса (VIP+/VIP — в 2 раза меньше)
+    if vip_plus_active or vip_active:
+        bonus_cd = DAILY_BONUS_COOLDOWN / 2
+    else:
+        bonus_cd = DAILY_BONUS_COOLDOWN
     bonus_time_left = max(0, bonus_cd - (time.time() - player.last_bonus_claim))
     base_bonus = t(lang, 'daily_bonus')
     if bonus_time_left > 0:
