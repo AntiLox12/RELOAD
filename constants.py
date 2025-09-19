@@ -58,7 +58,7 @@ VIP_PLUS_DURATIONS_SEC = {
 }
 
 # --- TG Premium ---
-TG_PREMIUM_COST = 600000 
+TG_PREMIUM_COST = 1000000 
 TG_PREMIUM_DURATION_SEC = 90 * 24 * 60 * 60  # ~90 дней
 
 # --- Администрирование (bootstrap) ---
