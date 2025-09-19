@@ -166,8 +166,8 @@ SILK_MAX_PLANTATIONS = 2
 SILK_NOTIFICATION_TIME = 30
 
 # Флаги временного отключения функций
-SILK_PLANTATIONS_ENABLED = False  # Временно отключить создание новых плантаций
-SILK_TRADING_ENABLED = False      # Временно отключить продажу шёлка
+SILK_PLANTATIONS_ENABLED = True # Временно отключить создание новых плантаций
+SILK_TRADING_ENABLED = True      # Временно отключить продажу шёлка
 
 # Рыночные цены на шёлк (базовая стоимость может колебаться)
 SILK_MARKET_PRICES = {
