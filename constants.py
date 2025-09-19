@@ -107,14 +107,14 @@ SILK_INVESTMENT_LEVELS = {
     'premium': {
         'cost': 15000,
         'trees': 150,
-        'grow_time': 72 * 60 * 60,  # 72 часа
+        'grow_time': 48 * 60 * 60,  # 48 часов (уменьшено с 72)
         'min_yield': 420,
         'max_yield': 480,
     },
-    'master': {
+        'master': {
         'cost': 50000,
         'trees': 500,
-        'grow_time': 96 * 60 * 60,  # 96 часов
+        'grow_time': 60 * 60 * 60,  # 60 часов (уменьшено с 96)
         'min_yield': 1300,
         'max_yield': 1500,
     },
@@ -160,7 +160,7 @@ SILK_VIP_BONUSES = {
 }
 
 # Максимальное количество плантаций у одного игрока
-SILK_MAX_PLANTATIONS = 5
+SILK_MAX_PLANTATIONS = 2
 
 # Время уведомления до готовности урожая (в минутах)
 SILK_NOTIFICATION_TIME = 30
