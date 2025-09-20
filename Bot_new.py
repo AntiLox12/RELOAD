@@ -251,25 +251,25 @@ TEXTS = {
     'vip_auto_state': {'ru': 'Состояние: {state}', 'en': 'State: {state}'},
     'vip_auto_today': {'ru': 'Сегодня: {count}/{limit}', 'en': 'Today: {count}/{limit}'},
     # --- VIP+ submenu ---
-    'vip_plus': {'ru': 'V.I.P+', 'en': 'V.I.P+'},
+    'vip_plus': {'ru': VIP_PLUS_EMOJI + ' V.I.P+', 'en': VIP_PLUS_EMOJI + ' V.I.P+'},
     'vip_plus_title': {
-        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)',
-        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)'
+        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)',
+        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)'
     },
     'vip_plus_1d': {'ru': '1 День', 'en': '1 Day'},
     'vip_plus_7d': {'ru': '7 дней', 'en': '7 days'},
     'vip_plus_30d': {'ru': '30 дней', 'en': '30 days'},
     'vip_plus_details_1d': {
-        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
     },
     'vip_plus_details_7d': {
-        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
     },
     'vip_plus_details_30d': {
-        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 👑 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.5\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 👑 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.5\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
+        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
     },
     'vip_plus_buy': {'ru': 'Купить', 'en': 'Buy'},
     'vip_plus_price': {'ru': 'Цена: {cost} септимов', 'en': 'Price: {cost} septims'},
@@ -319,9 +319,11 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         search_status = base_search
 
-    # Проверка кулдауна ежедневного бонуса (VIP+/VIP — в 2 раза меньше)
-    if vip_plus_active or vip_active:
-        bonus_cd = DAILY_BONUS_COOLDOWN / 2
+    # Проверка кулдауна ежедневного бонуса (VIP+ — x4 скорость, VIP — x2 скорость)
+    if vip_plus_active:
+        bonus_cd = DAILY_BONUS_COOLDOWN / 4  # x4 скорость для VIP+
+    elif vip_active:
+        bonus_cd = DAILY_BONUS_COOLDOWN / 2  # x2 скорость для VIP
     else:
         bonus_cd = DAILY_BONUS_COOLDOWN
     bonus_time_left = max(0, bonus_cd - (time.time() - player.last_bonus_claim))
@@ -699,8 +701,18 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
 
     # Формируем сообщение
     rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
+    
+    # Проверяем VIP статус с приоритетом VIP+
+    vip_plus_ts = db.get_vip_plus_until(user_id)
     vip_ts = db.get_vip_until(user_id)
-    vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}" if vip_ts and time.time() < vip_ts and safe_format_timestamp(vip_ts) else ''
+    current_time = time.time()
+    
+    if vip_plus_ts and current_time < vip_plus_ts and safe_format_timestamp(vip_plus_ts):
+        vip_line = f"\n{VIP_PLUS_EMOJI} VIP+ до: {safe_format_timestamp(vip_plus_ts)}"
+    elif vip_ts and current_time < vip_ts and safe_format_timestamp(vip_ts):
+        vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}"
+    else:
+        vip_line = ''
     # TODO: применить эффекты VIP (механика шансов/кд) по согласованию
     caption = (
         f"🎉 Ты нашел энергетик!{vip_line}\n\n"
@@ -808,8 +820,15 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Проверка кулдауна
         current_time = time.time()
+        vip_plus_active = db.is_vip_plus(user.id)
         vip_active = db.is_vip(user.id)
-        eff_bonus_cd = DAILY_BONUS_COOLDOWN / 2 if vip_active else DAILY_BONUS_COOLDOWN
+        
+        if vip_plus_active:
+            eff_bonus_cd = DAILY_BONUS_COOLDOWN / 4  # x4 скорость для VIP+
+        elif vip_active:
+            eff_bonus_cd = DAILY_BONUS_COOLDOWN / 2  # x2 скорость для VIP
+        else:
+            eff_bonus_cd = DAILY_BONUS_COOLDOWN
         if current_time - player.last_bonus_claim < eff_bonus_cd:
             time_left = int(eff_bonus_cd - (current_time - player.last_bonus_claim))
             hours, remainder = divmod(time_left, 3600)
@@ -832,22 +851,35 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         rarity = random.choices(list(RARITIES.keys()), weights=list(RARITIES.values()), k=1)[0]
 
-    # Добавляем в инвентарь и обновляем игрока
+    # Добавляем в инвентарь, начисляем септимы и обновляем игрока
     db.add_drink_to_inventory(user_id=user.id, drink_id=found_drink.id, rarity=rarity)
+    # Начисляем 20 септимов за ежедневный бонус
+    new_coins = db.increment_coins(user.id, 20)
     db.update_player(user.id, last_bonus_claim=current_time)
     logger.info(
-        f"[DAILY BONUS] User {user.username or user.id} ({user.id}) received {found_drink.name} | rarity={rarity}"
+        f"[DAILY BONUS] User {user.username or user.id} ({user.id}) received {found_drink.name} | rarity={rarity} | +20 coins -> {new_coins}"
     )
 
     # Формируем сообщение
     rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
+    
+    # Проверяем VIP статус с приоритетом VIP+
+    vip_plus_ts = db.get_vip_plus_until(user.id)
     vip_ts = db.get_vip_until(user.id)
-    vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}" if vip_ts and time.time() < vip_ts and safe_format_timestamp(vip_ts) else ''
+    current_time = time.time()
+    
+    if vip_plus_ts and current_time < vip_plus_ts and safe_format_timestamp(vip_plus_ts):
+        vip_line = f"\n{VIP_PLUS_EMOJI} VIP+ до: {safe_format_timestamp(vip_plus_ts)}"
+    elif vip_ts and current_time < vip_ts and safe_format_timestamp(vip_ts):
+        vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}"
+    else:
+        vip_line = ''
     # TODO: применить эффекты VIP (механика шансов/доп. бонусов) по согласованию
     caption = (
         f"🎉 Ты получил свой ежедневный бонус!{vip_line}\n\n"
         f"<b>Название:</b> {found_drink.name}\n"
-        f"<b>Редкость:</b> {rarity_emoji} {rarity}\n\n"
+        f"<b>Редкость:</b> {rarity_emoji} {rarity}\n"
+        f"💰 <b>Награда:</b> +20 септимов\n\n"
         f"<i>{found_drink.description}</i>"
     )
 

@@ -1357,26 +1357,36 @@ def get_fertilizer_status(bed: PlantationBed) -> dict:
                 fert_name = result['fertilizer_name'].lower()
                 effect = getattr(bed.fertilizer, 'effect', '') or ''
                 
-                if 'урожай++' in effect:
-                    result['multiplier'] = 1.6  # +60%
+                # Повышенные множители для лучшей эффективности
+                if 'урожай++' in effect:  # МегаУрожай
+                    result['multiplier'] = 2.5  # +150% (вместо +60%)
                     result['effect_type'] = 'mega_yield'
-                elif 'урожай' in effect:
-                    result['multiplier'] = 1.5  # +50%
+                elif 'урожай' in effect:  # Фосфорное
+                    result['multiplier'] = 2.0  # +100% (вместо +50%)
                     result['effect_type'] = 'yield'
-                elif 'качество' in effect:
-                    result['multiplier'] = 1.0  # не влияет на количество, но улучшает редкость
+                elif 'качество' in effect:  # Калийное, Минерал+
+                    result['multiplier'] = 1.6  # +60% (к количеству + качество)
                     result['effect_type'] = 'quality'
-                elif 'всё' in effect:
-                    result['multiplier'] = 1.4  # +40%
+                elif 'всё' in effect:  # Комплексное
+                    result['multiplier'] = 1.8  # +80% (вместо +40%)
                     result['effect_type'] = 'complex'
-                elif 'рост+кач' in effect:
-                    result['multiplier'] = 1.55  # +55%
+                elif 'рост+кач' in effect:  # Стимул-Х
+                    result['multiplier'] = 2.2  # +120% (вместо +55%)
                     result['effect_type'] = 'growth_quality'
-                elif 'время' in effect:
-                    result['multiplier'] = 1.6  # +60%
+                elif 'время' in effect:  # СуперРост
+                    result['multiplier'] = 2.0  # +100% к урожаю (вместо +60%)
                     result['effect_type'] = 'time'
+                elif 'рост' in effect:  # Азотное
+                    result['multiplier'] = 1.7  # +70% (вместо +40%)
+                    result['effect_type'] = 'growth'
+                elif 'питание' in effect:  # Гумат
+                    result['multiplier'] = 1.8  # +80% (вместо +40%)
+                    result['effect_type'] = 'nutrition'
+                elif 'био' in effect:  # Биоактив
+                    result['multiplier'] = 1.9  # +90% (вместо +45%)
+                    result['effect_type'] = 'bio'
                 else:
-                    result['multiplier'] = 1.4  # +40% базовые удобрения
+                    result['multiplier'] = 1.6  # +60% базовые удобрения (вместо +40%)
                     result['effect_type'] = 'basic'
                 
     except Exception:
@@ -1386,11 +1396,29 @@ def get_fertilizer_status(bed: PlantationBed) -> dict:
 
 
 def _update_bed_ready_if_due(dbs, bed: PlantationBed) -> bool:
-    """Внутренняя: переводит грядку в состояние 'ready', если прошло время роста. Возвращает True, если обновлено."""
+    """Внутренняя: переводит грядку в состояние 'ready', если прошло время роста. Возвращает True, если обновлено.
+    Учитывает эффекты активных удобрений на скорость роста.
+    """
     try:
         if bed and bed.state == 'growing' and bed.seed_type and bed.planted_at:
             now_ts = int(time.time())
-            if now_ts - int(bed.planted_at) >= int(bed.seed_type.grow_time_sec or 0):
+            base_grow_time = int(bed.seed_type.grow_time_sec or 0)
+            
+            # Применяем эффекты удобрений на время роста
+            actual_grow_time = base_grow_time
+            if bed.fertilizer_id and bed.fertilizer:
+                fert_status = get_fertilizer_status(bed)
+                if fert_status['active']:
+                    effect_type = fert_status['effect_type']
+                    # Удобрения на ускорение роста
+                    if effect_type == 'time':  # СуперРост (-время)
+                        actual_grow_time = int(base_grow_time * 0.4)  # Сокращение на 60%
+                    elif effect_type in ('growth_quality', 'complex'):  # Стимул-Х, Комплексное
+                        actual_grow_time = int(base_grow_time * 0.7)  # Сокращение на 30%
+                    elif 'рост' in (bed.fertilizer.effect or ''):  # Азотное (+рост)
+                        actual_grow_time = int(base_grow_time * 0.75)  # Сокращение на 25%
+            
+            if now_ts - int(bed.planted_at) >= actual_grow_time:
                 bed.state = 'ready'
                 dbs.commit()
                 return True
@@ -1567,31 +1595,41 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
             try:
                 # Базовые веса редкостей
                 rarity_weights = {k: float(v) for k, v in RARITIES.items()}
-                # Смещения весов от удобрения и полива
+                # Смещения весов от удобрения и полива - улучшенные эффекты
                 if fert_active:
                     # Различные эффекты в зависимости от типа удобрения
                     if fert_effect_type in ('quality', 'complex', 'growth_quality'):
                         # Усиливаем высокие редкости, снижаем Basic
                         if 'Basic' in rarity_weights:
-                            rarity_weights['Basic'] *= 0.7
-                        for rk in ('Medium', 'Elite', 'Absolute', 'Majestic'):
-                            if rk in rarity_weights:
-                                multiplier = 1.5 if rk == 'Medium' else 2.0 if rk == 'Elite' else 2.5
-                                rarity_weights[rk] *= multiplier
+                            rarity_weights['Basic'] *= 0.5  # Сильнее снижаем Basic
+                        if 'Medium' in rarity_weights:
+                            rarity_weights['Medium'] *= 2.5  # Усиливаем Medium
+                        if 'Elite' in rarity_weights:
+                            rarity_weights['Elite'] *= 4.0  # Значительно усиливаем Elite
+                        if 'Absolute' in rarity_weights:
+                            rarity_weights['Absolute'] *= 6.0  # Сильно усиливаем Absolute
+                        if 'Majestic' in rarity_weights:
+                            rarity_weights['Majestic'] *= 8.0  # Максимально усиливаем Majestic
                     elif fert_effect_type in ('yield', 'mega_yield', 'time'):
-                        # Меньше влияние на редкость, больше на количество
+                        # Средний эффект на редкость
                         if 'Basic' in rarity_weights:
-                            rarity_weights['Basic'] *= 0.9
-                        for rk in ('Medium', 'Elite'):
-                            if rk in rarity_weights:
-                                rarity_weights[rk] *= 1.2
+                            rarity_weights['Basic'] *= 0.7
+                        if 'Medium' in rarity_weights:
+                            rarity_weights['Medium'] *= 1.8
+                        if 'Elite' in rarity_weights:
+                            rarity_weights['Elite'] *= 2.5
+                        if 'Absolute' in rarity_weights:
+                            rarity_weights['Absolute'] *= 3.0
+                        if 'Majestic' in rarity_weights:
+                            rarity_weights['Majestic'] *= 4.0
                     else:
-                        # Базовые удобрения
+                        # Базовые удобрения - умеренный эффект
                         if 'Basic' in rarity_weights:
                             rarity_weights['Basic'] *= 0.8
-                        for rk in ('Medium', 'Elite'):
-                            if rk in rarity_weights:
-                                rarity_weights[rk] *= 1.3
+                        if 'Medium' in rarity_weights:
+                            rarity_weights['Medium'] *= 1.5
+                        if 'Elite' in rarity_weights:
+                            rarity_weights['Elite'] *= 2.0
                 if wc > 0:
                     # Полив чуть усиливает Medium/Elite
                     if 'Medium' in rarity_weights:
