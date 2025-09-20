@@ -68,6 +68,8 @@ from constants import (
     ADMIN_USERNAMES,
     AUTO_SEARCH_DAILY_LIMIT,
     CASINO_WIN_PROB,
+    CASINO_MAX_BET,
+    CASINO_MIN_BET,
     RECEIVER_PRICES,
     RECEIVER_COMMISSION,
     SHOP_PRICES,
@@ -111,6 +113,9 @@ def safe_format_timestamp(timestamp, format_str='%d.%m.%Y %H:%M'):
 ADMIN_USER_IDS: set[int] = set()  # legacy, больше не используется для прав, оставлено для обратной совместимости
 
 ADD_NAME, ADD_DESCRIPTION, ADD_SPECIAL, ADD_PHOTO = range(4)
+
+# Константы для conversation handler казино
+CASINO_CUSTOM_BET = range(1)
 
 PENDING_ADDITIONS: dict[int, dict] = {}
 NEXT_PENDING_ID = 1
@@ -1537,8 +1542,9 @@ async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
     )
     keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 10", callback_data='casino_bet_10'), InlineKeyboardButton("🎲 50", callback_data='casino_bet_50')],
-        [InlineKeyboardButton("🎲 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+        [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+        [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
+        [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
         [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
     ]
@@ -1567,6 +1573,8 @@ async def show_casino_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Игра: подбрасывание монеты (шанс ~{int(CASINO_WIN_PROB * 100)}% в пользу заведения).\n"
         "• Выплата: 1 к 1 (вы получаете свою ставку и столько же сверху).\n"
         "• Ставка списывается сразу. При победе начисляется двойная сумма.\n"
+        f"• Минимальная ставка: {CASINO_MIN_BET} септимов.\n"
+        f"• Максимальная ставка: {CASINO_MAX_BET} септимов.\n"
         "• Играйте ответственно."
     )
     keyboard = [
@@ -1587,6 +1595,11 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     if int(amount) <= 0:
         await query.answer("Неверная ставка", show_alert=True)
+        return
+    
+    # Добавляем валидацию лимитов
+    if int(amount) > CASINO_MAX_BET:
+        await query.answer(f"Ставка слишком большая. Максимум: {CASINO_MAX_BET}", show_alert=True)
         return
 
     lock = _get_lock(f"user:{user.id}:casino")
@@ -1626,8 +1639,9 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
         )
         keyboard = [
-            [InlineKeyboardButton("🎲 Ставка 10", callback_data='casino_bet_10'), InlineKeyboardButton("🎲 50", callback_data='casino_bet_50')],
-            [InlineKeyboardButton("🎲 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+            [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+            [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
+            [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
             [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
             [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         ]
@@ -1650,11 +1664,158 @@ async def open_casino_from_text(update: Update, context: ContextTypes.DEFAULT_TY
         f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
     )
     keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 10", callback_data='casino_bet_10'), InlineKeyboardButton("🎲 50", callback_data='casino_bet_50')],
-        [InlineKeyboardButton("🎲 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+        [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+        [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
+        [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
         [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
     ]
+    await msg.reply_html(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# === НОВЫЕ ФУНКЦИИ КАЗИНО С ПОЛЬЗОВАТЕЛЬСКИМИ СТАВКАМИ ===
+
+async def start_custom_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает conversation для ввода пользовательской ставки."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        "<b>🂰 Введите свою ставку</b>\n\n"
+        f"Ваш баланс: <b>{coins}</b> септимов\n"
+        f"Минимальная ставка: <b>{CASINO_MIN_BET}</b> септимов\n"
+        f"Максимальная ставка: <b>{CASINO_MAX_BET}</b> септимов\n\n"
+        "Напишите сумму своей ставки:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("❌ Отмена", callback_data='city_casino')]
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    
+    return CASINO_CUSTOM_BET
+
+
+async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод пользовательской ставки."""
+    user = update.effective_user
+    msg = update.effective_message
+    
+    if not msg or not msg.text:
+        await msg.reply_text("Пожалуйста, введите число.")
+        return CASINO_CUSTOM_BET
+    
+    try:
+        bet_amount = int(msg.text.strip())
+    except ValueError:
+        await msg.reply_text("Неверный формат. Пожалуйста, введите целое число.")
+        return CASINO_CUSTOM_BET
+    
+    # Валидация ставки
+    if bet_amount < CASINO_MIN_BET:
+        await msg.reply_text(f"Ставка слишком маленькая. Минимум: {CASINO_MIN_BET} септимов.")
+        return CASINO_CUSTOM_BET
+    
+    if bet_amount > CASINO_MAX_BET:
+        await msg.reply_text(f"Ставка слишком большая. Максимум: {CASINO_MAX_BET} септимов.")
+        return CASINO_CUSTOM_BET
+    
+    # Проверяем баланс
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    if coins < bet_amount:
+        await msg.reply_text(f"Недостаточно септимов. У вас: {coins}, нужно: {bet_amount}")
+        return CASINO_CUSTOM_BET
+    
+    # Выполняем ставку
+    lock = _get_lock(f"user:{user.id}:casino")
+    if lock.locked():
+        await msg.reply_text("Игра уже обрабатывается…")
+        return ConversationHandler.END
+    
+    async with lock:
+        # Повторно проверяем баланс
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        coins_before = int(getattr(player, 'coins', 0) or 0)
+        if coins_before < bet_amount:
+            await msg.reply_text("Недостаточно септимов")
+            # Показываем казино и завершаем conversation
+            await show_casino_after_custom_bet(msg, user, context)
+            return ConversationHandler.END
+        
+        # Списываем ставку
+        after_debit = db.increment_coins(user.id, -bet_amount)
+        if after_debit is None:
+            await msg.reply_text("Ошибка при списании")
+            return ConversationHandler.END
+        
+        # Разыгрываем исход
+        win = random.random() < CASINO_WIN_PROB
+        coins_after = after_debit
+        result_line = ""
+        if win:
+            coins_after = db.increment_coins(user.id, bet_amount * 2) or after_debit + bet_amount * 2
+            result_line = f"🎉 Победа! Вы получаете +{bet_amount} септимов."
+        else:
+            result_line = f"💥 Поражение! Списано {bet_amount} септимов."
+        
+        # Показываем результат
+        text = (
+            "<b>🎰 Казино ХайТаун</b>\n"
+            f"{result_line}\n"
+            f"Баланс: <b>{int(coins_after)}</b> септимов.\n\n"
+            f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+        )
+        keyboard = [
+            [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+            [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
+            [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
+            [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
+        ]
+        
+        await msg.reply_html(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    return ConversationHandler.END
+
+
+async def cancel_custom_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет ввод пользовательской ставки."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        # Показываем обычное казино
+        await show_city_casino(update, context)
+    return ConversationHandler.END
+
+
+async def show_casino_after_custom_bet(msg, user, context):
+    """Показывает казино после завершения custom bet."""
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        "<b>🎰 Казино ХайТаун</b>\n"
+        f"Ваш баланс: <b>{coins}</b> септимов.\n\n"
+        f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+    )
+    keyboard = [
+        [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
+        [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
+        [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
+        [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
+    ]
+    
     await msg.reply_html(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -5907,6 +6068,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_add)],
     )
     application.add_handler(add_conv_handler)
+    
+    # Conversation handler для пользовательских ставок в казино
+    casino_custom_bet_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_custom_bet, pattern='^casino_custom_bet$')],
+        states={
+            CASINO_CUSTOM_BET: [MessageHandler(filters.TEXT & (~filters.COMMAND), handle_custom_bet_input)],
+        },
+        fallbacks=[CallbackQueryHandler(cancel_custom_bet, pattern='^city_casino$')],
+        allow_reentry=True
+    )
+    application.add_handler(casino_custom_bet_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
     # ВАЖНО: перехватываем ответы на ForceReply с причиной отклонения до общего текстового обработчика
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply, block=True), group=0)
