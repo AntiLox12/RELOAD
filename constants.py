@@ -127,7 +127,7 @@ SILK_TYPES = {
     'raw': {
         'name': 'Сырой шёлк',
         'emoji': '🧵',
-        'base_price': 28,
+        'base_price': 30,
         'probability': 70,  # вероятность получения в %
     },
     'refined': {
