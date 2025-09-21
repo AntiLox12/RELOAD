@@ -127,19 +127,19 @@ SILK_TYPES = {
     'raw': {
         'name': 'Сырой шёлк',
         'emoji': '🧵',
-        'base_price': 25,
+        'base_price': 28,
         'probability': 70,  # вероятность получения в %
     },
     'refined': {
         'name': 'Рафинированный шёлк',
         'emoji': '🪡',
-        'base_price': 32,  # было 40
+        'base_price': 35,  # было 40
         'probability': 25,
     },
     'premium': {
         'name': 'Премиум шёлк',
         'emoji': '✨',
-        'base_price': 40,  # было 50
+        'base_price': 42,  # было 50
         'probability': 5,
     },
 }
