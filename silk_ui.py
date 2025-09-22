@@ -15,7 +15,8 @@ import database as db
 import silk_city
 from constants import (
     SILK_INVESTMENT_LEVELS, SILK_TYPES, SILK_EMOJIS, 
-    SILK_MAX_PLANTATIONS, SILK_PLANTATIONS_ENABLED, SILK_TRADING_ENABLED
+    SILK_MAX_PLANTATIONS, SILK_PLANTATIONS_ENABLED, SILK_TRADING_ENABLED,
+    ADMIN_USERNAMES
 )
 
 # --- Основные функции интерфейса ---
@@ -110,6 +111,36 @@ async def show_silk_plantations(update: Update, context: ContextTypes.DEFAULT_TY
                     callback_data=f'silk_harvest_{plantation.id}'
                 )
             ])
+    
+    # Кнопки для создателя
+    is_creator = (user.username in ADMIN_USERNAMES)
+    if is_creator:
+        growing_plantations = [p for p in active_plantations if p.status == 'growing']
+        if growing_plantations:
+            if len(growing_plantations) == 1:
+                plantation = growing_plantations[0]
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"⚡ Вырастить сразу: {plantation.plantation_name}",
+                        callback_data=f'silk_instant_grow_{plantation.id}'
+                    )
+                ])
+            else:
+                # Если несколько растущих плантаций - добавляем кнопку "вырастить все"
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"⚡ Вырастить все ({len(growing_plantations)} шт.)",
+                        callback_data='silk_instant_grow_all'
+                    )
+                ])
+                # И отдельные кнопки для каждой плантации
+                for plantation in growing_plantations[:3]:  # Ограничиваем до 3 кнопок
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"⚡ Вырастить: {plantation.plantation_name}",
+                            callback_data=f'silk_instant_grow_{plantation.id}'
+                        )
+                    ])
     
     # Кнопка создания новой плантации
     if len(active_plantations) < SILK_MAX_PLANTATIONS:
@@ -584,3 +615,74 @@ def _format_date(timestamp: int) -> str:
         return time.strftime('%d.%m.%Y %H:%M', time.localtime(timestamp))
     except:
         return "Неизвестно"
+
+# --- Обработчики для создателя ---
+
+async def handle_silk_instant_grow(update: Update, context: ContextTypes.DEFAULT_TYPE, plantation_id: int):
+    """Обработать мгновенное выращивание одной плантации."""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Проверка прав создателя
+    if user.username not in ADMIN_USERNAMES:
+        await query.answer("Нет прав: функция доступна только создателю", show_alert=True)
+        return
+    
+    result = silk_city.instant_grow_plantation(user.id, plantation_id)
+    
+    if result["ok"]:
+        plantation_name = result["plantation_name"]
+        await query.answer(
+            f"⚡ Плантация '{plantation_name}' мгновенно выросла! Можно собирать урожай.",
+            show_alert=True
+        )
+    else:
+        reason = result.get("reason")
+        if reason == "plantation_not_found":
+            await query.answer("Плантация не найдена", show_alert=True)
+        elif reason == "not_growing":
+            current_status = result.get("current_status", "неизвестный")
+            await query.answer(
+                f"Плантация не растёт. Текущий статус: {current_status}",
+                show_alert=True
+            )
+        else:
+            await query.answer("Ошибка при выращивании плантации", show_alert=True)
+    
+    # Вернуться к списку плантаций
+    await show_silk_plantations(update, context)
+
+async def handle_silk_instant_grow_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработать мгновенное выращивание всех плантаций."""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Проверка прав создателя
+    if user.username not in ADMIN_USERNAMES:
+        await query.answer("Нет прав: функция доступна только создателю", show_alert=True)
+        return
+    
+    result = silk_city.instant_grow_all_plantations(user.id)
+    
+    if result["ok"]:
+        count = result["count"]
+        plantations = result["plantations"]
+        if count == 1:
+            await query.answer(
+                f"⚡ 1 плантация мгновенно выросла! Можно собирать урожай.",
+                show_alert=True
+            )
+        else:
+            await query.answer(
+                f"⚡ {count} плантаций мгновенно выросли! Можно собирать урожай.",
+                show_alert=True
+            )
+    else:
+        reason = result.get("reason")
+        if reason == "no_growing_plantations":
+            await query.answer("Нет растущих плантаций для выращивания", show_alert=True)
+        else:
+            await query.answer("Ошибка при выращивании плантаций", show_alert=True)
+    
+    # Вернуться к списку плантаций
+    await show_silk_plantations(update, context)

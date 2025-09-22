@@ -535,6 +535,99 @@ def get_ready_plantations_for_notification(user_id: int) -> List[SilkPlantation]
     finally:
         dbs.close()
 
+def instant_grow_plantation(user_id: int, plantation_id: int) -> Dict:
+    """
+    Мгновенно вырастить плантацию (функция для создателя).
+    
+    Returns:
+        dict: {ok: bool, reason?: str, plantation_name?: str}
+    """
+    dbs = SessionLocal()
+    try:
+        plantation = (
+            dbs.query(SilkPlantation)
+            .filter(SilkPlantation.id == plantation_id, SilkPlantation.player_id == user_id)
+            .first()
+        )
+        
+        if not plantation:
+            return {"ok": False, "reason": "plantation_not_found"}
+        
+        if plantation.status != 'growing':
+            return {"ok": False, "reason": "not_growing", "current_status": plantation.status}
+        
+        # Мгновенно завершить рост
+        current_time = int(time.time())
+        plantation.harvest_ready_at = current_time
+        plantation.status = 'ready'
+        
+        dbs.commit()
+        
+        logger.info(f"[SILK] Instant grow: User {user_id} plantation {plantation_id} ({plantation.plantation_name})")
+        
+        return {
+            "ok": True,
+            "plantation_name": plantation.plantation_name
+        }
+        
+    except Exception as e:
+        try:
+            dbs.rollback()
+        except:
+            pass
+        logger.error(f"[SILK] Error instant growing plantation {plantation_id} for user {user_id}: {e}")
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+def instant_grow_all_plantations(user_id: int) -> Dict:
+    """
+    Мгновенно вырастить все растущие плантации игрока (функция для создателя).
+    
+    Returns:
+        dict: {ok: bool, count?: int, plantations?: List[str]}
+    """
+    dbs = SessionLocal()
+    try:
+        growing_plantations = (
+            dbs.query(SilkPlantation)
+            .filter(SilkPlantation.player_id == user_id)
+            .filter(SilkPlantation.status == 'growing')
+            .all()
+        )
+        
+        if not growing_plantations:
+            return {"ok": False, "reason": "no_growing_plantations"}
+        
+        # Мгновенно завершить рост для всех плантаций
+        current_time = int(time.time())
+        plantation_names = []
+        
+        for plantation in growing_plantations:
+            plantation.harvest_ready_at = current_time
+            plantation.status = 'ready'
+            plantation_names.append(plantation.plantation_name)
+        
+        dbs.commit()
+        
+        logger.info(f"[SILK] Instant grow all: User {user_id} grew {len(growing_plantations)} plantations")
+        
+        return {
+            "ok": True,
+            "count": len(growing_plantations),
+            "plantations": plantation_names
+        }
+        
+    except Exception as e:
+        try:
+            dbs.rollback()
+        except:
+            pass
+        logger.error(f"[SILK] Error instant growing all plantations for user {user_id}: {e}")
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
 # --- Утилиты ---
 
 def format_time_remaining(timestamp: int) -> str:

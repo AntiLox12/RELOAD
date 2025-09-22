@@ -3916,6 +3916,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await silk_ui.handle_silk_sell(update, context, silk_type, quantity_str)
         except Exception:
             await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('silk_instant_grow_'):
+        # silk_instant_grow_{plantation_id} or silk_instant_grow_all
+        if data == 'silk_instant_grow_all':
+            await silk_ui.handle_silk_instant_grow_all(update, context)
+        else:
+            try:
+                plantation_id = int(data.split('_')[-1])
+                await silk_ui.handle_silk_instant_grow(update, context, plantation_id)
+            except Exception:
+                await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'city_casino':
         await show_city_casino(update, context)
     elif data == 'market_shop':
