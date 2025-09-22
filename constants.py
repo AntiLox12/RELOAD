@@ -100,25 +100,25 @@ SILK_INVESTMENT_LEVELS = {
         'max_yield': 38,
     },
     'standard': {
-        'cost': 5000,
+        'cost': 4000,
         'trees': 50,
-        'grow_time': 48 * 60 * 60,  # 48 часов
+        'grow_time': 40 * 60 * 60,  # 40 часов
         'min_yield': 140,
         'max_yield': 165,
     },
     'premium': {
         'cost': 10000,
         'trees': 150,
-        'grow_time': 48 * 60 * 60,  # 48 часов (уменьшено с 72)
+        'grow_time': 44 * 60 * 60,  # 44 часов
         'min_yield': 420,
         'max_yield': 480,
     },
         'master': {
         'cost': 40000,
         'trees': 500,
-        'grow_time': 60 * 60 * 60,  # 60 часов (уменьшено с 96)
-        'min_yield': 1300,
-        'max_yield': 1500,
+        'grow_time': 48 * 60 * 60,  # 48 часов
+        'min_yield': 1700,
+        'max_yield': 1800,
     },
 }
 
