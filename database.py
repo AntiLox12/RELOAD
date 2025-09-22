@@ -149,6 +149,9 @@ class GroupChat(Base):
     title = Column(String, nullable=True)
     is_enabled = Column(Boolean, default=True, index=True)
     last_notified = Column(Integer, default=0)
+    # Новые настройки для создателей групп
+    notify_disabled = Column(Boolean, default=False, index=True)  # Отключение notify_groups_job
+    auto_delete_enabled = Column(Boolean, default=False, index=True)  # Включение автоудаления через 5 минут
 
 # --- Склад для TG Premium ---
 
@@ -3652,3 +3655,91 @@ def get_money_leaderboard(limit: int = 10) -> list[dict]:
         return []
     finally:
         dbs.close()
+
+# --- Функции для управления групповыми настройками ---
+
+def get_group_settings(chat_id: int) -> dict:
+    """Получение настроек группы."""
+    db = SessionLocal()
+    try:
+        group = db.query(GroupChat).filter(GroupChat.chat_id == chat_id).first()
+        if not group:
+            return {'exists': False}
+        return {
+            'exists': True,
+            'title': group.title,
+            'is_enabled': group.is_enabled,
+            'notify_disabled': getattr(group, 'notify_disabled', False),
+            'auto_delete_enabled': getattr(group, 'auto_delete_enabled', False)
+        }
+    finally:
+        db.close()
+
+def update_group_settings(chat_id: int, notify_disabled: bool = None, auto_delete_enabled: bool = None) -> bool:
+    """Обновление настроек группы. Возвращает True если успешно."""
+    db = SessionLocal()
+    try:
+        group = db.query(GroupChat).filter(GroupChat.chat_id == chat_id).first()
+        if not group:
+            return False
+        
+        if notify_disabled is not None:
+            group.notify_disabled = notify_disabled
+        if auto_delete_enabled is not None:
+            group.auto_delete_enabled = auto_delete_enabled
+        
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+def get_groups_with_notifications_enabled() -> list[GroupChat]:
+    """Получение всех групп, где уведомления не отключены (для notify_groups_job)."""
+    db = SessionLocal()
+    try:
+        return db.query(GroupChat).filter(
+            GroupChat.is_enabled == True,
+            GroupChat.notify_disabled != True  # Включаем группы где поле не установлено или False
+        ).all()
+    finally:
+        db.close()
+
+def migrate_group_settings():
+    """Миграция базы для добавления новых полей в таблицу group_chats."""
+    db = SessionLocal()
+    try:
+        # Проверяем, существуют ли новые колонки
+        try:
+            db.execute(text("SELECT notify_disabled FROM group_chats LIMIT 1"))
+            print("[MIGRATION] Group settings columns already exist")
+            return
+        except Exception:
+            # Колонки не существуют, создаём
+            pass
+        
+        print("[MIGRATION] Adding group settings columns...")
+        
+        # Добавляем новые колонки
+        try:
+            db.execute(text("ALTER TABLE group_chats ADD COLUMN notify_disabled BOOLEAN DEFAULT FALSE"))
+            db.execute(text("ALTER TABLE group_chats ADD COLUMN auto_delete_enabled BOOLEAN DEFAULT FALSE"))
+            db.commit()
+            print("[MIGRATION] Successfully added group settings columns")
+        except Exception as e:
+            print(f"[MIGRATION] Error adding columns: {e}")
+            db.rollback()
+            
+    except Exception as e:
+        print(f"[MIGRATION] Migration failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()

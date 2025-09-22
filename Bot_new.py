@@ -8,7 +8,7 @@ import asyncio
 import secrets
 import html
 import re
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ForceReply
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ForceReply, Message, User
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     ApplicationBuilder,
@@ -129,6 +129,9 @@ _LOCKS: Dict[str, asyncio.Lock] = {}
 
 # --- Ожидание причины отклонения (ключ = (chat_id, prompt_message_id)) ---
 REJECT_PROMPTS: Dict[tuple[int, int], dict] = {}
+
+# --- Система автоудаления сообщений для групп (ключ = message_id) ---
+AUTO_DELETE_MESSAGES: Dict[str, dict] = {}
 
 def _get_lock(key: str) -> asyncio.Lock:
     lock = _LOCKS.get(key)
@@ -293,6 +296,55 @@ TEXTS = {
         'ru': '<b>Пакет 500 звёзд</b>\n\nДоступно при наличии на складе. Вы можете приобрести пакет, если он в наличии.',
         'en': '<b>Pack of 500 stars</b>\n\nAvailable while in stock. You can purchase when it is in stock.'
     },
+    # --- Групповые настройки ---
+    'group_settings_title': {
+        'ru': '⚙️ Настройки группы',
+        'en': '⚙️ Group Settings'
+    },
+    'group_settings_desc': {
+        'ru': 'Настройки доступны только создателям групп.',
+        'en': 'Settings are only available to group creators.'
+    },
+    'group_notifications': {
+        'ru': '🔔 Уведомления',
+        'en': '🔔 Notifications'
+    },
+    'group_auto_delete': {
+        'ru': '🗑️ Автоудаление сообщений',
+        'en': '🗑️ Auto-delete messages'
+    },
+    'btn_toggle_notifications': {
+        'ru': '🔔 Переключить уведомления',
+        'en': '🔔 Toggle notifications'
+    },
+    'btn_toggle_auto_delete': {
+        'ru': '🗑️ Переключить автоудаление',
+        'en': '🗑️ Toggle auto-delete'
+    },
+    'notifications_enabled': {
+        'ru': '✅ Уведомления включены',
+        'en': '✅ Notifications enabled'
+    },
+    'notifications_disabled': {
+        'ru': '❌ Уведомления отключены',
+        'en': '❌ Notifications disabled'
+    },
+    'auto_delete_enabled': {
+        'ru': '✅ Автоудаление включено (5 мин)',
+        'en': '✅ Auto-delete enabled (5 min)'
+    },
+    'auto_delete_disabled': {
+        'ru': '❌ Автоудаление отключено',
+        'en': '❌ Auto-delete disabled'
+    },
+    'group_access_denied': {
+        'ru': '❌ Нет прав доступа. Только создатели групп могут изменять настройки.',
+        'en': '❌ Access denied. Only group creators can change settings.'
+    },
+    'group_only_command': {
+        'ru': '❌ Эта команда доступна только в группах.',
+        'en': '❌ This command is only available in groups.'
+    }
 }
 
 def t(lang: str, key: str) -> str:
@@ -4175,6 +4227,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reset_confirm(update, context, True)
     elif data == 'reset_no':
         await reset_confirm(update, context, False)
+    elif data == 'group_toggle_notify':
+        await toggle_group_notifications(update, context)
+    elif data == 'group_toggle_delete':
+        await toggle_group_auto_delete(update, context)
     elif data.startswith('selectgift2_'):
         # Новый формат: selectgift2_{token} -> payload в GIFT_SELECT_TOKENS
         token = data.split('_', 1)[1]
@@ -4757,6 +4813,118 @@ async def register_group_if_needed(update: Update):
             db.upsert_group_chat(chat_id=chat.id, title=chat.title)
         except Exception:
             pass
+
+
+# --- Функции для работы с правами создателя группы ---
+
+async def is_group_creator(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+    """Проверяет, является ли пользователь создателем группы."""
+    try:
+        logger.info(f"[GROUPSETTINGS] Checking creator permissions: user_id={user_id} chat_id={chat_id}")
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
+        is_creator = chat_member.status == 'creator'
+        logger.info(f"[GROUPSETTINGS] Permission check result: user_id={user_id} chat_id={chat_id} status={chat_member.status} is_creator={is_creator}")
+        return is_creator
+    except Exception as e:
+        logger.warning(f"[GROUPSETTINGS] Не удалось проверить права создателя для пользователя {user_id} в чате {chat_id}: {e}")
+        return False
+
+async def check_group_creator_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Проверяет права создателя группы для текущего пользователя и чата.
+    Возвращает True если пользователь является создателем группы.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    if not chat or chat.type not in ("group", "supergroup"):
+        return False
+    
+    return await is_group_creator(context, chat.id, user.id)
+
+
+async def schedule_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_minutes: int = 5):
+    """Планирует автоудаление сообщения, если в группе включено автоудаление."""
+    try:
+        # Проверяем, включено ли автоудаление в этой группе
+        settings = db.get_group_settings(chat_id)
+        if not settings.get('auto_delete_enabled', False):
+            return
+        
+        # Планируем задачу удаления
+        job_name = f"auto_delete_{chat_id}_{message_id}"
+        context.application.job_queue.run_once(
+            auto_delete_message_job,
+            when=delay_minutes * 60,  # Преобразуем минуты в секунды
+            data={'chat_id': chat_id, 'message_id': message_id},
+            name=job_name
+        )
+        
+        # Сохраняем ссылку на сообщение в глобальном словаре
+        AUTO_DELETE_MESSAGES[job_name] = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'scheduled_at': time.time()
+        }
+        
+        logger.info(f"[AUTO_DELETE] Scheduled deletion for message {message_id} in chat {chat_id} in {delay_minutes} minutes")
+    except Exception as e:
+        logger.warning(f"[AUTO_DELETE] Failed to schedule auto-delete for message {message_id} in chat {chat_id}: {e}")
+
+async def auto_delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    """Задача для автоудаления сообщения."""
+    try:
+        job_data = context.job.data
+        chat_id = job_data['chat_id']
+        message_id = job_data['message_id']
+        
+        # Проверяем, что автоудаление всё ещё включено
+        settings = db.get_group_settings(chat_id)
+        if not settings.get('auto_delete_enabled', False):
+            logger.info(f"[AUTO_DELETE] Auto-delete disabled for chat {chat_id}, skipping message {message_id}")
+            return
+        
+        # Пытаемся удалить сообщение
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.info(f"[AUTO_DELETE] Successfully deleted message {message_id} from chat {chat_id}")
+        except BadRequest as e:
+            if "Message to delete not found" in str(e):
+                logger.info(f"[AUTO_DELETE] Message {message_id} in chat {chat_id} already deleted")
+            else:
+                logger.warning(f"[AUTO_DELETE] Failed to delete message {message_id} from chat {chat_id}: {e}")
+        except Exception as e:
+            logger.warning(f"[AUTO_DELETE] Error deleting message {message_id} from chat {chat_id}: {e}")
+        
+    except Exception as e:
+        logger.error(f"[AUTO_DELETE] Error in auto_delete_message_job: {e}")
+    finally:
+        # Удаляем запись из словаря
+        job_name = context.job.name
+        if job_name and job_name in AUTO_DELETE_MESSAGES:
+            del AUTO_DELETE_MESSAGES[job_name]
+
+
+async def groupsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/groupsettings — открывает настройки группы (только для создателей групп)."""
+    await register_group_if_needed(update)
+
+    message = update.message
+    chat = update.effective_chat
+    
+    # 1. Проверяем, что это группа
+    if not chat or chat.type not in ("group", "supergroup"):
+        await message.reply_text(t('ru', 'group_only_command'))
+        return
+
+    # 2. Получаем реального пользователя, отправившего команду.
+    #    Это работает и для обычных пользователей, и для анонимных админов.
+    user_to_check = message.from_user
+    if not user_to_check:
+        logger.warning("[GROUPSETTINGS] Не удалось определить пользователя из сообщения в чате %s", chat.id)
+        return
+
+    # 3. Передаем этого пользователя в функцию отображения настроек
+    await show_group_settings(update, context, user_to_check)
 
 
 # --- Диагностика: логирование всех команд в группах ---
@@ -5458,6 +5626,142 @@ async def reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, conf
         await show_settings(update, context)
 
 
+# --- Функции для групповых настроек ---
+
+async def show_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, user_to_check: User):
+    """Отображает меню настроек группы (только для создателей)."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+    
+    chat = update.effective_chat
+    
+    # Проверяем права переданного пользователя
+    is_creator = await is_group_creator(context, chat.id, user_to_check.id)
+    
+    logger.info(
+        "[SHOW_GROUP_SETTINGS] Creator check for user %s in chat %s. Result: %s",
+        user_to_check.id, chat.id, is_creator
+    )
+
+    if not is_creator:
+        error_msg = t('ru', 'group_access_denied')
+        if query:
+            # Если это был клик по кнопке, отвечаем на него
+            await query.answer(error_msg, show_alert=True)
+            # И пытаемся отредактировать сообщение, если возможно
+            try:
+                await query.edit_message_text(error_msg)
+            except BadRequest:
+                pass
+        else:
+            # Если это была команда, отвечаем на сообщение
+            await update.message.reply_text(error_msg)
+        return
+    
+    # Получаем настройки группы
+    settings = db.get_group_settings(chat.id)
+    if not settings.get('exists'):
+        db.upsert_group_chat(chat.id, chat.title)
+        settings = db.get_group_settings(chat.id)
+    
+    lang = 'ru'
+    
+    notify_disabled = settings.get('notify_disabled', False)
+    auto_delete_enabled = settings.get('auto_delete_enabled', False)
+    
+    notify_status = t(lang, 'notifications_disabled') if notify_disabled else t(lang, 'notifications_enabled')
+    auto_delete_status = t(lang, 'auto_delete_enabled') if auto_delete_enabled else t(lang, 'auto_delete_disabled')
+    
+    text = (
+        f"<b>{t(lang, 'group_settings_title')}</b>\n\n"
+        f"{t(lang, 'group_settings_desc')}\n\n"
+        f"{t(lang, 'group_notifications')}: {notify_status}\n"
+        f"{t(lang, 'group_auto_delete')}: {auto_delete_status}\n"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton(t(lang, 'btn_toggle_notifications'), callback_data='group_toggle_notify')],
+        [InlineKeyboardButton(t(lang, 'btn_toggle_auto_delete'), callback_data='group_toggle_delete')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if query:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            # Планируем автоудаление отредактированного сообщения, если включено в настройках группы
+            try:
+                await schedule_auto_delete_message(context, chat.id, query.message.message_id)
+            except Exception:
+                pass
+        except BadRequest:
+            sent_msg = await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+            # Планируем автоудаление отправленного сообщения, если включено в настройках группы
+            try:
+                await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
+            except Exception:
+                pass
+    else:
+        sent_msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        # Планируем автоудаление отправленного сообщения, если включено в настройках группы
+        try:
+            await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
+        except Exception:
+            pass
+
+async def toggle_group_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключает уведомления для группы."""
+    query = update.callback_query
+    await query.answer()
+    
+    chat = update.effective_chat
+    
+    # Проверяем права создателя
+    is_creator = await check_group_creator_permissions(update, context)
+    if not is_creator:
+        await query.answer(t('ru', 'group_access_denied'), show_alert=True)
+        return
+    
+    # Получаем текущие настройки
+    settings = db.get_group_settings(chat.id)
+    current_state = settings.get('notify_disabled', False)
+    new_state = not current_state
+    
+    # Обновляем настройки
+    if db.update_group_settings(chat.id, notify_disabled=new_state):
+        status_msg = 'Уведомления отключены' if new_state else 'Уведомления включены'
+        await query.answer(status_msg, show_alert=True)
+        await show_group_settings(update, context, update.effective_user)
+    else:
+        await query.answer('Ошибка при обновлении настроек', show_alert=True)
+
+async def toggle_group_auto_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключает автоудаление сообщений для группы."""
+    query = update.callback_query
+    await query.answer()
+    
+    chat = update.effective_chat
+    
+    # Проверяем права создателя
+    is_creator = await check_group_creator_permissions(update, context)
+    if not is_creator:
+        await query.answer(t('ru', 'group_access_denied'), show_alert=True)
+        return
+    
+    # Получаем текущие настройки
+    settings = db.get_group_settings(chat.id)
+    current_state = settings.get('auto_delete_enabled', False)
+    new_state = not current_state
+    
+    # Обновляем настройки
+    if db.update_group_settings(chat.id, auto_delete_enabled=new_state):
+        status_msg = 'Автоудаление включено' if new_state else 'Автоудаление отключено'
+        await query.answer(status_msg, show_alert=True)
+        await show_group_settings(update, context, update.effective_user)
+    else:
+        await query.answer('Ошибка при обновлении настроек', show_alert=True)
+
+
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает таблицу лидеров."""
     leaderboard_data = db.get_leaderboard()
@@ -6097,9 +6401,9 @@ def main():
     # Регистрируем /gift раньше, чтобы исключить перехват другими обработчиками
     application.add_handler(CommandHandler("gift", gift_command))
     # Тихая регистрация групп по любым групповым сообщениям/командам
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS, group_register_handler))
     application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler("check", check_command))
+    application.add_handler(CommandHandler("groupsettings", groupsettings_command))
     
     # Логируем информацию о боте после старта (диагностика: верный ли бот запущен)
     async def _log_bot_info(context: ContextTypes.DEFAULT_TYPE):
@@ -6111,7 +6415,7 @@ def main():
 
     # Периодическая проверка групп: отправляем не чаще 8 часов (ограничение внутри функции)
     async def notify_groups_job(context: ContextTypes.DEFAULT_TYPE):
-        groups = db.get_enabled_group_chats()
+        groups = db.get_groups_with_notifications_enabled()  # Новая функция, учитывает notify_disabled
         if not groups:
             return
         interval_sec = 8 * 60 * 60
