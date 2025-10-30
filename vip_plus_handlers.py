@@ -120,12 +120,26 @@ async def show_vip_plus_1d(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n{vip_plus_t(lang, 'vip_plus_price').format(cost=cost)}"
     if until_str:
         text += f"\n{vip_plus_t(lang, 'vip_plus_until').format(dt=until_str)}"
+    
+    # Проверяем наличие активного обычного VIP
+    has_vip = db.is_vip(user.id) and not db.is_vip_plus(user.id)
+    if has_vip:
+        vip_until = db.get_vip_until(user.id)
+        if vip_until and vip_until > time.time():
+            remaining_seconds = int(vip_until - time.time())
+            remaining_days = remaining_seconds / (24 * 3600)
+            text += f"\n\n⚠️ <b>Внимание!</b>\n"
+            text += f"У вас активен обычный VIP (осталось ~{remaining_days:.1f} дней).\n"
+            text += f"При покупке VIP+:\n"
+            text += f"• 25% времени VIP перенесётся на VIP+\n"
+            text += f"• 75% времени VIP сгорит\n"
+    
     current_coins = int(player.coins or 0)
     if current_coins < cost:
         text += f"\n{vip_plus_t(lang, 'vip_plus_insufficient').format(coins=current_coins, cost=cost)}"
     
     keyboard = [
-        [InlineKeyboardButton(f"{vip_plus_t(lang, 'vip_plus_buy')} — {cost}", callback_data='buy_vip_plus_1d')],
+        [InlineKeyboardButton(f"{vip_plus_t(lang, 'vip_plus_buy')} — {cost}", callback_data='confirm_vip_plus_1d')],
         [InlineKeyboardButton(vip_plus_t(lang, 'btn_back'), callback_data='vip_plus_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
@@ -160,12 +174,26 @@ async def show_vip_plus_7d(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n{vip_plus_t(lang, 'vip_plus_price').format(cost=cost)}"
     if until_str:
         text += f"\n{vip_plus_t(lang, 'vip_plus_until').format(dt=until_str)}"
+    
+    # Проверяем наличие активного обычного VIP
+    has_vip = db.is_vip(user.id) and not db.is_vip_plus(user.id)
+    if has_vip:
+        vip_until = db.get_vip_until(user.id)
+        if vip_until and vip_until > time.time():
+            remaining_seconds = int(vip_until - time.time())
+            remaining_days = remaining_seconds / (24 * 3600)
+            text += f"\n\n⚠️ <b>Внимание!</b>\n"
+            text += f"У вас активен обычный VIP (осталось ~{remaining_days:.1f} дней).\n"
+            text += f"При покупке VIP+:\n"
+            text += f"• 25% времени VIP перенесётся на VIP+\n"
+            text += f"• 75% времени VIP сгорит\n"
+    
     current_coins = int(player.coins or 0)
     if current_coins < cost:
         text += f"\n{vip_plus_t(lang, 'vip_plus_insufficient').format(coins=current_coins, cost=cost)}"
     
     keyboard = [
-        [InlineKeyboardButton(f"{vip_plus_t(lang, 'vip_plus_buy')} — {cost}", callback_data='buy_vip_plus_7d')],
+        [InlineKeyboardButton(f"{vip_plus_t(lang, 'vip_plus_buy')} — {cost}", callback_data='confirm_vip_plus_7d')],
         [InlineKeyboardButton(vip_plus_t(lang, 'btn_back'), callback_data='vip_plus_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
@@ -200,14 +228,97 @@ async def show_vip_plus_30d(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n{vip_plus_t(lang, 'vip_plus_price').format(cost=cost)}"
     if until_str:
         text += f"\n{vip_plus_t(lang, 'vip_plus_until').format(dt=until_str)}"
+    
+    # Проверяем наличие активного обычного VIP
+    has_vip = db.is_vip(user.id) and not db.is_vip_plus(user.id)
+    if has_vip:
+        vip_until = db.get_vip_until(user.id)
+        if vip_until and vip_until > time.time():
+            remaining_seconds = int(vip_until - time.time())
+            remaining_days = remaining_seconds / (24 * 3600)
+            text += f"\n\n⚠️ <b>Внимание!</b>\n"
+            text += f"У вас активен обычный VIP (осталось ~{remaining_days:.1f} дней).\n"
+            text += f"При покупке VIP+:\n"
+            text += f"• 25% времени VIP перенесётся на VIP+\n"
+            text += f"• 75% времени VIP сгорит\n"
+    
     current_coins = int(player.coins or 0)
     if current_coins < cost:
         text += f"\n{vip_plus_t(lang, 'vip_plus_insufficient').format(coins=current_coins, cost=cost)}"
     
     keyboard = [
-        [InlineKeyboardButton(f"{vip_plus_t(lang, 'vip_plus_buy')} — {cost}", callback_data='buy_vip_plus_30d')],
+        [InlineKeyboardButton(f"{vip_plus_t(lang, 'vip_plus_buy')} — {cost}", callback_data='confirm_vip_plus_30d')],
         [InlineKeyboardButton(vip_plus_t(lang, 'btn_back'), callback_data='vip_plus_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+async def confirm_vip_plus_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_key: str):
+    """Показывает окно подтверждения покупки VIP+ с предупреждением о переносе VIP времени."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    if plan_key not in VIP_PLUS_COSTS or plan_key not in VIP_PLUS_DURATIONS_SEC:
+        await query.answer("Ошибка плана", show_alert=True)
+        return
+
+    cost = VIP_PLUS_COSTS[plan_key]
+    
+    # Проверяем наличие обычного VIP
+    has_vip = db.is_vip(user.id) and not db.is_vip_plus(user.id)
+    
+    if has_vip:
+        # Показываем предупреждение с подробностями переноса времени
+        vip_until = db.get_vip_until(user.id)
+        if vip_until and vip_until > time.time():
+            remaining_seconds = int(vip_until - time.time())
+            remaining_days = remaining_seconds / (24 * 3600)
+            transferred_seconds = int(remaining_seconds * 0.25)
+            transferred_days = transferred_seconds / (24 * 3600)
+            burned_seconds = int(remaining_seconds * 0.75)
+            burned_days = burned_seconds / (24 * 3600)
+            
+            plan_names = {'1d': '1 день', '7d': '7 дней', '30d': '30 дней'}
+            plan_name = plan_names.get(plan_key, plan_key)
+            
+            text = f"<b>⚠️ Подтверждение покупки VIP+</b>\n\n"
+            text += f"Вы покупаете: <b>VIP+ на {plan_name}</b>\n"
+            text += f"Стоимость: <b>{cost}</b> септимов\n\n"
+            text += f"<b>📊 Информация о переносе времени:</b>\n"
+            text += f"• Текущий VIP: ~{remaining_days:.1f} дней (~{remaining_seconds//3600} часов)\n"
+            text += f"• Перенесётся на VIP+: ~{transferred_days:.1f} дней (~{transferred_seconds//3600} часов)\n"
+            text += f"• Сгорит: ~{burned_days:.1f} дней (~{burned_seconds//3600} часов)\n\n"
+            text += f"⚠️ <i>75% времени VIP будет потеряно!</i>"
+    else:
+        # Обычное подтверждение без предупреждения
+        plan_names = {'1d': '1 день', '7d': '7 дней', '30d': '30 дней'}
+        plan_name = plan_names.get(plan_key, plan_key)
+        
+        text = f"<b>Подтверждение покупки VIP+</b>\n\n"
+        text += f"Вы покупаете: <b>VIP+ на {plan_name}</b>\n"
+        text += f"Стоимость: <b>{cost}</b> септимов\n\n"
+        text += f"Подтвердите покупку."
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Подтвердить покупку VIP+", callback_data=f'buy_vip_plus_{plan_key}')],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f'vip_plus_{plan_key}')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -251,8 +362,15 @@ async def buy_vip_plus(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_
     vip_plus_until_ts = res.get('vip_plus_until') or db.get_vip_plus_until(user.id)
     coins_left = res.get('coins_left')
     until_str = time.strftime('%d.%m.%Y %H:%M', time.localtime(int(vip_plus_until_ts))) if vip_plus_until_ts else '—'
-
+    
+    # Добавляем информацию о переносе времени, если было
+    transferred_time = res.get('vip_time_transferred', 0)
     text = vip_plus_t(lang, 'vip_plus_bought').format(emoji=VIP_PLUS_EMOJI, dt=until_str, coins=coins_left)
+    
+    if transferred_time > 0:
+        transferred_days = transferred_time / (24 * 3600)
+        text += f"\n\n✅ Перенесено {transferred_days:.1f} дней с VIP на VIP+"
+    
     keyboard = [
         [InlineKeyboardButton(vip_plus_t(lang, 'btn_back'), callback_data='vip_plus_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],

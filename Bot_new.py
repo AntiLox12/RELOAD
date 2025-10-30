@@ -48,11 +48,13 @@ from vip_plus_handlers import (
     show_vip_plus_7d,
     show_vip_plus_30d,
     buy_vip_plus,
+    confirm_vip_plus_purchase,
 )
 from constants import (
     SEARCH_COOLDOWN,
     DAILY_BONUS_COOLDOWN,
     ENERGY_IMAGES_DIR,
+    DAILY_BONUS_REWARDS,
     RARITIES,
     COLOR_EMOJIS,
     RARITY_ORDER,
@@ -117,12 +119,16 @@ ADD_NAME, ADD_DESCRIPTION, ADD_SPECIAL, ADD_PHOTO = range(4)
 # Константы для conversation handler казино
 CASINO_CUSTOM_BET = range(1)
 
+# Константы для conversation handler удобрений
+FERTILIZER_CUSTOM_QTY = range(1)
+
 PENDING_ADDITIONS: dict[int, dict] = {}
 NEXT_PENDING_ID = 1
 
 GIFT_OFFERS: dict[int, dict] = {}
 NEXT_GIFT_ID = 1
 GIFT_SELECT_TOKENS: dict[str, dict] = {}
+GIFT_SELECTION_STATE: dict[int, dict] = {}  # {user_id: {recipient_info, inventory_items}}
 
 # --- Блокировки для предотвращения даблкликов/гонок ---
 _LOCKS: Dict[str, asyncio.Lock] = {}
@@ -157,10 +163,12 @@ TEXTS = {
     'settings_title': {'ru': '⚙️ Настройки', 'en': '⚙️ Settings'},
     'current_language': {'ru': '🌐 Язык', 'en': '🌐 Language'},
     'auto_reminder': {'ru': '⏰ Автонапоминание', 'en': '⏰ Auto-reminder'},
+    'plantation_reminder': {'ru': '💧 Напоминание о поливе', 'en': '💧 Watering reminder'},
     'on': {'ru': 'Вкл', 'en': 'On'},
     'off': {'ru': 'Выкл', 'en': 'Off'},
     'btn_change_lang': {'ru': '🌐 Изменить язык', 'en': '🌐 Change language'},
     'btn_toggle_rem': {'ru': '⏰ Переключить напоминание', 'en': '⏰ Toggle reminder'},
+    'btn_toggle_plantation_rem': {'ru': '💧 Переключить напоминание о поливе', 'en': '💧 Toggle watering reminder'},
     'auto_search': {'ru': '🤖 Автопоиск VIP', 'en': '🤖 VIP Auto-search'},
     'btn_toggle_auto': {'ru': '🤖 Переключить автопоиск VIP', 'en': '🤖 Toggle VIP auto-search'},
     'auto_requires_vip': {'ru': 'Эта функция доступна только с активным V.I.P.', 'en': 'This feature requires an active V.I.P.'},
@@ -401,6 +409,13 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(t(lang, 'stats'), callback_data='stats')],
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
     ]
+    
+    # Добавляем кнопку "Админ панель" для Создателя и админов 3 уровня
+    is_creator = user.username and user.username in ADMIN_USERNAMES
+    is_level3_admin = db.get_admin_level(user.id) >= 3
+    if is_creator or is_level3_admin:
+        keyboard.append([InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     menu_text = t(lang, 'menu_title').format(user=user.mention_html())
@@ -441,12 +456,558 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка при редактировании сообщения в меню: {e}")
 
 
+# --- Админ панель для Создателя ---
+
+def has_creator_panel_access(user_id: int, username: str | None) -> bool:
+    """Проверяет, имеет ли пользователь доступ к админ панели (Создатель или админ 3 уровня)."""
+    is_creator = username and username in ADMIN_USERNAMES
+    is_level3_admin = db.get_admin_level(user_id) >= 3
+    return is_creator or is_level3_admin
+
+
+async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает админ панель для Создателя и админов 3 уровня."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    
+    # Проверка доступа (Создатель или админ 3 уровня)
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Сброс ежедневного бонуса", callback_data='creator_reset_bonus')],
+        [InlineKeyboardButton("💰 Выдача монет", callback_data='creator_give_coins')],
+        [InlineKeyboardButton("📊 Статистика пользователя", callback_data='creator_user_stats')],
+        [InlineKeyboardButton("👥 Админы", callback_data='creator_admins')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "⚙️ <b>Админ панель Создателя</b>\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def creator_reset_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс сброса ежедневного бонуса."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "🔄 <b>Сброс ежедневного бонуса</b>\n\n"
+        "Отправьте:\n"
+        "• <code>@username</code> - для конкретного пользователя\n"
+        "• <code>all</code> - для всех пользователей\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    # Устанавливаем состояние ожидания ввода
+    context.user_data['awaiting_creator_action'] = 'reset_bonus'
+    return 'AWAITING_INPUT'
+
+
+async def creator_give_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс выдачи монет."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "💰 <b>Выдача монет</b>\n\n"
+        "Отправьте в формате:\n"
+        "<code>@username количество</code>\n\n"
+        "Пример: <code>@user 1000</code>\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'give_coins'
+    return 'AWAITING_INPUT'
+
+
+async def creator_user_stats_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс получения статистики пользователя."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "📊 <b>Статистика пользователя</b>\n\n"
+        "Отправьте <code>@username</code> пользователя\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'user_stats'
+    return 'AWAITING_INPUT'
+
+
+async def creator_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовый ввод для админ команд."""
+    user = update.effective_user
+    
+    if not has_creator_panel_access(user.id, user.username):
+        return
+    
+    action = context.user_data.get('awaiting_creator_action')
+    if not action:
+        return
+    
+    text_input = update.message.text.strip()
+    
+    if action == 'reset_bonus':
+        await handle_reset_bonus(update, context, text_input)
+    elif action == 'give_coins':
+        await handle_give_coins(update, context, text_input)
+    elif action == 'user_stats':
+        await handle_user_stats(update, context, text_input)
+    elif action == 'admin_add':
+        await handle_admin_add(update, context, text_input)
+    elif action == 'admin_promote':
+        await handle_admin_promote(update, context, text_input)
+    elif action == 'admin_demote':
+        await handle_admin_demote(update, context, text_input)
+    elif action == 'admin_remove':
+        await handle_admin_remove(update, context, text_input)
+    
+    # Очищаем состояние
+    context.user_data.pop('awaiting_creator_action', None)
+
+
+async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает сброс ежедневного бонуса."""
+    keyboard = [[InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if text_input.lower() == 'all':
+        # Сбрасываем бонус для всех
+        try:
+            count = db.reset_all_daily_bonus()
+            response = f"✅ Ежедневный бонус сброшен для <b>{count}</b> пользователей!"
+        except Exception as e:
+            logger.error(f"Ошибка сброса бонусов: {e}")
+            response = f"❌ Ошибка: {e}"
+    elif text_input.startswith('@'):
+        # Сбрасываем бонус для конкретного пользователя
+        username = text_input[1:]  # Убираем @
+        player = db.get_player_by_username(username)
+        if player:
+            db.update_player(player.user_id, last_bonus_claim=0)
+            response = f"✅ Ежедневный бонус сброшен для @{username}!"
+        else:
+            response = f"❌ Пользователь @{username} не найден!"
+    else:
+        response = "❌ Неверный формат! Используйте @username или all"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает выдачу монет."""
+    keyboard = [[InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    parts = text_input.split()
+    if len(parts) != 2 or not parts[0].startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username количество"
+    else:
+        username = parts[0][1:]
+        try:
+            amount = int(parts[1])
+            player = db.get_player_by_username(username)
+            if player:
+                new_balance = db.increment_coins(player.user_id, amount)
+                response = f"✅ Выдано <b>{amount}</b> септимов пользователю @{username}\nНовый баланс: <b>{new_balance}</b>"
+            else:
+                response = f"❌ Пользователь @{username} не найден!"
+        except ValueError:
+            response = "❌ Количество должно быть числом!"
+        except Exception as e:
+            logger.error(f"Ошибка выдачи монет: {e}")
+            response = f"❌ Ошибка: {e}"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает получение статистики пользователя."""
+    keyboard = [[InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input.startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username"
+    else:
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+        if player:
+            # Получаем дополнительную информацию
+            inventory_count = len(db.get_player_inventory_with_details(player.user_id))
+            vip_until = db.get_vip_until(player.user_id)
+            vip_plus_until = db.get_vip_plus_until(player.user_id)
+            
+            vip_status = "Нет"
+            if vip_plus_until and time.time() < vip_plus_until:
+                vip_status = f"VIP+ до {safe_format_timestamp(vip_plus_until)}"
+            elif vip_until and time.time() < vip_until:
+                vip_status = f"VIP до {safe_format_timestamp(vip_until)}"
+            
+            last_bonus = safe_format_timestamp(player.last_bonus_claim) if player.last_bonus_claim else "Никогда"
+            last_search = safe_format_timestamp(player.last_search) if player.last_search else "Никогда"
+            
+            response = (
+                f"📊 <b>Статистика пользователя @{username}</b>\n\n"
+                f"<b>ID:</b> {player.user_id}\n"
+                f"<b>Баланс:</b> {player.coins} 🪙\n"
+                f"<b>Инвентарь:</b> {inventory_count} предметов\n"
+                f"<b>VIP статус:</b> {vip_status}\n"
+                f"<b>Последний поиск:</b> {last_search}\n"
+                f"<b>Последний бонус:</b> {last_bonus}\n"
+                f"<b>Язык:</b> {player.language}"
+            )
+        else:
+            response = f"❌ Пользователь @{username} не найден!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает добавление админа."""
+    keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    parts = text_input.split()
+    if len(parts) != 2 or not parts[0].startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username уровень (1-3)"
+    else:
+        username = parts[0][1:]
+        try:
+            level = int(parts[1])
+            if level not in (1, 2, 3):
+                response = "❌ Уровень должен быть 1, 2 или 3!"
+            else:
+                player = db.get_player_by_username(username)
+                if not player:
+                    response = f"❌ Пользователь @{username} не найден в базе!"
+                else:
+                    success = db.add_admin_user(player.user_id, username, level)
+                    if success:
+                        response = f"✅ Админ @{username} добавлен с уровнем {level}!"
+                    else:
+                        response = f"⚠️ @{username} уже является админом. Используйте повышение/понижение уровня."
+        except ValueError:
+            response = "❌ Уровень должен быть числом (1, 2 или 3)!"
+        except Exception as e:
+            logger.error(f"Ошибка добавления админа: {e}")
+            response = f"❌ Ошибка: {e}"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_admin_promote(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает повышение уровня админа."""
+    keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input.startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username"
+    else:
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+        if not player:
+            response = f"❌ Пользователь @{username} не найден!"
+        else:
+            current_level = db.get_admin_level(player.user_id)
+            if current_level == 0:
+                response = f"❌ @{username} не является админом!"
+            elif current_level >= 3:
+                response = f"⚠️ @{username} уже имеет максимальный уровень (3)!"
+            else:
+                new_level = current_level + 1
+                success = db.set_admin_level(player.user_id, new_level)
+                if success:
+                    response = f"✅ Уровень админа @{username} повышен: {current_level} → {new_level}"
+                else:
+                    response = "❌ Ошибка при повышении уровня!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_admin_demote(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает понижение уровня админа."""
+    keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input.startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username"
+    else:
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+        if not player:
+            response = f"❌ Пользователь @{username} не найден!"
+        else:
+            current_level = db.get_admin_level(player.user_id)
+            if current_level == 0:
+                response = f"❌ @{username} не является админом!"
+            elif current_level <= 1:
+                response = f"⚠️ @{username} имеет минимальный уровень (1). Используйте 'Уволить' для удаления."
+            else:
+                new_level = current_level - 1
+                success = db.set_admin_level(player.user_id, new_level)
+                if success:
+                    response = f"✅ Уровень админа @{username} понижен: {current_level} → {new_level}"
+                else:
+                    response = "❌ Ошибка при понижении уровня!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает увольнение админа."""
+    keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input.startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username"
+    else:
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+        if not player:
+            response = f"❌ Пользователь @{username} не найден!"
+        else:
+            current_level = db.get_admin_level(player.user_id)
+            if current_level == 0:
+                response = f"❌ @{username} не является админом!"
+            else:
+                success = db.remove_admin_user(player.user_id)
+                if success:
+                    response = f"✅ Админ @{username} (уровень {current_level}) уволен!"
+                else:
+                    response = "❌ Ошибка при увольнении админа!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+# --- Управление админами ---
+
+async def show_admins_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает панель управления админами."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем список всех админов
+    admins = db.get_admin_users()
+    
+    text = "👥 <b>Управление админами</b>\n\n"
+    
+    if admins:
+        text += "<b>Список админов:</b>\n\n"
+        for admin in admins:
+            level_emoji = "⭐" * admin.level
+            username_display = f"@{admin.username}" if admin.username else f"ID: {admin.user_id}"
+            text += f"{level_emoji} <b>Уровень {admin.level}</b> - {username_display}\n"
+    else:
+        text += "<i>Админов нет</i>\n"
+    
+    text += "\n<b>Выберите действие:</b>"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить нового админа", callback_data='creator_admin_add')],
+        [InlineKeyboardButton("⬆️ Повысить уровень", callback_data='creator_admin_promote')],
+        [InlineKeyboardButton("⬇️ Понизить уровень", callback_data='creator_admin_demote')],
+        [InlineKeyboardButton("❌ Уволить админа", callback_data='creator_admin_remove')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def creator_admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс добавления админа."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "➕ <b>Добавление нового админа</b>\n\n"
+        "Отправьте в формате:\n"
+        "<code>@username уровень</code>\n\n"
+        "Где уровень: 1, 2 или 3\n"
+        "Пример: <code>@admin 2</code>\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'admin_add'
+
+
+async def creator_admin_promote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс повышения уровня админа."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "⬆️ <b>Повышение уровня админа</b>\n\n"
+        "Отправьте <code>@username</code> админа\n\n"
+        "Уровень будет повышен на 1\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'admin_promote'
+
+
+async def creator_admin_demote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс понижения уровня админа."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "⬇️ <b>Понижение уровня админа</b>\n\n"
+        "Отправьте <code>@username</code> админа\n\n"
+        "Уровень будет понижен на 1\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'admin_demote'
+
+
+async def creator_admin_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс увольнения админа."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "❌ <b>Увольнение админа</b>\n\n"
+        "Отправьте <code>@username</code> админа\n\n"
+        "⚠️ Админ будет полностью удален!\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='creator_admins')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'admin_remove'
+
+
 async def search_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: напоминание о завершении кулдауна поиска."""
     try:
         await context.bot.send_message(chat_id=context.job.chat_id, text="Кулдаун закончился! Можно искать снова.")
     except Exception as ex:
         logger.warning(f"Не удалось отправить напоминание (job): {ex}")
+
+async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue: напоминание о возможности полива грядки."""
+    try:
+        bed_index = context.job.data.get('bed_index', 0)
+        keyboard = [[InlineKeyboardButton("🌱 Перейти к плантациям", callback_data='market_plantation')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(
+            chat_id=context.job.chat_id, 
+            text=f"💧 Грядка {bed_index} готова к поливу!",
+            reply_markup=reply_markup
+        )
+    except Exception as ex:
+        logger.warning(f"Не удалось отправить напоминание о поливе (job): {ex}")
 
 async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: периодически выполняет автопоиск для VIP-пользователей.
@@ -720,12 +1281,18 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         time_left = eff_search_cd - (current_time - player.last_search)
         return {"status": "cooldown", "time_left": time_left}
 
-    # Выбираем случайный энергетик
-    all_drinks = db.get_all_drinks()
-    if not all_drinks:
+    # Выбираем случайный энергетик с учетом системы "горячих" и "холодных" напитков
+    weighted_drinks = db.get_weighted_drinks_list()
+    if not weighted_drinks:
         return {"status": "no_drinks"}
 
-    found_drink = random.choice(all_drinks)
+    found_drink = random.choice(weighted_drinks)
+    
+    # Определяем "температуру" найденного напитка ДО записи находки
+    drink_temp = db.get_drink_temperature(found_drink.id)
+    
+    # Записываем находку в статистику (ПОСЛЕ определения температуры)
+    db.record_drink_discovery(found_drink.id)
 
     # Определяем редкость
     if found_drink.is_special:
@@ -759,6 +1326,17 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     # Формируем сообщение
     rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
     
+    # Определяем эмодзи и текст температуры напитка
+    if drink_temp == 'hot':
+        temp_emoji = '🔥'
+        temp_text = 'Горячий напиток! (давно не попадался)'
+    elif drink_temp == 'cold':
+        temp_emoji = '❄️'
+        temp_text = 'Холодный напиток (недавно находили)'
+    else:
+        temp_emoji = '🌡️'
+        temp_text = 'Нейтральный'
+    
     # Проверяем VIP статус с приоритетом VIP+
     vip_plus_ts = db.get_vip_plus_until(user_id)
     vip_ts = db.get_vip_until(user_id)
@@ -770,11 +1348,12 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}"
     else:
         vip_line = ''
-    # TODO: применить эффекты VIP (механика шансов/кд) по согласованию
+    
     caption = (
         f"🎉 Ты нашел энергетик!{vip_line}\n\n"
         f"<b>Название:</b> {found_drink.name}\n"
         f"<b>Редкость:</b> {rarity_emoji} {rarity}\n"
+        f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>\n"
         f"💰 <b>Награда:</b> +{septims_reward} септимов (баланс: {new_coins})\n\n"
         f"<i>{found_drink.description}</i>"
     )
@@ -860,6 +1439,83 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
 
+async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, selected_reward: str) -> None:
+    """
+    Показывает анимацию текстовой рулетки с движущейся стрелочкой.
+    Длительность: 3 секунды.
+    """
+    # Список наград для отображения
+    rewards_display = [
+        ('coins', '💰 400 септимов'),
+        ('absolute_drink', '🟣 Энергетик Absolute'),
+        ('vip_3d', '👑 VIP на 3 дня'),
+        ('vip_plus_7d', '💎 VIP+ на 7 дней'),
+        ('vip_plus_30d', '🎊 VIP+ на 30 дней'),
+    ]
+    
+    # Находим индекс выбранной награды
+    selected_index = next((i for i, (key, _) in enumerate(rewards_display) if key == selected_reward), 0)
+    
+    # Отправляем начальное сообщение
+    roulette_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text="🎰 <b>Крутим рулетку...</b>",
+        parse_mode='HTML'
+    )
+    
+    # Анимация: прокручиваем рулетку 3 секунды
+    duration = 3.0  # секунд
+    frames = 25  # количество кадров анимации
+    frame_delay = duration / frames  # задержка между кадрами
+    
+    # Создаём случайную последовательность для эффекта прокрутки
+    current_pos = 0
+    prev_pos = -1  # Предыдущая позиция для проверки изменений
+    
+    for frame in range(frames):
+        # На последних кадрах замедляемся и останавливаемся на выбранной награде
+        if frame < frames - 5:
+            # Быстрая прокрутка
+            current_pos = (current_pos + 1) % len(rewards_display)
+        elif frame < frames - 1:
+            # Замедление перед выбранной наградой
+            if current_pos != selected_index:
+                current_pos = (current_pos + 1) % len(rewards_display)
+        else:
+            # Финальная позиция - выбранная награда
+            current_pos = selected_index
+        
+        # Обновляем сообщение только если позиция изменилась
+        if current_pos != prev_pos:
+            # Формируем текст рулетки
+            roulette_text = "🎰 <b>Крутим рулетку...</b>\n\n"
+            for i, (_, display_name) in enumerate(rewards_display):
+                if i == current_pos:
+                    roulette_text += f"➡️ <b>{display_name}</b>\n"
+                else:
+                    roulette_text += f"     {display_name}\n"
+            
+            # Обновляем сообщение
+            try:
+                await roulette_message.edit_text(
+                    text=roulette_text,
+                    parse_mode='HTML'
+                )
+                prev_pos = current_pos
+            except Exception as e:
+                # Игнорируем ошибки редактирования
+                pass
+        
+        # Задержка между кадрами
+        await asyncio.sleep(frame_delay)
+    
+    # Удаляем сообщение с рулеткой после завершения
+    try:
+        await roulette_message.delete()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение рулетки: {e}")
+
+
 async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Логика получения ежедневного бонуса."""
     query = update.callback_query
@@ -893,69 +1549,156 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Ещё рано! До бонуса: {hours:02d}:{minutes:02d}:{seconds:02d}", show_alert=True)
             return
 
-    # Выбираем случайный энергетик
-    all_drinks = db.get_all_drinks()
-    if not all_drinks:
-        await query.edit_message_text("В базе данных пока нет энергетиков! Бонус не может быть выдан.",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]))
-        return
+    # Выбираем награду по весам из рулетки
+    reward_types = list(DAILY_BONUS_REWARDS.keys())
+    reward_weights = [DAILY_BONUS_REWARDS[r]['weight'] for r in reward_types]
+    selected_reward = random.choices(reward_types, weights=reward_weights, k=1)[0]
+    
+    reward_info = DAILY_BONUS_REWARDS[selected_reward]
+    
+    # Удаляем старое сообщение
+    await query.message.delete()
+    
+    # Показываем текстовую анимацию рулетки
+    await show_roulette_animation(context, query.message.chat_id, selected_reward)
+    
+    # Обрабатываем награду в зависимости от типа
+    caption = ""
+    reward_log = ""
+    found_drink = None  # Для хранения энергетика если выпадет
+    
+    if selected_reward == 'coins':
+        # Награда 1: 400 септимов
+        coins_amount = reward_info['amount']
+        new_coins = db.increment_coins(user.id, coins_amount)
+        db.update_player(user.id, last_bonus_claim=current_time)
         
-    found_drink = random.choice(all_drinks)
-
-    # Определяем редкость
-    if found_drink.is_special:
-        rarity = 'Special'
-    else:
-        rarity = random.choices(list(RARITIES.keys()), weights=list(RARITIES.values()), k=1)[0]
-
-    # Добавляем в инвентарь, начисляем септимы и обновляем игрока
-    db.add_drink_to_inventory(user_id=user.id, drink_id=found_drink.id, rarity=rarity)
-    # Начисляем 20 септимов за ежедневный бонус
-    new_coins = db.increment_coins(user.id, 20)
-    db.update_player(user.id, last_bonus_claim=current_time)
+        caption = (
+            f"🎉 <b>Поздравляем!</b>\n\n"
+            f"💰 Вы выиграли <b>{coins_amount} септимов</b>!\n\n"
+            f"Текущий баланс: <b>{new_coins}</b> 🪙"
+        )
+        reward_log = f"+{coins_amount} coins -> {new_coins}"
+        
+    elif selected_reward == 'absolute_drink':
+        # Награда 2: Случайный энергетик Absolute (не Special)
+        all_drinks = db.get_all_drinks()
+        non_special_drinks = [d for d in all_drinks if not d.is_special]
+        
+        if not non_special_drinks:
+            caption = "❌ В базе нет доступных энергетиков для награды."
+        else:
+            found_drink = random.choice(non_special_drinks)
+            rarity = 'Absolute'
+            rarity_emoji = COLOR_EMOJIS.get(rarity, '🟣')
+            
+            db.add_drink_to_inventory(user_id=user.id, drink_id=found_drink.id, rarity=rarity)
+            db.update_player(user.id, last_bonus_claim=current_time)
+            
+            caption = (
+                f"🎉 <b>Невероятная удача!</b>\n\n"
+                f"Вы получили эксклюзивный энергетик редкости <b>{rarity_emoji} {rarity}</b>!\n\n"
+                f"<b>Название:</b> {found_drink.name}\n"
+                f"<b>Редкость:</b> {rarity_emoji} {rarity}\n\n"
+                f"<i>{found_drink.description}</i>"
+            )
+            reward_log = f"{found_drink.name} | rarity={rarity}"
+            # found_drink сохраняется для отправки фото в конце
+            
+    elif selected_reward == 'vip_3d':
+        # Награда 3: VIP на 3 дня или VIP+ на 1 день если уже есть VIP+
+        vip_plus_ts = db.get_vip_plus_until(user.id)
+        current_time_check = time.time()
+        
+        if vip_plus_ts and current_time_check < vip_plus_ts:
+            # Если есть активный VIP+, добавляем 1 день VIP+
+            new_vip_plus_ts = db.extend_vip_plus(user.id, 1 * 24 * 60 * 60)
+            db.update_player(user.id, last_bonus_claim=current_time)
+            
+            caption = (
+                f"🎉 <b>Элитная награда!</b>\n\n"
+                f"{VIP_PLUS_EMOJI} Вы получили <b>+1 день VIP+</b>!\n\n"
+                f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
+            )
+            reward_log = "+1 day VIP+"
+        else:
+            # Выдаём обычный VIP на 3 дня
+            new_vip_ts = db.extend_vip(user.id, 3 * 24 * 60 * 60)
+            db.update_player(user.id, last_bonus_claim=current_time)
+            
+            caption = (
+                f"🎉 <b>Отличная награда!</b>\n\n"
+                f"{VIP_EMOJI} Вы получили <b>VIP на 3 дня</b>!\n\n"
+                f"VIP активен до: {safe_format_timestamp(new_vip_ts)}"
+            )
+            reward_log = "VIP 3 days"
+            
+    elif selected_reward == 'vip_plus_7d':
+        # Награда 4: VIP+ на 7 дней
+        new_vip_plus_ts = db.extend_vip_plus(user.id, 7 * 24 * 60 * 60)
+        db.update_player(user.id, last_bonus_claim=current_time)
+        
+        caption = (
+            f"🎉 <b>Фантастическая награда!</b>\n\n"
+            f"{VIP_PLUS_EMOJI} Вы получили <b>VIP+ на 7 дней</b>!\n\n"
+            f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
+        )
+        reward_log = "VIP+ 7 days"
+        
+    elif selected_reward == 'vip_plus_30d':
+        # Награда 5: VIP+ на 30 дней (джекпот!)
+        new_vip_plus_ts = db.extend_vip_plus(user.id, 30 * 24 * 60 * 60)
+        db.update_player(user.id, last_bonus_claim=current_time)
+        
+        caption = (
+            f"🎊 <b>ДЖЕКПОТ!!!</b> 🎊\n\n"
+            f"{VIP_PLUS_EMOJI} Вы сорвали куш — <b>VIP+ на 30 дней</b>!\n\n"
+            f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
+        )
+        reward_log = "VIP+ 30 days (JACKPOT!)"
+    
+    # Логируем результат
     logger.info(
-        f"[DAILY BONUS] User {user.username or user.id} ({user.id}) received {found_drink.name} | rarity={rarity} | +20 coins -> {new_coins}"
+        f"[DAILY BONUS ROULETTE] User {user.username or user.id} ({user.id}) | "
+        f"reward={selected_reward} | {reward_log}"
     )
-
-    # Формируем сообщение
-    rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
     
-    # Проверяем VIP статус с приоритетом VIP+
-    vip_plus_ts = db.get_vip_plus_until(user.id)
-    vip_ts = db.get_vip_until(user.id)
-    current_time = time.time()
-    
-    if vip_plus_ts and current_time < vip_plus_ts and safe_format_timestamp(vip_plus_ts):
-        vip_line = f"\n{VIP_PLUS_EMOJI} VIP+ до: {safe_format_timestamp(vip_plus_ts)}"
-    elif vip_ts and current_time < vip_ts and safe_format_timestamp(vip_ts):
-        vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}"
-    else:
-        vip_line = ''
-    # TODO: применить эффекты VIP (механика шансов/доп. бонусов) по согласованию
-    caption = (
-        f"🎉 Ты получил свой ежедневный бонус!{vip_line}\n\n"
-        f"<b>Название:</b> {found_drink.name}\n"
-        f"<b>Редкость:</b> {rarity_emoji} {rarity}\n"
-        f"💰 <b>Награда:</b> +20 септимов\n\n"
-        f"<i>{found_drink.description}</i>"
-    )
-
+    # Отправляем финальное сообщение с наградой
     keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.message.delete()
-    
-    image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path) if found_drink.image_path else None
-    if image_full_path and os.path.exists(image_full_path):
-        with open(image_full_path, 'rb') as photo:
-            await context.bot.send_photo(
+    # Если выпал энергетик - отправляем с фото, иначе - просто текст
+    if found_drink and found_drink.image_path:
+        image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path)
+        if os.path.exists(image_full_path):
+            try:
+                with open(image_full_path, 'rb') as photo:
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id,
+                        photo=photo,
+                        caption=caption,
+                        reply_markup=reply_markup,
+                        parse_mode='HTML'
+                    )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить фото энергетика: {e}")
+                # Отправляем текстом если фото не получилось
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=caption,
+                    reply_markup=reply_markup,
+                    parse_mode='HTML'
+                )
+        else:
+            # Фото не найдено - отправляем текстом
+            await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                photo=photo,
-                caption=caption,
+                text=caption,
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
     else:
+        # Для всех остальных наград - просто текст
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=caption,
@@ -1043,7 +1786,8 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("➡️", callback_data=f"inventory_p{next_page}"),
         ])
 
-    # Кнопка назад в меню
+    # Кнопка поиска по названию и назад в меню
+    keyboard_rows.append([InlineKeyboardButton("🔎 Поиск по названию", callback_data='inventory_search_start')])
     keyboard_rows.append([InlineKeyboardButton("🔙 В меню", callback_data='menu')])
     reply_markup = InlineKeyboardMarkup(keyboard_rows)
 
@@ -1071,6 +1815,179 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
+
+
+async def start_inventory_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик начала поиска по названию в инвентаре."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    # Устанавливаем флаг ожидания поиска
+    context.user_data['awaiting_inventory_search'] = True
+    
+    # Формируем сообщение с инструкцией
+    search_text = (
+        "🔎 <b>Поиск по названию в инвентаре</b>\n\n"
+        "Введите название энергетика, который хотите найти в своём инвентаре.\n"
+        "Поиск не чувствителен к регистру."
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отменить поиск", callback_data='inventory_search_cancel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.edit_message_text(search_text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=search_text,
+            reply_markup=reply_markup,
+            parse_mode='HTML'
+        )
+
+
+async def show_inventory_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE, search_query: str, page: int = 1):
+    """Показывает результаты поиска по инвентарю с пагинацией."""
+    user_id = update.effective_user.id
+    inventory_items = db.get_player_inventory_with_details(user_id)
+    
+    # Фильтруем по поисковому запросу (нечувствительно к регистру)
+    search_lower = search_query.lower()
+    filtered_items = [
+        item for item in inventory_items
+        if search_lower in item.drink.name.lower()
+    ]
+    
+    # Сохраняем поисковый запрос в context для пагинации
+    context.user_data['last_inventory_search'] = search_query
+    
+    if page < 1:
+        page = 1
+    
+    # Если ничего не найдено
+    if not filtered_items:
+        search_text = (
+            f"🔎 <b>Результаты поиска: \"{search_query}\"</b>\n\n"
+            "❌ Ничего не найдено в вашем инвентаре.\n"
+            "Попробуйте изменить поисковый запрос."
+        )
+        keyboard_rows = [
+            [InlineKeyboardButton("🔄 Новый поиск", callback_data='inventory_search_start')],
+            [InlineKeyboardButton("📦 К инвентарю", callback_data='inventory')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard_rows)
+        
+        message = update.effective_message
+        if isinstance(update, Update) and update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(search_text, reply_markup=reply_markup, parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=search_text,
+                    reply_markup=reply_markup,
+                    parse_mode='HTML'
+                )
+        else:
+            await message.reply_text(search_text, reply_markup=reply_markup, parse_mode='HTML')
+        return
+    
+    # Сортировка по редкости
+    sorted_items = sorted(
+        filtered_items,
+        key=lambda i: (
+            RARITY_ORDER.index(i.rarity) if i.rarity in RARITY_ORDER else len(RARITY_ORDER),
+            i.drink.name.lower(),
+        )
+    )
+    
+    total_items = len(sorted_items)
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    if page > total_pages:
+        page = total_pages
+    
+    start_idx = (page - 1) * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    page_items = sorted_items[start_idx:end_idx]
+    
+    # Формируем текст результатов
+    search_text = (
+        f"🔎 <b>Результаты поиска: \"{search_query}\"</b>\n"
+        f"Найдено: {total_items} предмет(ов)\n"
+        f"Страница {page}/{total_pages}\n"
+    )
+    
+    current_rarity = None
+    for item in page_items:
+        if item.rarity != current_rarity:
+            rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
+            search_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
+            current_rarity = item.rarity
+        search_text += f"• {item.drink.name} — <b>{item.quantity} шт.</b>\n"
+    
+    # Клавиатура с кнопками предметов (2 в строке)
+    keyboard_rows = []
+    current_row = []
+    for item in page_items:
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {item.drink.name}"
+        callback = f"view_{item.id}_sp{page}"
+        current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
+        if len(current_row) == 2:
+            keyboard_rows.append(current_row)
+            current_row = []
+    if current_row:
+        keyboard_rows.append(current_row)
+    
+    # Пагинация
+    if total_pages > 1:
+        prev_page = total_pages if page == 1 else page - 1
+        next_page = 1 if page == total_pages else page + 1
+        
+        keyboard_rows.append([
+            InlineKeyboardButton("⬅️", callback_data=f"inventory_search_p{prev_page}"),
+            InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
+            InlineKeyboardButton("➡️", callback_data=f"inventory_search_p{next_page}"),
+        ])
+    
+    # Кнопки управления
+    keyboard_rows.append([
+        InlineKeyboardButton("🔄 Новый поиск", callback_data='inventory_search_start'),
+        InlineKeyboardButton("📦 К инвентарю", callback_data='inventory')
+    ])
+    keyboard_rows.append([InlineKeyboardButton("🔙 В меню", callback_data='menu')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard_rows)
+    
+    # Отправляем или редактируем сообщение
+    message = update.effective_message
+    if isinstance(update, Update) and update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(search_text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=search_text,
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+    else:
+        await message.reply_text(search_text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def inventory_search_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет поиск и возвращает к инвентарю."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Очищаем флаг ожидания поиска
+    context.user_data.pop('awaiting_inventory_search', None)
+    context.user_data.pop('last_inventory_search', None)
+    
+    # Возвращаемся к инвентарю
+    await show_inventory(update, context)
 
 
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1291,7 +2208,7 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Определяем страницу и тип инвентаря
         page = 1
-        inventory_type = 'normal'  # normal или receiver
+        inventory_type = 'normal'  # normal, receiver или search
         
         if len(parts) > 2:
             page_part = parts[2]
@@ -1301,6 +2218,9 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
             elif page_part.startswith('rp'):
                 page = int(page_part[2:])
                 inventory_type = 'receiver'
+            elif page_part.startswith('sp'):
+                page = int(page_part[2:])
+                inventory_type = 'search'
                 
     except (IndexError, ValueError):
         await query.answer("Ошибка идентификатора предмета", show_alert=True)
@@ -1350,6 +2270,9 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
     if inventory_type == 'receiver':
         back_callback = f'receiver_qty_p{page}'
         back_text = '🔙 Назад к Приёмнику'
+    elif inventory_type == 'search':
+        back_callback = f'inventory_search_p{page}'
+        back_text = '🔙 Назад к поиску'
     else:
         back_callback = f'inventory_p{page}' if page > 1 else 'inventory'
         back_text = '🔙 Назад к инвентарю'
@@ -1953,11 +2876,7 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("🌾 Мои грядки", callback_data='plantation_my_beds')],
         [InlineKeyboardButton("🛒 Купить семена", callback_data='plantation_shop')],
         [InlineKeyboardButton("🧪 Купить удобрения", callback_data='plantation_fertilizers_shop')],
-        [InlineKeyboardButton("🧪 Мои удобрения", callback_data='plantation_fertilizers_inv')],
         [InlineKeyboardButton("➕ Купить грядку", callback_data='plantation_buy_bed')],
-        [InlineKeyboardButton("🥕 Собрать урожай", callback_data='plantation_harvest')],
-        [InlineKeyboardButton("🌍 Общие плантации", callback_data='plantation_community')],
-        [InlineKeyboardButton("💧 Полить грядки", callback_data='plantation_water')],
         [InlineKeyboardButton("📊 Статистика", callback_data='plantation_stats')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
@@ -2006,25 +2925,34 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
             actions.append([InlineKeyboardButton(f"🔁 Пересадить {idx}", callback_data=f'plantation_choose_{idx}')])
         elif state == 'growing':
             name = html.escape(getattr(st, 'name', 'Семена')) if st else 'Семена'
-            grow = int(getattr(st, 'grow_time_sec', 0) or 0) if st else 0
+            # Получаем фактическое время роста с учетом удобрения
+            actual_grow_time = db.get_actual_grow_time(b)
             planted = int(getattr(b, 'planted_at', 0) or 0)
             passed = max(0, int(time.time()) - planted)
-            remain = max(0, grow - passed)
+            remain = max(0, actual_grow_time - passed)
             last = int(getattr(b, 'last_watered_at', 0) or 0)
             interval = int(getattr(st, 'water_interval_sec', 0) or 0) if st else 0
             next_water = max(0, interval - (int(time.time()) - last)) if last and interval else 0
             
-            # Проверяем статус удобрения
+            # Проверяем статус удобрений
             fert_status = db.get_fertilizer_status(b)
             
             prog = f"⏳ До созревания: { _fmt_time(remain) }" if remain else "⏳ Проверка готовности…"
             water_info = "💧 Можно поливать" if not next_water else f"💧 Через { _fmt_time(next_water) }"
             
-            # Добавляем информацию об удобрении
-            if fert_status['active']:
-                fert_info = f"🧪 {fert_status['fertilizer_name']}: { _fmt_time(fert_status['time_left']) }"
+            # Добавляем информацию об удобрениях (теперь может быть несколько)
+            if fert_status['active'] and fert_status['fertilizer_names']:
+                if len(fert_status['fertilizer_names']) == 1:
+                    fert_info = f"🧪 {fert_status['fertilizer_names'][0]} (x{fert_status['total_multiplier']:.1f})"
+                else:
+                    fert_info = f"🧪 Удобрений: {len(fert_status['fertilizer_names'])} (x{fert_status['total_multiplier']:.1f})"
             else:
-                fert_info = "🧪 Удобрения нет"
+                # Проверяем, было ли применено удобрение (даже если истекло)
+                if getattr(b, 'fertilizer_id', None) and getattr(b, 'fertilizer', None):
+                    fert_name = getattr(b.fertilizer, 'name', 'Удобрение')
+                    fert_info = f"🧪 {fert_name}: эффект ускорения действует"
+                else:
+                    fert_info = "🧪 Удобрения нет"
             
             lines.append(f"🌱 Грядка {idx}: Растёт {name}\n{prog}\n{water_info}\n{fert_info}")
             actions.append([
@@ -2104,40 +3032,6 @@ async def show_plantation_shop(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
-async def handle_community_seed_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    try:
-        is_admin = bool(db.is_admin(user.id) or (user.username in ADMIN_USERNAMES))
-    except Exception:
-        is_admin = bool(user.username in ADMIN_USERNAMES)
-    if not is_admin:
-        await query.answer("Нет прав", show_alert=True)
-        return
-    # Если уже есть проекты — не создаём повторно
-    existing = db.list_community_plantations(limit=1) or []
-    if existing:
-        await query.answer("Проекты уже существуют", show_alert=True)
-        await show_plantation_community(update, context)
-        return
-    # Создаём пару демонстрационных проектов
-    try:
-        db.create_community_plantation(
-            title="Летний урожай Monster",
-            description="Кооперативный проект по выращиванию. Присоединяйтесь и вносите свой вклад!",
-            created_by=user.id,
-        )
-        db.create_community_plantation(
-            title="Редкие семена Burn",
-            description="Набор участников открыт. Цель — собрать редкие семена для общего дела.",
-            created_by=user.id,
-        )
-        await query.answer("Демо-проекты добавлены", show_alert=False)
-    except Exception:
-        await query.answer("Ошибка при создании проектов", show_alert=True)
-    await show_plantation_community(update, context)
-
 async def show_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбор урожая."""
     query = update.callback_query
@@ -2160,93 +3054,6 @@ async def show_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_
     else:
         lines.append("\nПока нет готового урожая.")
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_plantation_community(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Общие плантации."""
-    query = update.callback_query
-    await query.answer()
-    lines = ["<b>🌍 Общие плантации</b>"]
-    keyboard = []
-    user = query.from_user
-    # Определим права админа (для возможности быстро создать демо-проекты)
-    try:
-        is_admin = bool(db.is_admin(user.id) or (user.username in ADMIN_USERNAMES))
-    except Exception:
-        is_admin = bool(user.username in ADMIN_USERNAMES)
-    try:
-        projects = db.list_community_plantations(limit=10) or []
-    except Exception:
-        projects = []
-    if projects:
-        lines.append("\nДоступные проекты:")
-        for p in projects:
-            title = html.escape(getattr(p, 'title', 'Проект'))
-            lines.append(f"• {title}")
-            keyboard.append([InlineKeyboardButton(f"▶ Открыть: {title}", callback_data=f"community_view_{p.id}")])
-    else:
-        lines.append("\nПока нет проектов. Загляните позже.")
-        if is_admin:
-            keyboard.append([InlineKeyboardButton("➕ Добавить демо-проекты", callback_data='community_seed_demo')])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-
-async def show_community_project(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    query = update.callback_query
-    await query.answer()
-    cp = db.get_community_plantation_by_id(project_id)
-    if not cp:
-        await query.answer("Проект не найден", show_alert=True)
-        await show_plantation_community(update, context)
-        return
-    user = query.from_user
-    title = html.escape(getattr(cp, 'title', 'Проект'))
-    desc = html.escape(getattr(cp, 'description', '') or '')
-    # Статистика проекта
-    try:
-        stats = db.get_community_stats(project_id) or {}
-    except Exception:
-        stats = {}
-    goal = int(stats.get('goal', 0) or 0)
-    progress = int(stats.get('progress', 0) or 0)
-    participants = int(stats.get('participants', 0) or 0)
-    status = str(stats.get('status') or 'active')
-    percent = int((progress * 100) // goal) if goal > 0 else 0
-    # Участие пользователя
-    try:
-        part = db.get_community_participant(project_id, user.id)
-    except Exception:
-        part = None
-    my_contrib = int(getattr(part, 'contributed_amount', 0) or 0) if part else 0
-
-    lines = [f"<b>🌍 {title}</b>"]
-    if desc:
-        lines.append(f"\n{desc}")
-    # Прогресс
-    bar = _progress_bar(progress, goal, width=16)
-    lines.append("")
-    lines.append(f"Прогресс: {progress}/{goal} ({percent}%)")
-    lines.append(bar)
-    lines.append(f"👥 Участников: {participants} | Статус: {'✅ завершён' if status == 'completed' else '🟢 активен'}")
-    if my_contrib > 0:
-        lines.append(f"Ваш вклад: {my_contrib} септимов")
-
-    keyboard = []
-    if status == 'active':
-        if not part:
-            keyboard.append([InlineKeyboardButton("🤝 Присоединиться", callback_data=f'community_join_{project_id}')])
-        # Быстрые суммы взносов
-        keyboard.append([
-            InlineKeyboardButton("💰 10", callback_data=f'community_contrib_{project_id}_10'),
-            InlineKeyboardButton("💰 50", callback_data=f'community_contrib_{project_id}_50'),
-            InlineKeyboardButton("💰 100", callback_data=f'community_contrib_{project_id}_100'),
-            InlineKeyboardButton("💰 500", callback_data=f'community_contrib_{project_id}_500'),
-        ])
-    else:
-        # Проект завершён — возможность забрать награду
-        keyboard.append([InlineKeyboardButton("🎁 Забрать награду", callback_data=f'community_claim_{project_id}')])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_community')])
-
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def show_plantation_water(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2313,35 +3120,167 @@ async def show_plantation_stats(update: Update, context: ContextTypes.DEFAULT_TY
 
 # === FERTILIZERS: SHOP, INVENTORY, APPLY ===
 
-async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Магазин удобрений."""
+def get_fertilizer_category(fertilizer) -> str:
+    """Определяет категорию удобрения по его эффекту."""
+    effect = str(getattr(fertilizer, 'effect', '') or '').lower()
+    name = str(getattr(fertilizer, 'name', '') or '').lower()
+    
+    if 'время' in effect or 'рост' in effect or 'суперрост' in name:
+        return 'growth'  # Ускорение роста
+    elif 'урожай' in effect or 'мегаурожай' in name or 'питание' in effect:
+        return 'yield'  # Увеличение урожая
+    elif 'качество' in effect or 'калийное' in name or 'минерал' in name:
+        return 'quality'  # Повышение качества
+    elif 'всё' in effect or 'био' in effect or 'комплекс' in name:
+        return 'complex'  # Комплексные
+    return 'other'
+
+def get_category_emoji(category: str) -> str:
+    """Возвращает эмодзи для категории."""
+    emojis = {
+        'growth': '⚡',
+        'yield': '🌾',
+        'quality': '💎',
+        'complex': '🌟',
+        'other': '🧪'
+    }
+    return emojis.get(category, '🧪')
+
+def get_category_name(category: str) -> str:
+    """Возвращает название категории на русском."""
+    names = {
+        'growth': 'Ускорение роста',
+        'yield': 'Увеличение урожая',
+        'quality': 'Повышение качества',
+        'complex': 'Комплексные',
+        'other': 'Прочие',
+        'all': 'Все удобрения'
+    }
+    return names.get(category, 'Прочие')
+
+async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes.DEFAULT_TYPE, filter_category: str = 'all'):
+    """Магазин удобрений с улучшенным интерфейсом."""
     query = update.callback_query
     await query.answer()
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    
+    # Получаем удобрения и инвентарь
     try:
         fertilizers = db.list_fertilizers() or []
     except Exception:
         fertilizers = []
+    
+    try:
+        inv = db.get_fertilizer_inventory(user.id) or []
+        inventory_dict = {}
+        for it in inv:
+            fz = getattr(it, 'fertilizer', None)
+            if fz:
+                inventory_dict[fz.id] = int(getattr(it, 'quantity', 0) or 0)
+    except Exception:
+        inventory_dict = {}
 
-    lines = [f"<b>🧪 Магазин удобрений</b>", f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов"]
+    # Заголовок и баланс
+    lines = [f"<b>🧪 Магазин удобрений</b>"]
+    lines.append(f"💰 Баланс: <b>{int(getattr(player, 'coins', 0) or 0)}</b> септимов")
+    
+    # Инвентарь (если есть)
+    if inventory_dict:
+        lines.append(f"\n📦 <b>В инвентаре:</b>")
+        inv_items = []
+        for fert in fertilizers:
+            qty = inventory_dict.get(fert.id, 0)
+            if qty > 0:
+                inv_items.append(f"{getattr(fert, 'name', 'Удобрение')}: {qty} шт.")
+        if inv_items:
+            lines.append(", ".join(inv_items[:5]))  # Показываем до 5 позиций
+            if len(inv_items) > 5:
+                lines.append(f"... и ещё {len(inv_items) - 5}")
+    
+    # Фильтры по категориям
+    filter_buttons = []
+    categories = ['all', 'growth', 'yield', 'quality', 'complex']
+    for cat in categories:
+        emoji = get_category_emoji(cat) if cat != 'all' else '🌐'
+        cat_name = get_category_name(cat)
+        # Отметим выбранную категорию
+        if cat == filter_category:
+            filter_buttons.append(InlineKeyboardButton(f"✅ {cat_name}", callback_data=f'fert_filter_{cat}'))
+        else:
+            filter_buttons.append(InlineKeyboardButton(f"{emoji} {cat_name}", callback_data=f'fert_filter_{cat}'))
+    
     keyboard = []
-    if fertilizers:
-        lines.append("\nДоступные удобрения:")
-        for fz in fertilizers:
-            name = html.escape(getattr(fz, 'name', 'Удобрение'))
-            desc = html.escape(getattr(fz, 'description', '') or '')
-            price = int(getattr(fz, 'price_coins', 0) or 0)
-            eff = html.escape(getattr(fz, 'effect', '') or '')
-            dur_m = int((int(getattr(fz, 'duration_sec', 0) or 0)) / 60)
-            lines.append(f"• {name} — {price}💰 | эффект: {eff} | длительность: ~{dur_m} мин\n  {desc}")
-            keyboard.append([
-                InlineKeyboardButton("Купить 1", callback_data=f'fert_buy_{fz.id}_1'),
-                InlineKeyboardButton("Купить 5", callback_data=f'fert_buy_{fz.id}_5'),
-            ])
+    # Добавляем фильтры по 2 кнопки в ряд
+    keyboard.append(filter_buttons[:3])
+    keyboard.append(filter_buttons[3:])
+    
+    # Фильтруем удобрения по категории
+    filtered_fertilizers = []
+    if filter_category == 'all':
+        filtered_fertilizers = fertilizers
     else:
-        lines.append("\nПока нет удобрений. Загляните позже.")
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
+        for fz in fertilizers:
+            if get_fertilizer_category(fz) == filter_category:
+                filtered_fertilizers.append(fz)
+    
+    # Группируем по категориям для красивого отображения
+    if filtered_fertilizers:
+        lines.append(f"\n<b>📋 Доступно удобрений ({len(filtered_fertilizers)}):</b>")
+        
+        # Группируем по категориям, если показываем все
+        if filter_category == 'all':
+            categories_group = {}
+            for fz in filtered_fertilizers:
+                cat = get_fertilizer_category(fz)
+                if cat not in categories_group:
+                    categories_group[cat] = []
+                categories_group[cat].append(fz)
+            
+            # Показываем по категориям
+            for cat in ['growth', 'yield', 'quality', 'complex', 'other']:
+                if cat in categories_group:
+                    cat_emoji = get_category_emoji(cat)
+                    cat_name = get_category_name(cat)
+                    lines.append(f"\n{cat_emoji} <b>{cat_name}:</b>")
+                    for fz in categories_group[cat]:
+                        name = html.escape(getattr(fz, 'name', 'Удобрение'))
+                        desc = html.escape(getattr(fz, 'description', '') or '')
+                        price = int(getattr(fz, 'price_coins', 0) or 0)
+                        dur_m = int((int(getattr(fz, 'duration_sec', 0) or 0)) / 60)
+                        in_inv = inventory_dict.get(fz.id, 0)
+                        inv_text = f" | 📦 <i>{in_inv} шт.</i>" if in_inv > 0 else ""
+                        lines.append(f"  • <b>{name}</b> — {price}💰{inv_text}")
+                        lines.append(f"    <i>{desc}</i> | ⏱ {dur_m} мин")
+                        # Кнопки покупки
+                        keyboard.append([
+                            InlineKeyboardButton("1 шт.", callback_data=f'fert_buy_{fz.id}_1'),
+                            InlineKeyboardButton("5 шт.", callback_data=f'fert_buy_{fz.id}_5'),
+                            InlineKeyboardButton("10 шт.", callback_data=f'fert_buy_{fz.id}_10'),
+                            InlineKeyboardButton("✏️", callback_data=f'fert_buy_custom_{fz.id}'),
+                        ])
+        else:
+            # Показываем только выбранную категорию
+            for fz in filtered_fertilizers:
+                name = html.escape(getattr(fz, 'name', 'Удобрение'))
+                desc = html.escape(getattr(fz, 'description', '') or '')
+                price = int(getattr(fz, 'price_coins', 0) or 0)
+                dur_m = int((int(getattr(fz, 'duration_sec', 0) or 0)) / 60)
+                in_inv = inventory_dict.get(fz.id, 0)
+                inv_text = f" | 📦 <i>{in_inv} шт.</i>" if in_inv > 0 else ""
+                lines.append(f"\n• <b>{name}</b> — {price}💰{inv_text}")
+                lines.append(f"  <i>{desc}</i> | ⏱ {dur_m} мин")
+                # Кнопки покупки
+                keyboard.append([
+                    InlineKeyboardButton("1 шт.", callback_data=f'fert_buy_{fz.id}_1'),
+                    InlineKeyboardButton("5 шт.", callback_data=f'fert_buy_{fz.id}_5'),
+                    InlineKeyboardButton("10 шт.", callback_data=f'fert_buy_{fz.id}_10'),
+                    InlineKeyboardButton("✏️", callback_data=f'fert_buy_custom_{fz.id}'),
+                ])
+    else:
+        lines.append("\n⚠️ Нет удобрений в выбранной категории.")
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад в меню", callback_data='market_plantation')])
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def handle_fertilizer_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int, quantity: int):
@@ -2366,6 +3305,156 @@ async def handle_fertilizer_buy(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await query.answer(f"Куплено! Баланс: {res.get('coins_left')}", show_alert=False)
         await show_plantation_fertilizers_shop(update, context)
+
+async def start_fertilizer_custom_buy_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper для извлечения fertilizer_id из callback_data."""
+    query = update.callback_query
+    try:
+        # Извлекаем ID из fert_buy_custom_{fert_id}
+        fertilizer_id = int(query.data.split('_')[-1])
+        return await start_fertilizer_custom_buy(update, context, fertilizer_id)
+    except Exception:
+        await query.answer("Ошибка. Попробуйте позже.", show_alert=True)
+        return ConversationHandler.END
+
+async def start_fertilizer_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int):
+    """Начинает процесс покупки кастомного количества удобрений."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    # Сохраняем ID удобрения в контексте
+    context.user_data['fert_custom_buy_id'] = fertilizer_id
+    
+    # Получаем информацию об удобрении
+    try:
+        fertilizers = db.list_fertilizers() or []
+        fert = None
+        for f in fertilizers:
+            if f.id == fertilizer_id:
+                fert = f
+                break
+        
+        if not fert:
+            await query.answer("Удобрение не найдено", show_alert=True)
+            return ConversationHandler.END
+        
+        name = html.escape(getattr(fert, 'name', 'Удобрение'))
+        price = int(getattr(fert, 'price_coins', 0) or 0)
+        
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        balance = int(getattr(player, 'coins', 0) or 0)
+        max_qty = balance // price if price > 0 else 0
+        
+        text = f"<b>✏️ Покупка удобрения</b>\n\n"
+        text += f"<b>{name}</b>\n"
+        text += f"💰 Цена: {price} септимов за 1 шт.\n"
+        text += f"💰 Ваш баланс: {balance} септимов\n"
+        text += f"📦 Максимум: {max_qty} шт.\n\n"
+        text += f"<i>Введите количество для покупки (1-{max_qty}):</i>"
+        
+        keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='fert_custom_cancel')]]
+        
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        
+        return FERTILIZER_CUSTOM_QTY
+    except Exception:
+        await query.answer("Ошибка. Попробуйте позже.", show_alert=True)
+        return ConversationHandler.END
+
+async def handle_fertilizer_custom_qty_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ввод кастомного количества удобрений."""
+    msg = update.message
+    user = update.effective_user
+    
+    if not msg or not msg.text:
+        await msg.reply_text("Пожалуйста, введите число.")
+        return FERTILIZER_CUSTOM_QTY
+    
+    fertilizer_id = context.user_data.get('fert_custom_buy_id')
+    if not fertilizer_id:
+        await msg.reply_text("Ошибка: удобрение не выбрано.")
+        return ConversationHandler.END
+    
+    try:
+        quantity = int(msg.text.strip())
+    except ValueError:
+        await msg.reply_text("❌ Неверный формат. Пожалуйста, введите целое число.")
+        return FERTILIZER_CUSTOM_QTY
+    
+    if quantity <= 0:
+        await msg.reply_text("❌ Количество должно быть больше 0.")
+        return FERTILIZER_CUSTOM_QTY
+    
+    # Проверяем максимум
+    try:
+        fertilizers = db.list_fertilizers() or []
+        fert = None
+        for f in fertilizers:
+            if f.id == fertilizer_id:
+                fert = f
+                break
+        
+        if not fert:
+            await msg.reply_text("❌ Удобрение не найдено.")
+            return ConversationHandler.END
+        
+        price = int(getattr(fert, 'price_coins', 0) or 0)
+        total_cost = price * quantity
+        
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        balance = int(getattr(player, 'coins', 0) or 0)
+        
+        if total_cost > balance:
+            await msg.reply_text(f"❌ Недостаточно монет!\nНужно: {total_cost} септимов\nУ вас: {balance} септимов")
+            return FERTILIZER_CUSTOM_QTY
+        
+        if quantity > 1000:
+            await msg.reply_text("❌ Слишком много! Максимум 1000 шт. за раз.")
+            return FERTILIZER_CUSTOM_QTY
+        
+    except Exception:
+        await msg.reply_text("❌ Ошибка при проверке. Попробуйте позже.")
+        return ConversationHandler.END
+    
+    # Выполняем покупку
+    lock = _get_lock(f"user:{user.id}:fert_buy")
+    if lock.locked():
+        await msg.reply_text("⏳ Обработка предыдущей покупки...")
+        return FERTILIZER_CUSTOM_QTY
+    
+    async with lock:
+        res = db.purchase_fertilizer(user.id, int(fertilizer_id), int(quantity))
+        if not res.get('ok'):
+            reason = res.get('reason')
+            if reason == 'not_enough_coins':
+                await msg.reply_text('❌ Недостаточно монет')
+            elif reason == 'no_such_fertilizer':
+                await msg.reply_text('❌ Удобрение не найдено')
+            elif reason == 'invalid_quantity':
+                await msg.reply_text('❌ Неверное количество')
+            else:
+                await msg.reply_text('❌ Ошибка. Попробуйте позже.')
+        else:
+            name = html.escape(getattr(fert, 'name', 'Удобрение'))
+            await msg.reply_html(f"✅ <b>Куплено!</b>\n\n{name} x {quantity}\n💰 Баланс: {res.get('coins_left')} септимов")
+        
+        # Показываем магазин
+        keyboard = [[InlineKeyboardButton("🧪 Вернуться в магазин", callback_data='plantation_fertilizers_shop')]]
+        await msg.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    return ConversationHandler.END
+
+async def cancel_fertilizer_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет покупку кастомного количества."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await show_plantation_fertilizers_shop(update, context)
+    return ConversationHandler.END
 
 async def show_plantation_fertilizers_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Инвентарь удобрений."""
@@ -2432,14 +3521,16 @@ async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_
             reason = res.get('reason')
             if reason == 'not_growing':
                 await query.answer('Грядка не в состоянии роста', show_alert=True)
-            elif reason == 'fertilizer_active':
-                await query.answer('На грядке уже активен эффект удобрения', show_alert=True)
+            elif reason == 'not_watered':
+                await query.answer('Сначала полейте растение!', show_alert=True)
             elif reason == 'no_fertilizer_in_inventory':
                 await query.answer('Нет такого удобрения в инвентаре', show_alert=True)
+            elif reason == 'max_fertilizers_reached':
+                await query.answer('Достигнут лимит удобрений (макс. 3 на грядку)', show_alert=True)
             else:
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         else:
-            await query.answer('Удобрение применено!', show_alert=False)
+            await query.answer('Удобрение применено! Бонусы суммируются.', show_alert=False)
         await show_plantation_my_beds(update, context)
 
 async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
@@ -2493,9 +3584,6 @@ async def show_plantation_join_project(update: Update, context: ContextTypes.DEF
 async def show_plantation_my_contribution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
 
-async def show_plantation_community_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
-
 async def show_plantation_water_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("🚧 Нечего поливать", show_alert=True)
 
@@ -2525,76 +3613,6 @@ def _progress_bar(value: int, total: int, width: int = 10) -> str:
     bar = "█" * filled + "░" * (width - filled)
     return f"[{bar}]"
 
-async def handle_community_join(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:community_join")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.join_community_project(project_id, user.id)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'no_project':
-                await query.answer('Проект не найден', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer('Вы присоединились к проекту!', show_alert=False)
-        await show_community_project(update, context, project_id)
-
-async def handle_community_contrib(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int, amount: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:community_contrib")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.contribute_to_community_project(project_id, user.id, int(amount))
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'invalid_amount':
-                await query.answer('Неверная сумма взноса', show_alert=True)
-            elif reason == 'not_enough_coins':
-                await query.answer('Недостаточно монет', show_alert=True)
-            elif reason == 'completed':
-                await query.answer('Проект уже завершён', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer(f"Взнос принят: {int(amount)}. Баланс: {res.get('coins_left')}", show_alert=False)
-        await show_community_project(update, context, project_id)
-
-async def handle_community_claim(update: Update, context: ContextTypes.DEFAULT_TYPE, project_id: int):
-    query = update.callback_query
-    user = query.from_user
-    lock = _get_lock(f"user:{user.id}:community_claim")
-    if lock.locked():
-        await query.answer("Обработка…", show_alert=False)
-        return
-    async with lock:
-        res = db.claim_community_reward(project_id, user.id)
-        if not res.get('ok'):
-            reason = res.get('reason')
-            if reason == 'not_completed':
-                await query.answer('Проект ещё не завершён', show_alert=True)
-            elif reason == 'not_participant':
-                await query.answer('Вы не участник проекта', show_alert=True)
-            elif reason == 'already_claimed':
-                await query.answer('Награда уже получена', show_alert=True)
-            elif reason == 'no_progress':
-                await query.answer('Нечего распределять', show_alert=True)
-            elif reason == 'no_contribution':
-                await query.answer('У вас нет вклада в проект', show_alert=True)
-            elif reason == 'no_state':
-                await query.answer('Состояние проекта не найдено', show_alert=True)
-            else:
-                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
-        else:
-            await query.answer(f"Начислено: {res.get('claimed_coins', 0)}. Баланс: {res.get('coins_after')}", show_alert=True)
-        await show_community_project(update, context, project_id)
 
 async def show_plantation_choose_seed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
     query = update.callback_query
@@ -2664,6 +3682,28 @@ async def handle_plantation_plant(update: Update, context: ContextTypes.DEFAULT_
                 await query.answer('Ошибка при посадке', show_alert=True)
         else:
             await query.answer('Посажено!', show_alert=False)
+            
+            # Планируем первое напоминание о поливе, если включено
+            player = db.get_or_create_player(user.id, user.username or user.first_name)
+            if getattr(player, 'remind_plantation', False) and context.application and context.application.job_queue:
+                water_interval = int(res.get('water_interval_sec', 0))
+                if water_interval > 0:
+                    try:
+                        # Удаляем старые напоминания для этой грядки
+                        current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user.id}_{bed_index}")
+                        for job in current_jobs:
+                            job.schedule_removal()
+                        
+                        # Планируем напоминание на время, когда можно будет полить
+                        context.application.job_queue.run_once(
+                            plantation_water_reminder_job,
+                            when=water_interval,
+                            chat_id=user.id,
+                            data={'bed_index': bed_index},
+                            name=f"plantation_water_reminder_{user.id}_{bed_index}",
+                        )
+                    except Exception as ex:
+                        logger.warning(f"Не удалось запланировать напоминание о поливе при посадке: {ex}")
         await show_plantation_my_beds(update, context)
 
 
@@ -2689,6 +3729,28 @@ async def handle_plantation_water(update: Update, context: ContextTypes.DEFAULT_
                 await query.answer('Ошибка при поливе', show_alert=True)
         else:
             await query.answer('Полито!', show_alert=False)
+            
+            # Планируем напоминание о следующем поливе, если включено
+            player = db.get_or_create_player(user.id, user.username or user.first_name)
+            if getattr(player, 'remind_plantation', False) and context.application and context.application.job_queue:
+                water_interval = int(res.get('water_interval_sec', 0))
+                if water_interval > 0:
+                    try:
+                        # Удаляем старые напоминания для этой грядки
+                        current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user.id}_{bed_index}")
+                        for job in current_jobs:
+                            job.schedule_removal()
+                        
+                        # Планируем новое напоминание
+                        context.application.job_queue.run_once(
+                            plantation_water_reminder_job,
+                            when=water_interval,
+                            chat_id=user.id,
+                            data={'bed_index': bed_index},
+                            name=f"plantation_water_reminder_{user.id}_{bed_index}",
+                        )
+                    except Exception as ex:
+                        logger.warning(f"Не удалось запланировать напоминание о поливе: {ex}")
         await show_plantation_my_beds(update, context)
 
 
@@ -2717,6 +3779,15 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
             drink_id = int(res.get('drink_id') or 0)
             rarity_counts = res.get('rarity_counts') or {}
 
+            # Удаляем напоминание о поливе для этой грядки
+            if context.application and context.application.job_queue:
+                try:
+                    current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user.id}_{bed_index}")
+                    for job in current_jobs:
+                        job.schedule_removal()
+                except Exception as ex:
+                    logger.warning(f"Не удалось удалить напоминание о поливе при сборе урожая: {ex}")
+
             # Короткое подтверждение
             await query.answer(f"Собрано: {items_added}", show_alert=False)
 
@@ -2741,7 +3812,7 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
             eff = res.get('effects') or {}
             wc = int(eff.get('water_count') or 0)
             fert_active = bool(eff.get('fertilizer_active'))
-            fert_name = eff.get('fertilizer_name') or ''
+            fert_names = eff.get('fertilizer_names') or []
             status_raw = (eff.get('status_effect') or '').lower()
             yield_mult = float(eff.get('yield_multiplier') or 1.0)
             status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
@@ -2749,11 +3820,13 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
             lines.append("")
             lines.append("<i>Эффекты</i>:")
             lines.append(f"• Поливов: {wc}")
-            if fert_active:
-                if fert_name:
-                    lines.append(f"• Удобрение: активно ({html.escape(str(fert_name))})")
+            if fert_active and fert_names:
+                if len(fert_names) == 1:
+                    lines.append(f"• Удобрение: {html.escape(fert_names[0])}")
                 else:
-                    lines.append("• Удобрение: активно")
+                    lines.append(f"• Удобрений активно: {len(fert_names)}")
+                    for fname in fert_names:
+                        lines.append(f"  - {html.escape(fname)}")
             else:
                 lines.append("• Удобрение: нет")
             lines.append(f"• Негативный статус: {status_h}")
@@ -2799,6 +3872,15 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
             res = db.harvest_bed(user.id, idx)
             if not res.get('ok'):
                 continue
+            
+            # Удаляем напоминание о поливе для этой грядки
+            if context.application and context.application.job_queue:
+                try:
+                    current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user.id}_{idx}")
+                    for job in current_jobs:
+                        job.schedule_removal()
+                except Exception as ex:
+                    logger.warning(f"Не удалось удалить напоминание о поливе при массовом сборе: {ex}")
 
             amount = int(res.get('yield') or 0)
             items_added = int(res.get('items_added') or 0)
@@ -2957,6 +4039,7 @@ async def show_cities_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🏰 Город ХайТаун", callback_data='city_hightown')],
         [InlineKeyboardButton("🧵 Город Шёлка", callback_data='city_silk')],
+        [InlineKeyboardButton("🌆 Город Ростов", callback_data='city_rostov')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3007,6 +4090,105 @@ async def show_city_hightown(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
         except BadRequest:
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_city_rostov(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Город Ростов: город с разделами (заглушки)."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    _ = player.language
+
+    text = "<b>🌆 Город Ростов</b>\nВыберите раздел:"
+    keyboard = [
+        [InlineKeyboardButton("🎯 Клуб 42", callback_data='rostov_club42')],
+        [InlineKeyboardButton("💎 Магазин элиты", callback_data='rostov_elite_shop')],
+        [InlineKeyboardButton("💱 Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🔙 К городам", callback_data='cities_menu')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_club42(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заглушка для Клуба 42."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    _ = player.language
+
+    text = "<b>🎯 Клуб 42</b>\n\n🚧 <i>В разработке</i>"
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад", callback_data='city_rostov')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_elite_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заглушка для Магазина элиты."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    _ = player.language
+
+    text = "<b>💎 Магазин элиты</b>\n\n🚧 <i>В разработке</i>"
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад", callback_data='city_rostov')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Заглушка для Обменника."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    _ = player.language
+
+    text = "<b>💱 Обменник</b>\n\n🚧 <i>В разработке</i>"
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад", callback_data='city_rostov')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def show_market_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3497,58 +4679,78 @@ async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     lang = player.language
 
-    text = t(lang, 'vip_title')
-    # Добавим блок о текущем состоянии автопоиска VIP
-    try:
-        auto_state = t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else t(lang, 'off')
-        auto_count = int(getattr(player, 'auto_search_count', 0) or 0)
-        auto_limit = db.get_auto_search_daily_limit(user.id)  # Используем новую функцию с учётом бустов
-        text += t(lang, 'vip_auto_header')
-        text += "\n" + t(lang, 'vip_auto_state').format(state=auto_state)
-        text += "\n" + t(lang, 'vip_auto_today').format(count=auto_count, limit=auto_limit)
+    # Проверяем наличие активного VIP+
+    has_vip_plus = db.is_vip_plus(user.id)
+    
+    if has_vip_plus:
+        # Если есть VIP+, показываем предупреждение вместо кнопок тарифов
+        vip_plus_until = db.get_vip_plus_until(user.id)
+        until_str = safe_format_timestamp(vip_plus_until) if vip_plus_until else '—'
         
-        # Добавляем информацию о бусте, если он активен
-        boost_info = db.get_boost_info(user.id)
-        if boost_info['is_active']:
-            rocket_emoji = "🚀"
-            clock_emoji = "⏰"
-            
-            # Получаем детальную информацию о бусте
-            boost_text_parts = [
-                f"\n{rocket_emoji} <b>Автопоиск буст:</b>",
-                f"📊 Дополнительно: +{boost_info['boost_count']} поисков",
-                f"{clock_emoji} Осталось: {boost_info['time_remaining_formatted']}",
-                f"📅 Истекает: {boost_info['boost_until_formatted']}"
-            ]
-            
-            boost_display = "\n".join(boost_text_parts)
-            text += boost_display
-        elif boost_info['has_boost']:
-            # Буст есть, но не активен (истёк)
-            text += f"\n⏱ <i>Буст автопоиска истёк</i>"
-            
-        # Добавляем ссылку на историю бустов (если есть история)
+        text = f"<b>{VIP_EMOJI} V.I.P статус</b>\n\n"
+        text += f"⚠️ У вас уже есть активный {VIP_PLUS_EMOJI} VIP+ до {until_str}\n\n"
+        text += "❌ Покупка обычного VIP недоступна при наличии VIP+.\n\n"
+        text += "💡 VIP+ уже включает все преимущества обычного VIP и даже больше!"
+        
+        keyboard = [
+            [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='extra_bonuses')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        ]
+    else:
+        # Обычное меню VIP
+        text = t(lang, 'vip_title')
+        # Добавим блок о текущем состоянии автопоиска VIP
         try:
-            history = db.get_user_boost_history(user.id, limit=1)
-            if history:
-                text += f"\n\n📋 Для просмотра истории бустов напишите /myboosts"
+            auto_state = t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else t(lang, 'off')
+            auto_count = int(getattr(player, 'auto_search_count', 0) or 0)
+            auto_limit = db.get_auto_search_daily_limit(user.id)  # Используем новую функцию с учётом бустов
+            text += t(lang, 'vip_auto_header')
+            text += "\n" + t(lang, 'vip_auto_state').format(state=auto_state)
+            text += "\n" + t(lang, 'vip_auto_today').format(count=auto_count, limit=auto_limit)
+            
+            # Добавляем информацию о бусте, если он активен
+            boost_info = db.get_boost_info(user.id)
+            if boost_info['is_active']:
+                rocket_emoji = "🚀"
+                clock_emoji = "⏰"
+                
+                # Получаем детальную информацию о бусте
+                boost_text_parts = [
+                    f"\n{rocket_emoji} <b>Автопоиск буст:</b>",
+                    f"📊 Дополнительно: +{boost_info['boost_count']} поисков",
+                    f"{clock_emoji} Осталось: {boost_info['time_remaining_formatted']}",
+                    f"📅 Истекает: {boost_info['boost_until_formatted']}"
+                ]
+                
+                boost_display = "\n".join(boost_text_parts)
+                text += boost_display
+            elif boost_info['has_boost']:
+                # Буст есть, но не активен (истёк)
+                text += f"\n⏱ <i>Буст автопоиска истёк</i>"
+                
+            # Добавляем ссылку на историю бустов (если есть история)
+            try:
+                history = db.get_user_boost_history(user.id, limit=1)
+                if history:
+                    text += f"\n\n📋 Для просмотра истории бустов напишите /myboosts"
+            except Exception:
+                pass
         except Exception:
             pass
-    except Exception:
-        pass
+        
+        # Ensure text is properly encoded to avoid Unicode issues
+        try:
+            text = text.encode('utf-8', errors='replace').decode('utf-8')
+        except Exception:
+            pass
+        keyboard = [
+            [InlineKeyboardButton(t(lang, 'vip_1d'), callback_data='vip_1d')],
+            [InlineKeyboardButton(t(lang, 'vip_7d'), callback_data='vip_7d')],
+            [InlineKeyboardButton(t(lang, 'vip_30d'), callback_data='vip_30d')],
+            [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='extra_bonuses')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        ]
     
-    # Ensure text is properly encoded to avoid Unicode issues
-    try:
-        text = text.encode('utf-8', errors='replace').decode('utf-8')
-    except Exception:
-        pass
-    keyboard = [
-        [InlineKeyboardButton(t(lang, 'vip_1d'), callback_data='vip_1d')],
-        [InlineKeyboardButton(t(lang, 'vip_7d'), callback_data='vip_7d')],
-        [InlineKeyboardButton(t(lang, 'vip_30d'), callback_data='vip_30d')],
-        [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='extra_bonuses')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
-    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     message = query.message
@@ -3923,6 +5125,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'menu':
         await show_menu(update, context)
+    elif data == 'creator_panel':
+        await show_creator_panel(update, context)
+    elif data == 'creator_reset_bonus':
+        await creator_reset_bonus_start(update, context)
+    elif data == 'creator_give_coins':
+        await creator_give_coins_start(update, context)
+    elif data == 'creator_user_stats':
+        await creator_user_stats_start(update, context)
+    elif data == 'creator_admins':
+        await show_admins_panel(update, context)
+    elif data == 'creator_admin_add':
+        await creator_admin_add_start(update, context)
+    elif data == 'creator_admin_promote':
+        await creator_admin_promote_start(update, context)
+    elif data == 'creator_admin_demote':
+        await creator_admin_demote_start(update, context)
+    elif data == 'creator_admin_remove':
+        await creator_admin_remove_start(update, context)
     elif data == 'find_energy':
         await find_energy(update, context)
     elif data == 'claim_bonus':
@@ -3932,6 +5152,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('inventory_p'):
         # Пагинация инвентаря
         await show_inventory(update, context)
+    elif data == 'inventory_search_start':
+        # Начало поиска по инвентарю
+        await start_inventory_search(update, context)
+    elif data == 'inventory_search_cancel':
+        # Отмена поиска и возврат к инвентарю
+        await inventory_search_cancel(update, context)
+    elif data.startswith('inventory_search_p'):
+        # Пагинация результатов поиска
+        try:
+            page = int(data.removeprefix('inventory_search_p'))
+            search_query = context.user_data.get('last_inventory_search', '')
+            if search_query:
+                await show_inventory_search_results(update, context, search_query, page)
+            else:
+                await query.answer("Поисковый запрос не найден. Начните новый поиск.", show_alert=True)
+        except Exception:
+            await query.answer("Ошибка пагинации", show_alert=True)
     elif data.startswith('receiver_qty_p'):
         # Пагинация инвентаря по количеству для Приёмника
         await show_inventory_by_quantity(update, context)
@@ -3945,6 +5182,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_city_hightown(update, context)
     elif data == 'city_silk':
         await silk_ui.show_city_silk(update, context)
+    elif data == 'city_rostov':
+        await show_city_rostov(update, context)
+    elif data == 'rostov_club42':
+        await show_rostov_club42(update, context)
+    elif data == 'rostov_elite_shop':
+        await show_rostov_elite_shop(update, context)
+    elif data == 'rostov_exchange':
+        await show_rostov_exchange(update, context)
     elif data == 'silk_plantations':
         await silk_ui.show_silk_plantations(update, context)
     elif data == 'silk_market':
@@ -4010,8 +5255,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_plantation_harvest(update, context)
     elif data == 'plantation_harvest_all':
         await handle_plantation_harvest_all(update, context)
-    elif data == 'plantation_community':
-        await show_plantation_community(update, context)
     elif data == 'plantation_water':
         await show_plantation_water(update, context)
     elif data == 'plantation_stats':
@@ -4022,39 +5265,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_plantation_join_project(update, context)
     elif data == 'plantation_my_contribution':
         await show_plantation_my_contribution(update, context)
-    elif data == 'plantation_community_rewards':
-        await show_plantation_community_rewards(update, context)
     elif data == 'plantation_water_all':
         await show_plantation_water_all(update, context)
     elif data == 'plantation_leaderboard':
         await show_plantation_leaderboard(update, context)
-    elif data == 'community_seed_demo':
-        await handle_community_seed_demo(update, context)
-    elif data.startswith('community_view_'):
-        try:
-            pid = int(data.split('_')[-1])
-            await show_community_project(update, context, pid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('community_join_'):
-        try:
-            pid = int(data.split('_')[-1])
-            await handle_community_join(update, context, pid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('community_contrib_'):
-        # community_contrib_{pid}_{amount}
-        try:
-            _, _, pid, amount = data.split('_')
-            await handle_community_contrib(update, context, int(pid), int(amount))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('community_claim_'):
-        try:
-            pid = int(data.split('_')[-1])
-            await handle_community_claim(update, context, pid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('casino_bet_'):
         try:
             amount = int(data.split('_')[-1])
@@ -4068,6 +5282,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             _, _, sid, qty = data.split('_')
             await handle_plantation_buy(update, context, int(sid), int(qty))
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('fert_filter_'):
+        # fert_filter_{category}
+        try:
+            category = data.split('_')[-1]
+            await show_plantation_fertilizers_shop(update, context, filter_category=category)
         except Exception:
             await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('fert_buy_'):
@@ -4158,6 +5379,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await buy_vip(update, context, '7d')
     elif data == 'buy_vip_30d':
         await buy_vip(update, context, '30d')
+    elif data == 'confirm_vip_plus_1d':
+        await confirm_vip_plus_purchase(update, context, '1d')
+    elif data == 'confirm_vip_plus_7d':
+        await confirm_vip_plus_purchase(update, context, '7d')
+    elif data == 'confirm_vip_plus_30d':
+        await confirm_vip_plus_purchase(update, context, '30d')
     elif data == 'buy_vip_plus_1d':
         await buy_vip_plus(update, context, '1d')
     elif data == 'buy_vip_plus_7d':
@@ -4215,6 +5442,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await settings_lang_menu(update, context)
     elif data == 'settings_reminder':
         await toggle_reminder(update, context)
+    elif data == 'settings_plantation_reminder':
+        await toggle_plantation_reminder(update, context)
     elif data == 'settings_auto':
         await toggle_auto_search(update, context)
     elif data == 'settings_reset':
@@ -4231,6 +5460,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_group_notifications(update, context)
     elif data == 'group_toggle_delete':
         await toggle_group_auto_delete(update, context)
+    elif data.startswith('gift_page_'):
+        # Навигация по страницам выбора подарка
+        try:
+            page = int(data.split('_')[-1])
+            await send_gift_selection_menu(
+                context, 
+                query.from_user.id, 
+                page=page, 
+                message_id=query.message.message_id
+            )
+            await query.answer()
+        except Exception:
+            await query.answer("Ошибка навигации", show_alert=True)
+    elif data == 'gift_page_info':
+        # Информационная кнопка - ничего не делает
+        await query.answer("Текущая страница", show_alert=False)
+    elif data == 'gift_search':
+        # Начать поиск напитка
+        state = GIFT_SELECTION_STATE.get(query.from_user.id)
+        if state:
+            state['awaiting_search'] = True
+            state['search_message_id'] = query.message.message_id
+            await query.answer()
+            await query.edit_message_text(
+                "🔍 <b>Поиск напитка</b>\n\n"
+                "Введите название напитка (или его часть):",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Отменить поиск", callback_data="gift_cancel_search")]
+                ])
+            )
+        else:
+            await query.answer("Сессия истекла", show_alert=True)
+    elif data == 'gift_cancel_search':
+        # Отменить поиск и вернуться к списку
+        state = GIFT_SELECTION_STATE.get(query.from_user.id)
+        if state:
+            state['awaiting_search'] = False
+            await send_gift_selection_menu(
+                context, 
+                query.from_user.id, 
+                page=1, 
+                message_id=query.message.message_id
+            )
+            await query.answer("Поиск отменён")
+        else:
+            await query.answer("Сессия истекла", show_alert=True)
+    elif data == 'gift_cancel':
+        # Полностью отменить выбор подарка
+        user_id = query.from_user.id
+        if user_id in GIFT_SELECTION_STATE:
+            del GIFT_SELECTION_STATE[user_id]
+        await query.edit_message_text("❌ Выбор подарка отменён.")
+        await query.answer()
     elif data.startswith('selectgift2_'):
         # Новый формат: selectgift2_{token} -> payload в GIFT_SELECT_TOKENS
         token = data.split('_', 1)[1]
@@ -4842,6 +6125,111 @@ async def check_group_creator_permissions(update: Update, context: ContextTypes.
     return await is_group_creator(context, chat.id, user.id)
 
 
+async def check_bot_admin_rights(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> dict:
+    """Проверяет права бота в группе.
+    Возвращает словарь с информацией о правах.
+    """
+    try:
+        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        is_admin = bot_member.status in ('administrator', 'creator')
+        can_delete = getattr(bot_member, 'can_delete_messages', False) if is_admin else False
+        
+        return {
+            'is_admin': is_admin,
+            'can_delete_messages': can_delete,
+            'status': bot_member.status
+        }
+    except Exception as e:
+        logger.warning(f"[BOT_RIGHTS] Failed to check bot rights in chat {chat_id}: {e}")
+        return {
+            'is_admin': False,
+            'can_delete_messages': False,
+            'status': 'unknown'
+        }
+
+
+async def notify_creator_about_missing_rights(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Отправляет предупреждение создателю группы о недостающих правах бота."""
+    try:
+        # Получаем создателя группы
+        admins = await context.bot.get_chat_administrators(chat_id)
+        creator = None
+        for admin in admins:
+            if admin.status == 'creator':
+                creator = admin.user
+                break
+        
+        if not creator:
+            return
+        
+        warning_text = (
+            "⚠️ <b>Внимание!</b>\n\n"
+            "Бот не имеет прав администратора в вашей группе.\n"
+            "Для корректной работы автоудаления сообщений необходимо:\n\n"
+            "1. Сделать бота администратором группы\n"
+            "2. Выдать право <b>\"Удаление сообщений\"</b>\n\n"
+            "Без этих прав функция автоудаления работать не будет."
+        )
+        
+        # Отправляем предупреждение создателю в личку
+        try:
+            await context.bot.send_message(
+                chat_id=creator.id,
+                text=warning_text,
+                parse_mode='HTML'
+            )
+            logger.info(f"[BOT_RIGHTS] Sent warning to creator {creator.id} about missing rights in chat {chat_id}")
+        except Exception as e:
+            logger.warning(f"[BOT_RIGHTS] Failed to send warning to creator {creator.id}: {e}")
+            # Если не можем отправить в личку, попробуем в группе
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=warning_text,
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[BOT_RIGHTS] Error notifying creator about missing rights: {e}")
+
+
+async def send_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **kwargs):
+    """Отправляет сообщение и автоматически планирует его удаление, если включено в настройках группы."""
+    try:
+        sent_message = await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        
+        # Проверяем, является ли это групповым чатом и включено ли автоудаление
+        settings = db.get_group_settings(chat_id)
+        if settings.get('auto_delete_enabled', False):
+            delay = settings.get('auto_delete_delay_minutes', 5)
+            await schedule_auto_delete_message(context, chat_id, sent_message.message_id, delay)
+        
+        return sent_message
+    except Exception as e:
+        logger.error(f"[AUTO_DELETE] Error sending message to {chat_id}: {e}")
+        raise
+
+
+async def reply_auto_delete_message(message, text: str, context: ContextTypes.DEFAULT_TYPE = None, **kwargs):
+    """Отвечает на сообщение и автоматически планирует удаление ответа, если включено в настройках группы."""
+    try:
+        sent_message = await message.reply_text(text, **kwargs)
+        
+        if context:
+            # Проверяем, является ли это групповым чатом и включено ли автоудаление
+            chat_id = message.chat_id
+            settings = db.get_group_settings(chat_id)
+            if settings.get('auto_delete_enabled', False):
+                delay = settings.get('auto_delete_delay_minutes', 5)
+                await schedule_auto_delete_message(context, chat_id, sent_message.message_id, delay)
+        
+        return sent_message
+    except Exception as e:
+        logger.error(f"[AUTO_DELETE] Error replying to message: {e}")
+        raise
+
+
 async def schedule_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_minutes: int = 5):
     """Планирует автоудаление сообщения, если в группе включено автоудаление."""
     try:
@@ -4850,12 +6238,18 @@ async def schedule_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_
         if not settings.get('auto_delete_enabled', False):
             return
         
+        # Вычисляем время удаления
+        delete_at = int(time.time()) + (delay_minutes * 60)
+        
+        # Сохраняем задачу в БД для восстановления после перезапуска
+        scheduled_id = db.save_scheduled_auto_delete(chat_id, message_id, delete_at)
+        
         # Планируем задачу удаления
         job_name = f"auto_delete_{chat_id}_{message_id}"
         context.application.job_queue.run_once(
             auto_delete_message_job,
             when=delay_minutes * 60,  # Преобразуем минуты в секунды
-            data={'chat_id': chat_id, 'message_id': message_id},
+            data={'chat_id': chat_id, 'message_id': message_id, 'scheduled_id': scheduled_id},
             name=job_name
         )
         
@@ -4863,12 +6257,14 @@ async def schedule_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_
         AUTO_DELETE_MESSAGES[job_name] = {
             'chat_id': chat_id,
             'message_id': message_id,
-            'scheduled_at': time.time()
+            'scheduled_at': time.time(),
+            'scheduled_id': scheduled_id
         }
         
-        logger.info(f"[AUTO_DELETE] Scheduled deletion for message {message_id} in chat {chat_id} in {delay_minutes} minutes")
+        logger.info(f"[AUTO_DELETE] Scheduled deletion for message {message_id} in chat {chat_id} in {delay_minutes} minutes (DB ID: {scheduled_id})")
     except Exception as e:
         logger.warning(f"[AUTO_DELETE] Failed to schedule auto-delete for message {message_id} in chat {chat_id}: {e}")
+
 
 async def auto_delete_message_job(context: ContextTypes.DEFAULT_TYPE):
     """Задача для автоудаления сообщения."""
@@ -4876,11 +6272,15 @@ async def auto_delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         job_data = context.job.data
         chat_id = job_data['chat_id']
         message_id = job_data['message_id']
+        scheduled_id = job_data.get('scheduled_id')
         
         # Проверяем, что автоудаление всё ещё включено
         settings = db.get_group_settings(chat_id)
         if not settings.get('auto_delete_enabled', False):
             logger.info(f"[AUTO_DELETE] Auto-delete disabled for chat {chat_id}, skipping message {message_id}")
+            # Удаляем из БД даже если автоудаление выключено
+            if scheduled_id:
+                db.delete_scheduled_auto_delete(scheduled_id)
             return
         
         # Пытаемся удалить сообщение
@@ -4895,6 +6295,11 @@ async def auto_delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"[AUTO_DELETE] Error deleting message {message_id} from chat {chat_id}: {e}")
         
+        # Удаляем запись из БД после выполнения
+        if scheduled_id:
+            db.delete_scheduled_auto_delete(scheduled_id)
+            logger.debug(f"[AUTO_DELETE] Removed scheduled task {scheduled_id} from database")
+        
     except Exception as e:
         logger.error(f"[AUTO_DELETE] Error in auto_delete_message_job: {e}")
     finally:
@@ -4902,6 +6307,77 @@ async def auto_delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         job_name = context.job.name
         if job_name and job_name in AUTO_DELETE_MESSAGES:
             del AUTO_DELETE_MESSAGES[job_name]
+
+
+async def restore_scheduled_auto_deletes(application):
+    """Восстанавливает запланированные задачи автоудаления из БД при запуске бота."""
+    try:
+        logger.info("[AUTO_DELETE] Restoring scheduled auto-delete tasks from database...")
+        
+        # Получаем все запланированные задачи
+        scheduled_tasks = db.get_all_scheduled_auto_deletes()
+        
+        if not scheduled_tasks:
+            logger.info("[AUTO_DELETE] No scheduled tasks to restore")
+            return
+        
+        current_time = int(time.time())
+        restored_count = 0
+        expired_count = 0
+        
+        for scheduled_id, chat_id, message_id, delete_at in scheduled_tasks:
+            # Проверяем, не истекло ли время удаления
+            if delete_at <= current_time:
+                # Время удаления уже прошло - удаляем сразу
+                try:
+                    await application.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    logger.info(f"[AUTO_DELETE] Deleted expired message {message_id} from chat {chat_id}")
+                except Exception as e:
+                    logger.debug(f"[AUTO_DELETE] Could not delete expired message {message_id}: {e}")
+                
+                # Удаляем из БД
+                db.delete_scheduled_auto_delete(scheduled_id)
+                expired_count += 1
+            else:
+                # Задача еще актуальна - восстанавливаем
+                delay_seconds = delete_at - current_time
+                
+                # Проверяем, включено ли автоудаление в группе
+                settings = db.get_group_settings(chat_id)
+                if not settings.get('auto_delete_enabled', False):
+                    # Автоудаление выключено - удаляем задачу
+                    db.delete_scheduled_auto_delete(scheduled_id)
+                    logger.debug(f"[AUTO_DELETE] Skipped task {scheduled_id} - auto-delete disabled for chat {chat_id}")
+                    continue
+                
+                # Планируем задачу
+                job_name = f"auto_delete_{chat_id}_{message_id}"
+                application.job_queue.run_once(
+                    auto_delete_message_job,
+                    when=delay_seconds,
+                    data={'chat_id': chat_id, 'message_id': message_id, 'scheduled_id': scheduled_id},
+                    name=job_name
+                )
+                
+                AUTO_DELETE_MESSAGES[job_name] = {
+                    'chat_id': chat_id,
+                    'message_id': message_id,
+                    'scheduled_at': time.time(),
+                    'scheduled_id': scheduled_id
+                }
+                
+                restored_count += 1
+                logger.debug(f"[AUTO_DELETE] Restored task {scheduled_id} for message {message_id} (delete in {delay_seconds}s)")
+        
+        logger.info(f"[AUTO_DELETE] Restored {restored_count} tasks, processed {expired_count} expired tasks")
+        
+        # Очистка устаревших записей (старше 24 часов)
+        db.cleanup_old_scheduled_deletes()
+        
+    except Exception as e:
+        logger.error(f"[AUTO_DELETE] Error restoring scheduled tasks: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def groupsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5471,6 +6947,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = player.language
     lang_readable = 'Русский' if lang == 'ru' else 'English'
     reminder_state = t(lang, 'on') if player.remind else t(lang, 'off')
+    plantation_reminder_state = t(lang, 'on') if getattr(player, 'remind_plantation', False) else t(lang, 'off')
     auto_state = t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else t(lang, 'off')
 
     # Доп. информация: когда сбросится автопоиск VIP и сколько попыток осталось сегодня (показывать всегда)
@@ -5496,6 +6973,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>{t(lang, 'settings_title')}</b>\n\n"
         f"{t(lang, 'current_language')}: {lang_readable}\n"
         f"{t(lang, 'auto_reminder')}: {reminder_state}\n"
+        f"{t(lang, 'plantation_reminder')}: {plantation_reminder_state}\n"
         f"{t(lang, 'auto_search')}: {auto_state}\n"
     )
 
@@ -5505,6 +6983,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(t(lang, 'btn_change_lang'), callback_data='settings_lang')],
         [InlineKeyboardButton(t(lang, 'btn_toggle_rem'), callback_data='settings_reminder')],
+        [InlineKeyboardButton(t(lang, 'btn_toggle_plantation_rem'), callback_data='settings_plantation_reminder')],
         [InlineKeyboardButton(t(lang, 'btn_toggle_auto'), callback_data='settings_auto')],
         [InlineKeyboardButton(t(lang, 'btn_reset'), callback_data='settings_reset')],
         [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='menu')]
@@ -5539,6 +7018,16 @@ async def toggle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
     new_state = not player.remind
     db.update_player(player.user_id, remind=new_state)
+    await query.answer("Изменено" , show_alert=True)
+    await show_settings(update, context)
+
+async def toggle_plantation_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
+    new_state = not getattr(player, 'remind_plantation', False)
+    db.update_player(player.user_id, remind_plantation=new_state)
     await query.answer("Изменено" , show_alert=True)
     await show_settings(update, context)
 
@@ -5753,6 +7242,19 @@ async def toggle_group_auto_delete(update: Update, context: ContextTypes.DEFAULT
     current_state = settings.get('auto_delete_enabled', False)
     new_state = not current_state
     
+    # Если включаем автоудаление, проверяем права бота
+    if new_state:
+        bot_rights = await check_bot_admin_rights(context, chat.id)
+        if not bot_rights['is_admin'] or not bot_rights['can_delete_messages']:
+            # Отправляем предупреждение создателю
+            await notify_creator_about_missing_rights(context, chat.id)
+            await query.answer(
+                '⚠️ Бот не имеет прав администратора или права на удаление сообщений. '
+                'Автоудаление не будет работать. Проверьте личные сообщения для подробностей.',
+                show_alert=True
+            )
+            # Всё равно включаем настройку, но предупреждаем
+    
     # Обновляем настройки
     if db.update_group_settings(chat.id, auto_delete_enabled=new_state):
         status_msg = 'Автоудаление включено' if new_state else 'Автоудаление отключено'
@@ -5924,6 +7426,58 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not getattr(msg, 'text', None):
         return
     incoming = msg.text or ""
+    
+    # Проверяем, ждём ли мы ввод для админ панели Создателя
+    if context.user_data.get('awaiting_creator_action'):
+        await creator_handle_input(update, context)
+        return
+    
+    # Проверяем, ждём ли мы ввод для поиска подарка
+    user_id = update.effective_user.id
+    state = GIFT_SELECTION_STATE.get(user_id)
+    if state and state.get('awaiting_search'):
+        state['awaiting_search'] = False
+        search_query = incoming.strip()
+        
+        if not search_query:
+            await msg.reply_text("❌ Пустой запрос. Попробуйте снова.")
+            return
+        
+        # Обновляем меню с результатами поиска
+        message_id = state.get('search_message_id')
+        try:
+            await send_gift_selection_menu(
+                context, 
+                user_id, 
+                page=1, 
+                search_query=search_query,
+                message_id=message_id
+            )
+            # Удаляем сообщение пользователя с запросом
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.exception("[GIFT_SEARCH] Error: %s", e)
+            await msg.reply_text("Ошибка при поиске. Попробуйте снова.")
+        return
+    
+    # Проверяем, ждём ли мы ввод для поиска по инвентарю
+    if context.user_data.get('awaiting_inventory_search'):
+        # Очищаем флаг ожидания
+        context.user_data.pop('awaiting_inventory_search', None)
+        
+        # Выполняем поиск с введённым текстом
+        search_query = incoming.strip()
+        if not search_query:
+            await msg.reply_text("❌ Пустой запрос. Попробуйте снова.")
+            return
+        
+        # Показываем результаты поиска
+        await show_inventory_search_results(update, context, search_query, page=1)
+        return
+    
     normalized = "".join(ch for ch in incoming.lower() if ch.isalnum() or ch.isspace()).strip()
     # Поддержка вариантов ввода и пунктуации
     casino_triggers = {"найти казино", "найди казино", "casino"}
@@ -5996,37 +7550,53 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     user = update.effective_user
+    chat = update.effective_chat
+    
     # Анти-даблклик для команды /find
     lock = _get_lock(f"user:{user.id}:search")
     if lock.locked():
-        await msg.reply_text("Поиск уже выполняется…")
+        await reply_auto_delete_message(msg, "Поиск уже выполняется…", context=context)
         return
     async with lock:
         result = await _perform_energy_search(user.id, user.username or user.first_name, context)
 
     if result['status'] == 'cooldown':
         time_left = result["time_left"]
-        await msg.reply_text(f"Ещё не время! Подожди немного (⏳ {int(time_left // 60)}:{int(time_left % 60):02d}).")
+        await reply_auto_delete_message(
+            msg, 
+            f"Ещё не время! Подожди немного (⏳ {int(time_left // 60)}:{int(time_left % 60):02d}).",
+            context=context
+        )
         return
 
     if result['status'] == 'no_drinks':
-        await msg.reply_text("В базе данных пока нет энергетиков!")
+        await reply_auto_delete_message(msg, "В базе данных пока нет энергетиков!", context=context)
         return
 
     if result["status"] == 'ok':
         if result["image_path"] and os.path.exists(result["image_path"]):
             with open(result["image_path"], 'rb') as photo:
-                await msg.reply_photo(
+                sent_msg = await msg.reply_photo(
                     photo=photo,
                     caption=result["caption"],
                     reply_markup=result["reply_markup"],
                     parse_mode='HTML'
                 )
+                # Планируем автоудаление для фото-сообщения
+                try:
+                    await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
+                except Exception:
+                    pass
         else:
-            await msg.reply_html(
+            sent_msg = await msg.reply_html(
                 text=result["caption"],
                 reply_markup=result["reply_markup"]
             )
+            # Планируем автоудаление для текстового сообщения
+            try:
+                await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
+            except Exception:
+                pass
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6075,6 +7645,171 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_html(text=caption, reply_markup=keyboard)
 
 
+def get_rarity_emoji(rarity: str) -> str:
+    """Возвращает эмодзи для редкости напитка из constants.COLOR_EMOJIS."""
+    from constants import COLOR_EMOJIS
+    return COLOR_EMOJIS.get(rarity, '⭐')
+
+
+async def send_gift_selection_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int = 1, search_query: str = None, message_id: int = None):
+    """Отправляет или обновляет меню выбора подарка с пагинацией."""
+    state = GIFT_SELECTION_STATE.get(user_id)
+    if not state:
+        return
+    
+    inventory_items = state['inventory_items']
+    recipient_display = state['recipient_display']
+    gifts_sent_today = state['gifts_sent_today']
+    
+    # Фильтруем по поиску, если есть
+    if search_query:
+        filtered_items = [
+            item for item in inventory_items 
+            if search_query.lower() in item.drink.name.lower()
+        ]
+    else:
+        filtered_items = inventory_items
+    
+    if not filtered_items:
+        text = (
+            f"🎁 <b>Выбор подарка</b>\n\n"
+            f"❌ Ничего не найдено по запросу: <i>{html.escape(search_query)}</i>\n\n"
+            f"Получатель: {html.escape(recipient_display)}\n"
+            f"Подарков сегодня: {gifts_sent_today}/20"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Новый поиск", callback_data="gift_search")],
+            [InlineKeyboardButton("◀️ Показать все", callback_data="gift_page_1")]
+        ])
+        
+        if message_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
+        return
+    
+    # Пагинация (6 напитков на страницу, по 2 в ряд)
+    items_per_page = 6
+    total_items = len(filtered_items)
+    total_pages = max(1, (total_items + items_per_page - 1) // items_per_page)
+    
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    
+    start_idx = (page - 1) * items_per_page
+    end_idx = start_idx + items_per_page
+    page_items = filtered_items[start_idx:end_idx]
+    
+    # Формируем текст
+    search_info = f"\n🔍 Поиск: <i>{html.escape(search_query)}</i>\n" if search_query else ""
+    text = (
+        f"🎁 <b>Выберите напиток для подарка</b>\n\n"
+        f"👤 Получатель: {html.escape(recipient_display)}\n"
+        f"📊 Подарков сегодня: {gifts_sent_today}/20"
+        f"{search_info}\n"
+        f"📄 Страница {page}/{total_pages} ({total_items} напитков)"
+    )
+    
+    # Формируем клавиатуру с кнопками напитков (по 2 в ряд)
+    keyboard_rows = []
+    for i in range(0, len(page_items), 2):
+        row = []
+        for item in page_items[i:i+2]:
+            rarity_emoji = get_rarity_emoji(item.rarity)
+            # Ограничиваем длину названия для кнопки
+            drink_name = item.drink.name[:15] + "..." if len(item.drink.name) > 15 else item.drink.name
+            button_text = f"{rarity_emoji} {drink_name} x{item.quantity}"
+            
+            token = secrets.token_urlsafe(8)
+            GIFT_SELECT_TOKENS[token] = {
+                'group_id': state['group_id'],
+                'recipient_username': state['recipient_username'],
+                'recipient_id': state['recipient_id'],
+                'recipient_display': recipient_display,
+                'item_id': item.id,
+            }
+            row.append(InlineKeyboardButton(button_text, callback_data=f"selectgift2_{token}"))
+        keyboard_rows.append(row)
+    
+    # Кнопка поиска
+    keyboard_rows.append([InlineKeyboardButton("🔍 Поиск по названию", callback_data="gift_search")])
+    
+    # Навигация
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"gift_page_{page-1}"))
+    if total_pages > 1:
+        nav_row.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="gift_page_info"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"gift_page_{page+1}"))
+    
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    
+    # Кнопка отмены
+    keyboard_rows.append([InlineKeyboardButton("❌ Отменить", callback_data="gift_cancel")])
+    
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
+    
+    # Отправляем или обновляем сообщение
+    if message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+    else:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=keyboard,
+            parse_mode='HTML'
+        )
+
+
+async def giftstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/giftstats — показывает статистику подарков пользователя."""
+    user_id = update.effective_user.id
+    
+    try:
+        stats = db.get_gift_stats(user_id)
+        gifts_sent_today = db.get_user_gifts_sent_today(user_id)
+        
+        # Проверяем блокировку
+        is_blocked, reason = db.is_user_gift_restricted(user_id)
+        
+        text = (
+            f"📊 <b>Статистика подарков</b>\n\n"
+            f"🎁 Отправлено всего: <b>{stats['sent']}</b>\n"
+            f"🎉 Получено всего: <b>{stats['received']}</b>\n"
+            f"📅 Отправлено сегодня: <b>{gifts_sent_today}/20</b>\n\n"
+        )
+        
+        if is_blocked:
+            text += f"🚫 <b>Статус:</b> Заблокирован\n<i>Причина: {html.escape(reason)}</i>"
+        else:
+            text += "✅ <b>Статус:</b> Активен"
+        
+        await update.message.reply_html(text)
+    except Exception as e:
+        logger.exception("[GIFTSTATS] Error: %s", e)
+        await update.message.reply_text("Ошибка при получении статистики.")
+
+
 async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/gift @username — инициирует дарение энергетика. Работает только в группах."""
     try:
@@ -6102,7 +7837,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ruser = reply.from_user
         # Нельзя дарить сообщениям без пользователя (на всякий случай)
         if getattr(ruser, 'is_bot', False):
-            await update.message.reply_text("Нельзя дарить ботам.")
+            await reply_auto_delete_message(update.message, "Нельзя дарить ботам.", context=context)
             return
         recipient_id = ruser.id
         recipient_username = ruser.username or None
@@ -6121,66 +7856,110 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         if not args:
-            await update.message.reply_text("Использование: /gift @username\nЛибо ответьте на сообщение пользователя в группе и отправьте /gift")
+            await reply_auto_delete_message(
+                update.message, 
+                "Использование: /gift @username\nЛибо ответьте на сообщение пользователя в группе и отправьте /gift",
+                context=context
+            )
             return
         recipient_username = args[0].lstrip("@").strip()
         recipient_display = f"@{recipient_username}"
     giver_id = update.effective_user.id
+
+    # 🛡️ Защита от самодарения
+    if recipient_id and recipient_id == giver_id:
+        await reply_auto_delete_message(update.message, "❌ Вы не можете подарить напиток самому себе!", context=context)
+        return
+
+    # 🛡️ Проверка блокировки дарителя
+    is_blocked, reason = db.is_user_gift_restricted(giver_id)
+    if is_blocked:
+        await reply_auto_delete_message(
+            update.message,
+            f"🚫 Вы не можете дарить подарки.\nПричина: {reason}",
+            context=context
+        )
+        return
+
+    # 🛡️ Проверка блокировки получателя (если известен ID)
+    if recipient_id:
+        is_recipient_blocked, _ = db.is_user_gift_restricted(recipient_id)
+        if is_recipient_blocked:
+            await reply_auto_delete_message(
+                update.message,
+                f"🚫 Получатель не может принимать подарки.",
+                context=context
+            )
+            return
+
+    # 📊 Проверка дневного лимита (20 подарков в день)
+    gifts_sent_today = db.get_user_gifts_sent_today(giver_id)
+    if gifts_sent_today >= 20:
+        await reply_auto_delete_message(
+            update.message,
+            f"⏳ Вы достигли дневного лимита подарков ({gifts_sent_today}/20).\nПопробуйте завтра!",
+            context=context
+        )
+        return
+
+    # ⏱️ Проверка кулдауна (40 секунд)
+    last_gift_time = db.get_user_last_gift_time(giver_id)
+    current_time = int(time.time())
+    cooldown_seconds = 40
+    if last_gift_time and (current_time - last_gift_time) < cooldown_seconds:
+        remaining = cooldown_seconds - (current_time - last_gift_time)
+        await reply_auto_delete_message(
+            update.message,
+            f"⏳ Подождите {remaining} сек. перед следующим подарком.",
+            context=context
+        )
+        return
 
     # Безопасно читаем инвентарь дарителя
     try:
         inventory_items = db.get_player_inventory_with_details(giver_id)
     except Exception:
         logger.exception("[GIFT] Failed to fetch inventory for giver %s", giver_id)
-        await update.message.reply_text("Ошибка при чтении инвентаря. Попробуйте позже.")
+        await reply_auto_delete_message(update.message, "Ошибка при чтении инвентаря. Попробуйте позже.", context=context)
         return
     if not inventory_items:
-        await update.message.reply_text("Ваш инвентарь пуст — нечего дарить.")
+        await reply_auto_delete_message(update.message, "Ваш инвентарь пуст — нечего дарить.", context=context)
         return
 
-    # Клавиатура выбора напитка
-    keyboard_rows = []
-    try:
-        for item in inventory_items:
-            drink_name = item.drink.name
-            rarity = item.rarity
-            quantity = item.quantity
-            button_text = f"{drink_name} ({rarity}) x{quantity}"
-            token = secrets.token_urlsafe(8)
-            GIFT_SELECT_TOKENS[token] = {
-                'group_id': update.effective_chat.id,
-                'recipient_username': recipient_username or "",
-                'recipient_id': recipient_id,
-                'recipient_display': recipient_display,
-                'item_id': item.id,
-            }
-            cb_data = f"selectgift2_{token}"
-            keyboard_rows.append([InlineKeyboardButton(button_text, callback_data=cb_data)])
-    except Exception:
-        logger.exception("[GIFT] Failed to build gift keyboard for giver %s", giver_id)
-        await update.message.reply_text("Ошибка при формировании списка подарков. Попробуйте позже.")
-        return
+    # Сохраняем состояние выбора подарка
+    GIFT_SELECTION_STATE[giver_id] = {
+        'group_id': update.effective_chat.id,
+        'recipient_username': recipient_username or "",
+        'recipient_id': recipient_id,
+        'recipient_display': recipient_display,
+        'inventory_items': inventory_items,
+        'gifts_sent_today': gifts_sent_today
+    }
 
     # Пытаемся написать дарителю в личку. Если бот не может — сообщаем в группе, что нужно нажать Start.
     try:
-        await context.bot.send_message(
-            chat_id=giver_id,
-            text="Выберите энергетик, который хотите подарить:",
-            reply_markup=InlineKeyboardMarkup(keyboard_rows)
-        )
+        # Отправляем красивое меню выбора подарка
+        await send_gift_selection_menu(context, giver_id, page=1)
         # Сообщаем в группе, что список отправлен в личку
         try:
-            await update.message.reply_text("Отправил список вам в личные сообщения.")
+            sent_msg = await update.message.reply_text("Отправил список вам в личные сообщения.")
+            # Планируем автоудаление подтверждения
+            try:
+                await schedule_auto_delete_message(context, update.effective_chat.id, sent_msg.message_id)
+            except Exception:
+                pass
         except Exception:
             pass
     except Forbidden:
-        await update.message.reply_text(
-            "Не могу написать вам в личку. Откройте чат с ботом и нажмите Start, после этого повторите команду."
+        await reply_auto_delete_message(
+            update.message,
+            "Не могу написать вам в личку. Откройте чат с ботом и нажмите Start, после этого повторите команду.",
+            context=context
         )
         return
     except Exception as e:
         logger.exception("[GIFT] Failed to send DM to giver %s: %s", giver_id, e)
-        await update.message.reply_text("Не удалось отправить список в личные сообщения. Попробуйте позже.")
+        await reply_auto_delete_message(update.message, "Не удалось отправить список в личные сообщения. Попробуйте позже.", context=context)
         return
     
     
@@ -6204,6 +7983,33 @@ async def handle_select_gift(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.answer("Этот напиток недоступен.", show_alert=True)
         return
 
+    # 🛡️ Проверка на подозрительную активность (>10 подарков подряд одному человеку)
+    if recipient_id and db.check_consecutive_gifts(giver_id, recipient_id, limit=10):
+        # Блокируем обоих пользователей
+        db.add_gift_restriction(
+            giver_id, 
+            "Подозрительная активность: более 10 подарков подряд одному пользователю",
+            blocked_until=None  # Постоянная блокировка
+        )
+        db.add_gift_restriction(
+            recipient_id,
+            "Подозрительная активность: получение более 10 подарков подряд от одного пользователя",
+            blocked_until=None
+        )
+        logger.warning(
+            f"[GIFT_SECURITY] Blocked users {giver_id} and {recipient_id} for suspicious gift activity"
+        )
+        await query.edit_message_text(
+            "🚫 <b>Обнаружена подозрительная активность!</b>\n\n"
+            "Вы и получатель заблокированы за нарушение правил дарения.\n"
+            "Обратитесь к администратору для разблокировки.",
+            parse_mode='HTML'
+        )
+        # Очищаем состояние
+        if giver_id in GIFT_SELECTION_STATE:
+            del GIFT_SELECTION_STATE[giver_id]
+        return
+
     global NEXT_GIFT_ID
     gift_id = NEXT_GIFT_ID
     NEXT_GIFT_ID += 1
@@ -6221,13 +8027,18 @@ async def handle_select_gift(update: Update, context: ContextTypes.DEFAULT_TYPE,
         "group_id": group_id
     }
 
-    # Сообщение в группу
+    # Сообщение в группу с эмодзи редкости
     recip_text = GIFT_OFFERS[gift_id].get('recipient_display') or (f"@{recipient_username}" if recipient_username else "получателю")
     # Если нет @username, экранируем имя для HTML
     recip_html = recip_text if recip_text.startswith('@') else html.escape(str(recip_text))
+    rarity_emoji = get_rarity_emoji(item.rarity)
     caption = (
-        f"@{GIFT_OFFERS[gift_id]['giver_name']} хочет подарить {recip_html} напиток "
-        f"<b>{html.escape(item.drink.name)}</b> ({html.escape(item.rarity)}). Принять?"
+        f"🎁 <b>Подарок!</b>\n\n"
+        f"<b>От:</b> @{GIFT_OFFERS[gift_id]['giver_name']}\n"
+        f"<b>Кому:</b> {recip_html}\n"
+        f"<b>Напиток:</b> {rarity_emoji} {html.escape(item.drink.name)}\n"
+        f"<b>Редкость:</b> {html.escape(item.rarity)}\n\n"
+        f"<i>Принять подарок?</i>"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да", callback_data=f"giftresp_{gift_id}_yes"),
@@ -6241,7 +8052,11 @@ async def handle_select_gift(update: Update, context: ContextTypes.DEFAULT_TYPE,
         parse_mode='HTML'
     )
 
-    await query.edit_message_text("Подарок предложен! Ожидаем ответ.")
+    await query.edit_message_text("✅ Подарок предложен! Ожидаем ответ получателя.")
+    
+    # Очищаем состояние выбора подарка
+    if giver_id in GIFT_SELECTION_STATE:
+        del GIFT_SELECTION_STATE[giver_id]
 
 
 async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYPE, gift_id: int, accepted: bool):
@@ -6270,22 +8085,44 @@ async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("Это не вам предназначалось!", show_alert=True)
             return
 
-    if not accepted:
-        # Отклонено
-        try:
-            await query.edit_message_text("❌ Подарок отклонён.")
-        except BadRequest:
-            pass
-        del GIFT_OFFERS[gift_id]
-        return
-
-    # Фикс: сначала фиксируем drink_id, затем списываем и зачисляем
+    # Фикс: сначала фиксируем drink_id
     drink_id = offer.get('drink_id')
     if not drink_id:
         inv_item = db.get_inventory_item(offer['item_id'])
         drink_id = getattr(inv_item, 'drink_id', None) if inv_item else None
     if not drink_id:
         await query.edit_message_text("Не удалось определить напиток для передачи.")
+        del GIFT_OFFERS[gift_id]
+        return
+
+    recipient_id = query.from_user.id
+    
+    if not accepted:
+        # Отклонено - логируем в БД
+        db.log_gift(
+            giver_id=offer['giver_id'],
+            recipient_id=recipient_id,
+            drink_id=drink_id,
+            rarity=offer['rarity'],
+            status='declined'
+        )
+        rarity_emoji = get_rarity_emoji(offer['rarity'])
+        try:
+            await query.edit_message_text(
+                f"❌ <b>Подарок отклонён</b>\n\n"
+                f"{rarity_emoji} {html.escape(offer['drink_name'])} ({html.escape(offer['rarity'])})",
+                parse_mode='HTML'
+            )
+        except BadRequest:
+            pass
+        # Уведомление дарителю
+        try:
+            await context.bot.send_message(
+                chat_id=offer['giver_id'],
+                text=f"😔 Ваш подарок ({offer['drink_name']}) был отклонён."
+            )
+        except Exception:
+            pass
         del GIFT_OFFERS[gift_id]
         return
 
@@ -6297,21 +8134,62 @@ async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # Добавляем получателю
-    recipient_id = query.from_user.id
     db.add_drink_to_inventory(recipient_id, drink_id, offer['rarity'])
+    
+    # 📊 Логируем принятый подарок в БД
+    db.log_gift(
+        giver_id=offer['giver_id'],
+        recipient_id=recipient_id,
+        drink_id=drink_id,
+        rarity=offer['rarity'],
+        status='accepted'
+    )
+    
     # log
     logger.info(
         f"[GIFT] {offer['giver_name']} -> {query.from_user.username or query.from_user.id}: {offer['drink_name']} ({offer['rarity']})"
     )
 
+    rarity_emoji = get_rarity_emoji(offer['rarity'])
     try:
-        await query.edit_message_text("✅ Подарок принят!")
+        await query.edit_message_text(
+            f"✅ <b>Подарок принят!</b>\n\n"
+            f"{rarity_emoji} {html.escape(offer['drink_name'])} ({html.escape(offer['rarity'])})",
+            parse_mode='HTML'
+        )
     except BadRequest:
         pass
 
-    # Уведомления приватно
-    await context.bot.send_message(chat_id=offer['giver_id'], text="Ваш подарок принят! 🎉")
-    await context.bot.send_message(chat_id=recipient_id, text="Вы получили подарок! Загляните в инвентарь.")
+    # Уведомления приватно с деталями
+    try:
+        await context.bot.send_message(
+            chat_id=offer['giver_id'],
+            text=(
+                f"🎉 <b>Ваш подарок принят!</b>\n\n"
+                f"Получатель: {html.escape(offer.get('recipient_display', 'пользователь'))}\n"
+                f"Напиток: {rarity_emoji} {html.escape(offer['drink_name'])}\n"
+                f"Редкость: {html.escape(offer['rarity'])}"
+            ),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+    
+    try:
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text=(
+                f"🎁 <b>Вы получили подарок!</b>\n\n"
+                f"От: @{offer['giver_name']}\n"
+                f"Напиток: {rarity_emoji} {html.escape(offer['drink_name'])}\n"
+                f"Редкость: {html.escape(offer['rarity'])}\n\n"
+                f"<i>Напиток добавлен в ваш инвентарь!</i>"
+            ),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+    
     del GIFT_OFFERS[gift_id]
 
 
@@ -6328,6 +8206,13 @@ def main():
         db.ensure_default_fertilizers()
     except Exception as e:
         logger.warning(f"[PLANTATION] Failed to ensure default fertilizers: {e}")
+    # Обновляем длительность существующих удобрений на новые значения (10-30 мин)
+    try:
+        updated = db.update_fertilizers_duration()
+        if updated > 0:
+            logger.info(f"[PLANTATION] Updated duration for {updated} fertilizers")
+    except Exception as e:
+        logger.warning(f"[PLANTATION] Failed to update fertilizers duration: {e}")
     log_existing_drinks()
     
     # application = ApplicationBuilder().token(TOKEN).build()
@@ -6393,6 +8278,18 @@ def main():
         allow_reentry=True
     )
     application.add_handler(casino_custom_bet_handler)
+    
+    # Conversation handler для кастомной покупки удобрений
+    fertilizer_custom_buy_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_fertilizer_custom_buy_wrapper, pattern='^fert_buy_custom_')],
+        states={
+            FERTILIZER_CUSTOM_QTY: [MessageHandler(filters.TEXT & (~filters.COMMAND), handle_fertilizer_custom_qty_input)],
+        },
+        fallbacks=[CallbackQueryHandler(cancel_fertilizer_custom_buy, pattern='^fert_custom_cancel$|^plantation_fertilizers_shop$')],
+        allow_reentry=True
+    )
+    application.add_handler(fertilizer_custom_buy_handler)
+    
     application.add_handler(CallbackQueryHandler(button_handler))
     # ВАЖНО: перехватываем ответы на ForceReply с причиной отклонения до общего текстового обработчика
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply, block=True), group=0)
@@ -6400,6 +8297,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=1)
     # Регистрируем /gift раньше, чтобы исключить перехват другими обработчиками
     application.add_handler(CommandHandler("gift", gift_command))
+    application.add_handler(CommandHandler("giftstats", giftstats_command))
     # Тихая регистрация групп по любым групповым сообщениям/командам
     application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler("check", check_command))
@@ -6626,6 +8524,12 @@ def main():
                     continue
             if restored:
                 logger.info(f"[AUTO] Восстановлено задач автопоиска: {restored}")
+
+        # --- Восстановление задач автоудаления после рестарта ---
+        async def restore_auto_delete_on_startup(context: ContextTypes.DEFAULT_TYPE):
+            await restore_scheduled_auto_deletes(context.application)
+        
+        application.job_queue.run_once(restore_auto_delete_on_startup, when=3)
 
     print("Бот запущен...")
     application.run_polling()

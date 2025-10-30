@@ -27,6 +27,7 @@ class Player(Base):
     last_add = Column(Integer, default=0)
     language = Column(String, default='ru')
     remind = Column(Boolean, default=False)
+    remind_plantation = Column(Boolean, default=False)
     vip_until = Column(Integer, default=0)
     vip_plus_until = Column(Integer, default=0)  # VIP+ статус
     tg_premium_until = Column(Integer, default=0)
@@ -151,7 +152,18 @@ class GroupChat(Base):
     last_notified = Column(Integer, default=0)
     # Новые настройки для создателей групп
     notify_disabled = Column(Boolean, default=False, index=True)  # Отключение notify_groups_job
-    auto_delete_enabled = Column(Boolean, default=False, index=True)  # Включение автоудаления через 5 минут
+    auto_delete_enabled = Column(Boolean, default=False, index=True)  # Включение автоудаления
+    auto_delete_delay_minutes = Column(Integer, default=5)  # Задержка перед удалением в минутах
+
+# --- Запланированные задачи автоудаления ---
+
+class ScheduledAutoDelete(Base):
+    __tablename__ = 'scheduled_auto_deletes'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, index=True, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
+    delete_at = Column(Integer, index=True, nullable=False)  # Unix timestamp когда нужно удалить
+    created_at = Column(Integer, default=lambda: int(time.time()))
 
 # --- Склад для TG Premium ---
 
@@ -340,11 +352,29 @@ class PlantationBed(Base):
     owner = relationship('Player')
     seed_type = relationship('SeedType')
     fertilizer = relationship('Fertilizer')
+    active_fertilizers = relationship('BedFertilizer', back_populates='bed', cascade='all, delete-orphan')
 
     __table_args__ = (
         Index('idx_plantation_owner', 'owner_id'),
         Index('idx_plantation_owner_bed', 'owner_id', 'bed_index'),
         Index('idx_plantation_fertilizer', 'fertilizer_id'),
+    )
+
+
+class BedFertilizer(Base):
+    """Таблица для хранения множественных активных удобрений на грядке."""
+    __tablename__ = 'bed_fertilizers'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bed_id = Column(Integer, ForeignKey('plantation_beds.id'), index=True)
+    fertilizer_id = Column(Integer, ForeignKey('fertilizers.id'))
+    applied_at = Column(Integer, default=0)
+    
+    bed = relationship('PlantationBed', back_populates='active_fertilizers')
+    fertilizer = relationship('Fertilizer')
+    
+    __table_args__ = (
+        Index('idx_bed_fertilizer_bed', 'bed_id'),
+        Index('idx_bed_fertilizer_fertilizer', 'fertilizer_id'),
     )
 
 
@@ -383,6 +413,65 @@ class CommunityContributionLog(Base):
     user_id = Column(BigInteger, index=True)
     amount = Column(Integer, default=0)
     ts = Column(Integer, default=lambda: int(time.time()), index=True)
+
+# --- Статистика находок напитков (система "горячих" и "холодных" напитков) ---
+
+class DrinkDiscoveryStats(Base):
+    """Таблица для отслеживания частоты находок напитков.
+    Используется для системы "горячих" и "холодных" напитков."""
+    __tablename__ = 'drink_discovery_stats'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    drink_id = Column(Integer, ForeignKey('energy_drinks.id'), unique=True, index=True)
+    total_discoveries = Column(Integer, default=0)  # Всего раз найден
+    last_discovered_at = Column(Integer, default=0, index=True)  # Последняя находка (timestamp)
+    global_discoveries_today = Column(Integer, default=0)  # Находок сегодня (глобально)
+    last_reset_date = Column(Integer, default=0)  # Дата последнего сброса дневного счетчика
+    
+    drink = relationship('EnergyDrink')
+    
+    __table_args__ = (
+        Index('idx_drink_stats_drink', 'drink_id'),
+        Index('idx_drink_stats_last_discovered', 'last_discovered_at'),
+    )
+
+
+# --- Система подарков ---
+
+class GiftHistory(Base):
+    """Таблица для хранения истории всех подарков."""
+    __tablename__ = 'gift_history'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    giver_id = Column(BigInteger, index=True)  # ID дарителя
+    recipient_id = Column(BigInteger, index=True)  # ID получателя
+    drink_id = Column(Integer, ForeignKey('energy_drinks.id'))
+    rarity = Column(String)
+    status = Column(String, index=True)  # 'accepted' | 'declined'
+    created_at = Column(Integer, default=lambda: int(time.time()), index=True)
+    
+    drink = relationship('EnergyDrink')
+    
+    __table_args__ = (
+        Index('idx_gift_history_giver', 'giver_id'),
+        Index('idx_gift_history_recipient', 'recipient_id'),
+        Index('idx_gift_history_timestamp', 'created_at'),
+        Index('idx_gift_history_giver_recipient', 'giver_id', 'recipient_id'),
+    )
+
+
+class GiftRestriction(Base):
+    """Таблица для хранения блокировок на дарение подарков."""
+    __tablename__ = 'gift_restrictions'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, unique=True, index=True)  # ID заблокированного пользователя
+    reason = Column(String)  # Причина блокировки
+    blocked_at = Column(Integer, default=lambda: int(time.time()), index=True)
+    blocked_until = Column(Integer, nullable=True, index=True)  # NULL = навсегда, иначе timestamp
+    blocked_by = Column(BigInteger, nullable=True)  # ID админа или системы (None = автоматическая)
+    
+    __table_args__ = (
+        Index('idx_gift_restriction_user', 'user_id'),
+        Index('idx_gift_restriction_until', 'blocked_until'),
+    )
 
 
 # --- Функции для взаимодействия с базой данных ---
@@ -592,6 +681,19 @@ def get_seed_type_by_id(seed_type_id: int) -> SeedType | None:
         dbs.close()
 
 
+def get_seed_price_by_rarity(rarity: str) -> int:
+    """Возвращает цену семян в зависимости от редкости напитка.
+    Basic -> 50, Medium -> 120, Elite/Absolute/Majestic -> 250
+    """
+    rarity = str(rarity).strip()
+    if rarity == 'Basic':
+        return 50
+    elif rarity == 'Medium':
+        return 120
+    else:  # Elite, Absolute, Majestic, Special и т.д.
+        return 250
+
+
 def ensure_default_seed_types() -> int:
     """Создаёт базовые типы семян, если их нет. Возвращает количество добавленных записей.
     Логика: берём первые 3 энергетика и делаем по семени на каждый.
@@ -599,14 +701,45 @@ def ensure_default_seed_types() -> int:
     """
     dbs = SessionLocal()
     try:
-        # Миграция: обновляем старую цену 400 -> 15 для уже существующих типов семян
+        # Миграция: обновляем цены и параметры всех существующих семян на основе редкости связанного напитка
         try:
-            updated = (
-                dbs.query(SeedType)
-                .filter(SeedType.price_coins == 400)
-                .update({SeedType.price_coins: 15}, synchronize_session=False)
-            )
-            if updated:
+            all_seeds = dbs.query(SeedType).options(joinedload(SeedType.drink)).all()
+            updated = 0
+            for seed in all_seeds:
+                if seed.drink:
+                    # Получаем правильные параметры по редкости напитка
+                    correct_price = get_seed_price_by_rarity(getattr(seed.drink, 'rarity', 'Basic'))
+                    
+                    # Определяем параметры по цене
+                    if correct_price == 50:  # Basic
+                        grow_time, water_int, ymin, ymax = 7200, 1800, 1, 2
+                    elif correct_price == 120:  # Medium
+                        grow_time, water_int, ymin, ymax = 10800, 2400, 1, 2
+                    else:  # 250 - Elite+
+                        grow_time, water_int, ymin, ymax = 14400, 3600, 1, 3
+                    
+                    # Обновляем все параметры
+                    changed = False
+                    if seed.price_coins != correct_price:
+                        seed.price_coins = correct_price
+                        changed = True
+                    if seed.grow_time_sec != grow_time:
+                        seed.grow_time_sec = grow_time
+                        changed = True
+                    if seed.water_interval_sec != water_int:
+                        seed.water_interval_sec = water_int
+                        changed = True
+                    if seed.yield_min != ymin:
+                        seed.yield_min = ymin
+                        changed = True
+                    if seed.yield_max != ymax:
+                        seed.yield_max = ymax
+                        changed = True
+                    
+                    if changed:
+                        updated += 1
+            
+            if updated > 0:
                 dbs.commit()
         except Exception:
             try:
@@ -621,22 +754,26 @@ def ensure_default_seed_types() -> int:
         if not drinks:
             return 0
         added = 0
-        defaults = [
-            {"price": 15, "grow": 3600, "water": 1200, "ymin": 1, "ymax": 2},
-            {"price": 30, "grow": 5400, "water": 1200, "ymin": 1, "ymax": 3},
-            {"price": 60, "grow": 7200, "water": 1800, "ymin": 2, "ymax": 4},
-        ]
-        for i, drink in enumerate(drinks):
-            cfg = defaults[min(i, len(defaults) - 1)]
+        for drink in drinks:
+            # Определяем цену и параметры по редкости напитка
+            price = get_seed_price_by_rarity(getattr(drink, 'rarity', 'Basic'))
+            # Параметры также зависят от редкости
+            if price == 50:  # Basic
+                grow_time, water_int, ymin, ymax = 7200, 1800, 1, 2
+            elif price == 120:  # Medium
+                grow_time, water_int, ymin, ymax = 10800, 2400, 1, 2
+            else:  # 250 - Elite+
+                grow_time, water_int, ymin, ymax = 14400, 3600, 1, 3
+            
             st = SeedType(
                 name=f"Семена {drink.name}",
                 description=f"Семена для выращивания напитка '{drink.name}'.",
                 drink_id=drink.id,
-                price_coins=cfg["price"],
-                grow_time_sec=cfg["grow"],
-                water_interval_sec=cfg["water"],
-                yield_min=cfg["ymin"],
-                yield_max=cfg["ymax"],
+                price_coins=price,
+                grow_time_sec=grow_time,
+                water_interval_sec=water_int,
+                yield_min=ymin,
+                yield_max=ymax,
             )
             dbs.add(st)
             added += 1
@@ -690,16 +827,25 @@ def get_or_create_seed_type_for_drink(drink_id: int) -> SeedType | None:
                     except Exception:
                         pass
             return st_by_name
-        # Создаём новый тип семян с базовыми параметрами
+        # Создаём новый тип семян с параметрами по редкости напитка
+        price = get_seed_price_by_rarity(getattr(drink, 'rarity', 'Basic'))
+        # Параметры зависят от редкости
+        if price == 50:  # Basic
+            grow_time, water_int, ymin, ymax = 7200, 1800, 1, 2
+        elif price == 120:  # Medium
+            grow_time, water_int, ymin, ymax = 10800, 2400, 1, 2
+        else:  # 250 - Elite+
+            grow_time, water_int, ymin, ymax = 14400, 3600, 1, 3
+        
         st_new = SeedType(
             name=expected_name,
             description=f"Семена для выращивания напитка '{drink.name}'.",
             drink_id=drink.id,
-            price_coins=15,
-            grow_time_sec=5400,
-            water_interval_sec=1200,
-            yield_min=1,
-            yield_max=3,
+            price_coins=price,
+            grow_time_sec=grow_time,
+            water_interval_sec=water_int,
+            yield_min=ymin,
+            yield_max=ymax,
         )
         dbs.add(st_new)
         try:
@@ -732,283 +878,6 @@ def ensure_seed_types_for_drinks(drink_ids: list[int]) -> list[SeedType]:
             result.append(st)
     return result
 
-
-def list_community_plantations(limit: int = 20) -> list[CommunityPlantation]:
-    dbs = SessionLocal()
-    try:
-        return list(
-            dbs.query(CommunityPlantation)
-            .order_by(CommunityPlantation.id.desc())
-            .limit(limit)
-            .all()
-        )
-    finally:
-        dbs.close()
-
-
-def get_community_plantation_by_id(pid: int) -> CommunityPlantation | None:
-    dbs = SessionLocal()
-    try:
-        return dbs.query(CommunityPlantation).filter(CommunityPlantation.id == pid).first()
-    finally:
-        dbs.close()
-
-
-def create_community_plantation(title: str, description: str | None, created_by: int | None, goal_amount: int | None = None, reward_total_coins: int | None = None) -> CommunityPlantation | None:
-    dbs = SessionLocal()
-    try:
-        cp = CommunityPlantation(title=title, description=description, created_by=created_by)
-        dbs.add(cp)
-        dbs.commit()
-        dbs.refresh(cp)
-        # создаём состояние проекта по умолчанию
-        try:
-            st = dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == cp.id).first()
-            if not st:
-                st = CommunityProjectState(
-                    project_id=cp.id,
-                    goal_amount=int(goal_amount) if goal_amount is not None else 1000,
-                    progress_amount=0,
-                    status='active',
-                    reward_total_coins=int(reward_total_coins) if reward_total_coins is not None else 250,
-                )
-                dbs.add(st)
-                dbs.commit()
-        except Exception:
-            try:
-                dbs.rollback()
-            except Exception:
-                pass
-        return cp
-    except Exception:
-        try:
-            dbs.rollback()
-        except Exception:
-            pass
-        return None
-    finally:
-        dbs.close()
-
-
-def ensure_community_project_state(project_id: int, default_goal: int = 1000, default_reward_total: int = 250) -> CommunityProjectState | None:
-    dbs = SessionLocal()
-    try:
-        st = dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == project_id).first()
-        if st:
-            return st
-        # убеждаемся, что проект существует
-        proj = dbs.query(CommunityPlantation).filter(CommunityPlantation.id == project_id).first()
-        if not proj:
-            return None
-        st = CommunityProjectState(project_id=project_id, goal_amount=int(default_goal), progress_amount=0, status='active', reward_total_coins=int(default_reward_total))
-        dbs.add(st)
-        dbs.commit()
-        return st
-    except Exception:
-        try:
-            dbs.rollback()
-        except Exception:
-            pass
-        return None
-    finally:
-        dbs.close()
-
-
-def get_community_project_state(project_id: int) -> CommunityProjectState | None:
-    dbs = SessionLocal()
-    try:
-        return dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == project_id).first()
-    finally:
-        dbs.close()
-
-
-def get_community_participant(project_id: int, user_id: int) -> CommunityParticipant | None:
-    dbs = SessionLocal()
-    try:
-        return (
-            dbs.query(CommunityParticipant)
-            .filter(CommunityParticipant.project_id == project_id, CommunityParticipant.user_id == user_id)
-            .first()
-        )
-    finally:
-        dbs.close()
-
-
-def join_community_project(project_id: int, user_id: int) -> dict:
-    """Вступление в проект. Возвращает {ok, reason?}."""
-    dbs = SessionLocal()
-    try:
-        proj = dbs.query(CommunityPlantation).filter(CommunityPlantation.id == project_id).first()
-        if not proj:
-            return {"ok": False, "reason": "no_project"}
-        # ensure state
-        st = dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == project_id).first()
-        if not st:
-            st = CommunityProjectState(project_id=project_id, goal_amount=1000, progress_amount=0, status='active', reward_total_coins=250)
-            dbs.add(st)
-            dbs.commit()
-        # ensure player exists
-        player = dbs.query(Player).filter(Player.user_id == user_id).first()
-        if not player:
-            player = Player(user_id=user_id, username=str(user_id))
-            dbs.add(player)
-            dbs.commit()
-        # create participant if not exists
-        row = (
-            dbs.query(CommunityParticipant)
-            .filter(CommunityParticipant.project_id == project_id, CommunityParticipant.user_id == user_id)
-            .first()
-        )
-        if row:
-            return {"ok": True}
-        row = CommunityParticipant(project_id=project_id, user_id=user_id)
-        dbs.add(row)
-        dbs.commit()
-        return {"ok": True}
-    except Exception:
-        try:
-            dbs.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "reason": "exception"}
-    finally:
-        dbs.close()
-
-
-def contribute_to_community_project(project_id: int, user_id: int, amount: int) -> dict:
-    """Взнос в проект (в септимах). Возвращает {ok, reason?, coins_left?, progress?, goal?, status?}."""
-    if int(amount) <= 0:
-        return {"ok": False, "reason": "invalid_amount"}
-    dbs = SessionLocal()
-    try:
-        st = dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == project_id).with_for_update(read=False).first()
-        if not st:
-            # автоинициализация
-            st = CommunityProjectState(project_id=project_id, goal_amount=1000, progress_amount=0, status='active', reward_total_coins=250)
-            dbs.add(st)
-            dbs.commit()
-            dbs.refresh(st)
-        if st.status == 'completed':
-            return {"ok": False, "reason": "completed"}
-        player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
-        if not player:
-            player = Player(user_id=user_id, username=str(user_id), coins=0)
-            dbs.add(player)
-            dbs.commit()
-            dbs.refresh(player)
-        current = int(player.coins or 0)
-        if current < int(amount):
-            return {"ok": False, "reason": "not_enough_coins"}
-        # списываем у игрока
-        player.coins = current - int(amount)
-        # участник
-        part = (
-            dbs.query(CommunityParticipant)
-            .filter(CommunityParticipant.project_id == project_id, CommunityParticipant.user_id == user_id)
-            .with_for_update(read=False)
-            .first()
-        )
-        if not part:
-            part = CommunityParticipant(project_id=project_id, user_id=user_id, contributed_amount=0, reward_claimed=False)
-            dbs.add(part)
-            dbs.commit()
-            dbs.refresh(part)
-        part.contributed_amount = int(part.contributed_amount or 0) + int(amount)
-        # прогресс проекта
-        st.progress_amount = int(st.progress_amount or 0) + int(amount)
-        if int(st.progress_amount) >= int(st.goal_amount or 0) and st.status != 'completed':
-            st.status = 'completed'
-        # лог
-        try:
-            log = CommunityContributionLog(project_id=project_id, user_id=user_id, amount=int(amount))
-            dbs.add(log)
-        except Exception:
-            pass
-        dbs.commit()
-        return {
-            "ok": True,
-            "coins_left": int(player.coins),
-            "progress": int(st.progress_amount),
-            "goal": int(st.goal_amount or 0),
-            "status": st.status,
-        }
-    except Exception:
-        try:
-            dbs.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "reason": "exception"}
-    finally:
-        dbs.close()
-
-
-def get_community_stats(project_id: int) -> dict:
-    """Статистика проекта: {goal, progress, participants, status}."""
-    dbs = SessionLocal()
-    try:
-        st = dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == project_id).first()
-        goal = int(getattr(st, 'goal_amount', 0) or 0) if st else 0
-        progress = int(getattr(st, 'progress_amount', 0) or 0) if st else 0
-        status = getattr(st, 'status', 'active') if st else 'active'
-        participants = (
-            dbs.query(CommunityParticipant)
-            .filter(CommunityParticipant.project_id == project_id)
-            .count()
-        )
-        return {"goal": goal, "progress": progress, "participants": int(participants), "status": status}
-    finally:
-        dbs.close()
-
-
-def claim_community_reward(project_id: int, user_id: int) -> dict:
-    """Выдача награды участнику. Пропорционально его взносу. Возвращает {ok, reason?, claimed_coins?, coins_after?}."""
-    dbs = SessionLocal()
-    try:
-        st = dbs.query(CommunityProjectState).filter(CommunityProjectState.project_id == project_id).with_for_update(read=False).first()
-        if not st:
-            return {"ok": False, "reason": "no_state"}
-        if st.status != 'completed':
-            return {"ok": False, "reason": "not_completed"}
-        part = (
-            dbs.query(CommunityParticipant)
-            .filter(CommunityParticipant.project_id == project_id, CommunityParticipant.user_id == user_id)
-            .with_for_update(read=False)
-            .first()
-        )
-        if not part:
-            return {"ok": False, "reason": "not_participant"}
-        if bool(getattr(part, 'reward_claimed', False)):
-            return {"ok": False, "reason": "already_claimed"}
-        total = int(getattr(st, 'progress_amount', 0) or 0)
-        if total <= 0:
-            return {"ok": False, "reason": "no_progress"}
-        user_contrib = int(getattr(part, 'contributed_amount', 0) or 0)
-        if user_contrib <= 0:
-            return {"ok": False, "reason": "no_contribution"}
-        pool = int(getattr(st, 'reward_total_coins', 0) or 0)
-        # Удельная доля
-        share = int((pool * user_contrib) // total)
-        if share <= 0:
-            share = 0
-        # выдаём монеты
-        player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
-        if not player:
-            player = Player(user_id=user_id, username=str(user_id), coins=0)
-            dbs.add(player)
-            dbs.commit()
-            dbs.refresh(player)
-        player.coins = int(player.coins or 0) + int(share)
-        part.reward_claimed = True
-        dbs.commit()
-        return {"ok": True, "claimed_coins": int(share), "coins_after": int(player.coins)}
-    except Exception:
-        try:
-            dbs.rollback()
-        except Exception:
-            pass
-        return {"ok": False, "reason": "exception"}
-    finally:
-        dbs.close()
 
 def get_seed_inventory(user_id: int) -> list[SeedInventory]:
     dbs = SessionLocal()
@@ -1127,16 +996,16 @@ def ensure_default_fertilizers() -> int:
         if existing > 0:
             return 0
         data = [
-            {"name": "Азотное",       "description": "Ускоряет вегетацию",           "effect": "+рост",       "duration_sec": 21600,  "price_coins": 30},  # 6 часов, +40%
-            {"name": "Фосфорное",     "description": "Усиливает образование плодов", "effect": "+урожай",     "duration_sec": 21600,  "price_coins": 35},  # 6 часов, +50%
-            {"name": "Калийное",      "description": "Повышает устойчивость",        "effect": "+качество",   "duration_sec": 25200,  "price_coins": 40},  # 7 часов, +редкость
-            {"name": "Комплексное",   "description": "Сбалансированная смесь",       "effect": "+всё",        "duration_sec": 28800, "price_coins": 60},  # 8 часов, +40% урожай +редкость
-            {"name": "Биоактив",      "description": "Органический стимулятор",      "effect": "+био",        "duration_sec": 21600,  "price_coins": 50},  # 6 часов, +45%
-            {"name": "Стимул-Х",      "description": "Мощный стимулятор роста",       "effect": "+рост+кач",   "duration_sec": 25200,  "price_coins": 70},  # 7 часов, +55%
-            {"name": "Минерал+",      "description": "Минеральный комплекс",         "effect": "+качество",   "duration_sec": 25200,  "price_coins": 55},  # 7 часов, +редкость
-            {"name": "Гумат",         "description": "Гуминовый концентрат",          "effect": "+питание",    "duration_sec": 21600,  "price_coins": 45},  # 6 часов, +40%
-            {"name": "СуперРост",     "description": "Сокращает время роста",         "effect": "-время",      "duration_sec": 32400,  "price_coins": 80},  # 9 часов, +60%
-            {"name": "МегаУрожай",    "description": "Повышает выход урожая",         "effect": "+урожай++",   "duration_sec": 43200, "price_coins": 100}, # 12 часов, +60%
+            {"name": "Азотное",       "description": "Ускоряет вегетацию",           "effect": "+рост",       "duration_sec": 1500,  "price_coins": 75},   # 25 мин
+            {"name": "Фосфорное",     "description": "Усиливает образование плодов", "effect": "+урожай",     "duration_sec": 1800,  "price_coins": 90},   # 30 мин
+            {"name": "Калийное",      "description": "Повышает устойчивость",        "effect": "+качество",   "duration_sec": 2250,  "price_coins": 110},  # 37.5 мин
+            {"name": "Комплексное",   "description": "Сбалансированная смесь",       "effect": "+всё",        "duration_sec": 2700,  "price_coins": 180},  # 45 мин
+            {"name": "Биоактив",      "description": "Органический стимулятор",      "effect": "+био",        "duration_sec": 1800,  "price_coins": 130},  # 30 мин
+            {"name": "Стимул-Х",      "description": "Мощный стимулятор роста",       "effect": "+рост+кач",   "duration_sec": 2250,  "price_coins": 200},  # 37.5 мин
+            {"name": "Минерал+",      "description": "Минеральный комплекс",         "effect": "+качество",   "duration_sec": 1800,  "price_coins": 150},  # 30 мин
+            {"name": "Гумат",         "description": "Гуминовый концентрат",          "effect": "+питание",    "duration_sec": 1500,  "price_coins": 120},  # 25 мин
+            {"name": "СуперРост",     "description": "Сокращает время роста",         "effect": "-время",      "duration_sec": 1050,  "price_coins": 250},  # 17.5 мин
+            {"name": "МегаУрожай",    "description": "Повышает выход урожая",         "effect": "+урожай++",   "duration_sec": 2700,  "price_coins": 300},  # 45 мин
         ]
         created = 0
         for d in data:
@@ -1153,6 +1022,40 @@ def ensure_default_fertilizers() -> int:
                 pass
         dbs.commit()
         return int(created)
+    finally:
+        dbs.close()
+
+
+def update_fertilizers_duration() -> int:
+    """Обновляет duration_sec для существующих удобрений на новые значения (17.5-45 мин).
+    Возвращает количество обновленных записей."""
+    dbs = SessionLocal()
+    try:
+        duration_map = {
+            "Азотное": 1500,     # 25 мин
+            "Фосфорное": 1800,   # 30 мин
+            "Калийное": 2250,    # 37.5 мин
+            "Комплексное": 2700, # 45 мин
+            "Биоактив": 1800,    # 30 мин
+            "Стимул-Х": 2250,    # 37.5 мин
+            "Минерал+": 1800,    # 30 мин
+            "Гумат": 1500,       # 25 мин
+            "СуперРост": 1050,   # 17.5 мин
+            "МегаУрожай": 2700,  # 45 мин
+        }
+        
+        updated = 0
+        for name, duration in duration_map.items():
+            try:
+                fert = dbs.query(Fertilizer).filter(Fertilizer.name == name).first()
+                if fert:
+                    fert.duration_sec = duration
+                    updated += 1
+            except Exception:
+                pass
+        
+        dbs.commit()
+        return updated
     finally:
         dbs.close()
 
@@ -1225,7 +1128,9 @@ def purchase_fertilizer(user_id: int, fertilizer_id: int, quantity: int) -> dict
 
 def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
     """Применяет удобрение к грядке. Возвращает dict: {ok, reason?, bed_state?}
-    Возможные reason: no_such_bed, not_growing, no_such_fertilizer, no_fertilizer_in_inventory, fertilizer_active
+    Возможные reason: no_such_bed, not_growing, not_watered, no_such_fertilizer, no_fertilizer_in_inventory, max_fertilizers_reached
+    Теперь поддерживает накопление нескольких удобрений на одной грядке (максимум 3).
+    Требует, чтобы растение было полито хотя бы один раз (water_count > 0).
     """
     dbs = SessionLocal()
     try:
@@ -1235,7 +1140,11 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
 
         bed = (
             dbs.query(PlantationBed)
-            .options(joinedload(PlantationBed.fertilizer), joinedload(PlantationBed.seed_type))
+            .options(
+                joinedload(PlantationBed.fertilizer), 
+                joinedload(PlantationBed.seed_type),
+                joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+            )
             .filter(PlantationBed.owner_id == user_id, PlantationBed.bed_index == bed_index)
             .with_for_update(read=False)
             .first()
@@ -1247,13 +1156,18 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
             _update_bed_ready_if_due(dbs, bed)
             return {"ok": False, "reason": "not_growing", "bed_state": bed.state}
 
-        # Проверяем активное удобрение
+        # Проверяем, что растение было полито хотя бы раз
+        if int(bed.water_count or 0) <= 0:
+            return {"ok": False, "reason": "not_watered", "bed_state": bed.state}
+
+        # Проверяем количество активных удобрений (максимум 3)
+        # Используем check_duration=True, чтобы считать только удобрения с активным временем действия
         now_ts = int(time.time())
-        if bed.fertilizer_id and bed.fertilizer:
-            dur = int(getattr(bed.fertilizer, 'duration_sec', 0) or 0)
-            appl = int(getattr(bed, 'fertilizer_applied_at', 0) or 0)
-            if dur > 0 and appl > 0 and (now_ts - appl) <= dur:
-                return {"ok": False, "reason": "fertilizer_active", "bed_state": bed.state}
+        fert_status = get_fertilizer_status(bed, check_duration=True)
+        active_count = len(fert_status.get('fertilizers_info', []))
+        
+        if active_count >= 3:
+            return {"ok": False, "reason": "max_fertilizers_reached", "bed_state": bed.state}
 
         inv = (
             dbs.query(FertilizerInventory)
@@ -1264,9 +1178,18 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
         if not inv or int(inv.quantity or 0) <= 0:
             return {"ok": False, "reason": "no_fertilizer_in_inventory"}
 
-        # Применяем
+        # Применяем: добавляем в список активных удобрений
+        bed_fert = BedFertilizer(
+            bed_id=bed.id,
+            fertilizer_id=fertilizer_id,
+            applied_at=now_ts
+        )
+        dbs.add(bed_fert)
+        
+        # Также обновляем старые поля для обратной совместимости
         bed.fertilizer_id = fertilizer_id
         bed.fertilizer_applied_at = now_ts
+        
         inv.quantity = int(inv.quantity or 0) - 1
         dbs.commit()
         return {"ok": True, "bed_state": bed.state}
@@ -1320,7 +1243,11 @@ def get_player_beds(user_id: int) -> list[PlantationBed]:
     try:
         return list(
             dbs.query(PlantationBed)
-            .options(joinedload(PlantationBed.seed_type), joinedload(PlantationBed.fertilizer))
+            .options(
+                joinedload(PlantationBed.seed_type), 
+                joinedload(PlantationBed.fertilizer),
+                joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+            )
             .filter(PlantationBed.owner_id == user_id)
             .order_by(PlantationBed.bed_index.asc())
             .all()
@@ -1329,68 +1256,99 @@ def get_player_beds(user_id: int) -> list[PlantationBed]:
         dbs.close()
 
 
-def get_fertilizer_status(bed: PlantationBed) -> dict:
-    """Возвращает информацию о статусе удобрения на грядке.
-    Returns: {active: bool, fertilizer_name: str, time_left: int, multiplier: float, effect_type: str}
+def get_fertilizer_status(bed: PlantationBed, check_duration: bool = True) -> dict:
+    """Возвращает информацию о статусе удобрений на грядке.
+    Returns: {active: bool, fertilizer_names: list, total_multiplier: float, fertilizers_info: list}
+    Теперь поддерживает множественные удобрения с суммированием множителей.
+    
+    Args:
+        bed: Грядка для проверки
+        check_duration: Если True - учитывать только удобрения с активным временем действия (для проверки слотов).
+                       Если False - учитывать ВСЕ примененные удобрения (для расчета множителя при сборе).
     """
     result = {
         'active': False,
-        'fertilizer_name': None,
-        'time_left': 0,
-        'multiplier': 1.0,
-        'effect_type': 'none'
+        'fertilizer_names': [],
+        'total_multiplier': 1.0,
+        'fertilizers_info': []  # Список словарей: {name, multiplier, time_left, effect_type}
     }
     
     try:
-        if not bed.fertilizer_id or not bed.fertilizer:
+        if not hasattr(bed, 'active_fertilizers'):
             return result
-            
-        now_ts = int(time.time())
-        f_dur = int(getattr(bed.fertilizer, 'duration_sec', 0) or 0)
-        f_appl = int(getattr(bed, 'fertilizer_applied_at', 0) or 0)
         
-        if f_dur > 0 and f_appl > 0:
-            time_left = max(0, f_dur - (now_ts - f_appl))
-            if time_left > 0:
-                result['active'] = True
-                result['fertilizer_name'] = getattr(bed.fertilizer, 'name', 'Удобрение')
-                result['time_left'] = time_left
+        now_ts = int(time.time())
+        active_fertilizers = []
+        total_bonus = 0.0  # Сумма бонусов (без базового 1.0)
+        
+        # Проходим по всем активным удобрениям
+        for bed_fert in bed.active_fertilizers:
+            if not bed_fert.fertilizer:
+                continue
                 
-                # Определяем тип эффекта по названию удобрения
-                fert_name = result['fertilizer_name'].lower()
-                effect = getattr(bed.fertilizer, 'effect', '') or ''
+            fert = bed_fert.fertilizer
+            f_dur = int(getattr(fert, 'duration_sec', 0) or 0)
+            f_appl = int(getattr(bed_fert, 'applied_at', 0) or 0)
+            
+            if f_dur > 0 and f_appl > 0:
+                time_left = max(0, f_dur - (now_ts - f_appl))
                 
-                # Повышенные множители для лучшей эффективности
-                if 'урожай++' in effect:  # МегаУрожай
-                    result['multiplier'] = 2.5  # +150% (вместо +60%)
-                    result['effect_type'] = 'mega_yield'
-                elif 'урожай' in effect:  # Фосфорное
-                    result['multiplier'] = 2.0  # +100% (вместо +50%)
-                    result['effect_type'] = 'yield'
-                elif 'качество' in effect:  # Калийное, Минерал+
-                    result['multiplier'] = 1.6  # +60% (к количеству + качество)
-                    result['effect_type'] = 'quality'
-                elif 'всё' in effect:  # Комплексное
-                    result['multiplier'] = 1.8  # +80% (вместо +40%)
-                    result['effect_type'] = 'complex'
-                elif 'рост+кач' in effect:  # Стимул-Х
-                    result['multiplier'] = 2.2  # +120% (вместо +55%)
-                    result['effect_type'] = 'growth_quality'
-                elif 'время' in effect:  # СуперРост
-                    result['multiplier'] = 2.0  # +100% к урожаю (вместо +60%)
-                    result['effect_type'] = 'time'
-                elif 'рост' in effect:  # Азотное
-                    result['multiplier'] = 1.7  # +70% (вместо +40%)
-                    result['effect_type'] = 'growth'
-                elif 'питание' in effect:  # Гумат
-                    result['multiplier'] = 1.8  # +80% (вместо +40%)
-                    result['effect_type'] = 'nutrition'
-                elif 'био' in effect:  # Биоактив
-                    result['multiplier'] = 1.9  # +90% (вместо +45%)
-                    result['effect_type'] = 'bio'
-                else:
-                    result['multiplier'] = 1.6  # +60% базовые удобрения (вместо +40%)
-                    result['effect_type'] = 'basic'
+                # Если check_duration=True, проверяем время (для слотов)
+                # Если check_duration=False, берем все удобрения (для множителя при harvest)
+                if not check_duration or time_left > 0:
+                    fert_name = getattr(fert, 'name', 'Удобрение')
+                    effect = getattr(fert, 'effect', '') or ''
+                    
+                    # Определяем множитель для этого удобрения
+                    multiplier = 1.0
+                    effect_type = 'basic'
+                    
+                    if 'урожай++' in effect:
+                        multiplier = 1.4
+                        effect_type = 'mega_yield'
+                    elif 'урожай' in effect:
+                        multiplier = 1.25
+                        effect_type = 'yield'
+                    elif 'качество' in effect:
+                        multiplier = 1.15
+                        effect_type = 'quality'
+                    elif 'всё' in effect:
+                        multiplier = 1.3
+                        effect_type = 'complex'
+                    elif 'рост+кач' in effect:
+                        multiplier = 1.35
+                        effect_type = 'growth_quality'
+                    elif 'время' in effect:
+                        multiplier = 1.25
+                        effect_type = 'time'
+                    elif 'рост' in effect:
+                        multiplier = 1.2
+                        effect_type = 'growth'
+                    elif 'питание' in effect:
+                        multiplier = 1.3
+                        effect_type = 'nutrition'
+                    elif 'био' in effect:
+                        multiplier = 1.28
+                        effect_type = 'bio'
+                    else:
+                        multiplier = 1.15
+                        effect_type = 'basic'
+                    
+                    # Добавляем бонус (без базового 1.0) к общей сумме
+                    total_bonus += (multiplier - 1.0)
+                    
+                    active_fertilizers.append({
+                        'name': fert_name,
+                        'multiplier': multiplier,
+                        'time_left': time_left,
+                        'effect_type': effect_type
+                    })
+        
+        if active_fertilizers:
+            result['active'] = True
+            result['fertilizer_names'] = [f['name'] for f in active_fertilizers]
+            result['total_multiplier'] = 1.0 + total_bonus  # Базовый 1.0 + сумма бонусов
+            result['fertilizers_info'] = active_fertilizers
                 
     except Exception:
         pass
@@ -1398,28 +1356,40 @@ def get_fertilizer_status(bed: PlantationBed) -> dict:
     return result
 
 
+def get_actual_grow_time(bed: PlantationBed) -> int:
+    """Возвращает фактическое время роста с учетом примененного удобрения.
+    Если удобрение было применено, ускорение сохраняется до конца роста.
+    """
+    if not bed or not bed.seed_type:
+        return 0
+    
+    base_grow_time = int(bed.seed_type.grow_time_sec or 0)
+    
+    # Если удобрение применено, рассчитываем ускоренное время
+    if bed.fertilizer_id and bed.fertilizer:
+        effect = getattr(bed.fertilizer, 'effect', '') or ''
+        # Удобрения на ускорение роста
+        if 'время' in effect:  # СуперРост (-время)
+            return int(base_grow_time * 0.4)  # Сокращение на 60%
+        elif 'рост+кач' in effect:  # Стимул-Х
+            return int(base_grow_time * 0.7)  # Сокращение на 30%
+        elif 'всё' in effect:  # Комплексное
+            return int(base_grow_time * 0.7)  # Сокращение на 30%
+        elif 'рост' in effect:  # Азотное (+рост)
+            return int(base_grow_time * 0.75)  # Сокращение на 25%
+    
+    return base_grow_time
+
+
 def _update_bed_ready_if_due(dbs, bed: PlantationBed) -> bool:
     """Внутренняя: переводит грядку в состояние 'ready', если прошло время роста. Возвращает True, если обновлено.
-    Учитывает эффекты активных удобрений на скорость роста.
+    Учитывает эффекты удобрений на скорость роста.
+    ВАЖНО: Если удобрение было применено, ускорение сохраняется до конца роста (даже если duration истек).
     """
     try:
         if bed and bed.state == 'growing' and bed.seed_type and bed.planted_at:
             now_ts = int(time.time())
-            base_grow_time = int(bed.seed_type.grow_time_sec or 0)
-            
-            # Применяем эффекты удобрений на время роста
-            actual_grow_time = base_grow_time
-            if bed.fertilizer_id and bed.fertilizer:
-                fert_status = get_fertilizer_status(bed)
-                if fert_status['active']:
-                    effect_type = fert_status['effect_type']
-                    # Удобрения на ускорение роста
-                    if effect_type == 'time':  # СуперРост (-время)
-                        actual_grow_time = int(base_grow_time * 0.4)  # Сокращение на 60%
-                    elif effect_type in ('growth_quality', 'complex'):  # Стимул-Х, Комплексное
-                        actual_grow_time = int(base_grow_time * 0.7)  # Сокращение на 30%
-                    elif 'рост' in (bed.fertilizer.effect or ''):  # Азотное (+рост)
-                        actual_grow_time = int(base_grow_time * 0.75)  # Сокращение на 25%
+            actual_grow_time = get_actual_grow_time(bed)
             
             if now_ts - int(bed.planted_at) >= actual_grow_time:
                 bed.state = 'ready'
@@ -1466,8 +1436,9 @@ def plant_seed(user_id: int, bed_index: int, seed_type_id: int) -> dict:
         bed.last_watered_at = 0
         bed.water_count = 0
         inv.quantity = int(inv.quantity or 0) - 1
+        water_interval = int(seed_type.water_interval_sec or 0)
         dbs.commit()
-        return {"ok": True, "bed_state": bed.state}
+        return {"ok": True, "bed_state": bed.state, "water_interval_sec": water_interval}
     except Exception:
         try:
             dbs.rollback()
@@ -1509,7 +1480,7 @@ def water_bed(user_id: int, bed_index: int) -> dict:
         # Обновим готовность, если срок истёк
         _update_bed_ready_if_due(dbs, bed)
         dbs.commit()
-        return {"ok": True, "bed_state": bed.state}
+        return {"ok": True, "bed_state": bed.state, "water_interval_sec": interval}
     except Exception:
         try:
             dbs.rollback()
@@ -1529,7 +1500,10 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
     try:
         bed = (
             dbs.query(PlantationBed)
-            .options(joinedload(PlantationBed.seed_type))
+            .options(
+                joinedload(PlantationBed.seed_type),
+                joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+            )
             .filter(PlantationBed.owner_id == user_id, PlantationBed.bed_index == bed_index)
             .with_for_update(read=False)
             .first()
@@ -1553,26 +1527,29 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
         # Множители урожайности
         now_ts = int(time.time())
         yield_mult = 1.0
-        # Бонус за полив: до +25% (по 5% за полив, максимум 5)
+        # Бонус за полив: до +10% (по 2% за полив, максимум 5)
         wc = int(bed.water_count or 0)
         if wc > 0:
-            yield_mult *= (1.0 + min(wc, 5) * 0.05)
-        # Бонус от удобрения, если активно
-        fert_active = False
-        fertilizer_name = None
-        fert_effect_type = 'none'
+            yield_mult *= (1.0 + min(wc, 5) * 0.02)
+        # Бонус от удобрений - теперь суммируем множители всех активных удобрений
+        fert_applied = False
+        fertilizer_names = []
+        fert_effect_types = []
         fert_multiplier = 1.0
         try:
-            if bed.fertilizer_id and bed.fertilizer:
-                fert_status = get_fertilizer_status(bed)
-                fert_active = fert_status['active']
-                fertilizer_name = fert_status['fertilizer_name']
-                fert_effect_type = fert_status['effect_type']
-                fert_multiplier = fert_status['multiplier']
+            # Используем check_duration=False, чтобы учесть ВСЕ примененные удобрения
+            # независимо от истечения их времени действия (множитель сохраняется до сбора)
+            fert_status = get_fertilizer_status(bed, check_duration=False)
+            if fert_status['active']:
+                fert_applied = True
+                fertilizer_names = fert_status['fertilizer_names']
+                fert_multiplier = fert_status['total_multiplier']
+                # Собираем типы эффектов для определения влияния на редкость
+                fert_effect_types = [f['effect_type'] for f in fert_status['fertilizers_info']]
         except Exception:
-            fert_active = False
+            fert_applied = False
         
-        if fert_active:
+        if fert_applied:
             yield_mult *= fert_multiplier
         # Штрафы от негативных статусов
         try:
@@ -1598,41 +1575,43 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
             try:
                 # Базовые веса редкостей
                 rarity_weights = {k: float(v) for k, v in RARITIES.items()}
-                # Смещения весов от удобрения и полива - улучшенные эффекты
-                if fert_active:
-                    # Различные эффекты в зависимости от типа удобрения
-                    if fert_effect_type in ('quality', 'complex', 'growth_quality'):
-                        # Усиливаем высокие редкости, снижаем Basic
-                        if 'Basic' in rarity_weights:
-                            rarity_weights['Basic'] *= 0.5  # Сильнее снижаем Basic
-                        if 'Medium' in rarity_weights:
-                            rarity_weights['Medium'] *= 2.5  # Усиливаем Medium
-                        if 'Elite' in rarity_weights:
-                            rarity_weights['Elite'] *= 4.0  # Значительно усиливаем Elite
-                        if 'Absolute' in rarity_weights:
-                            rarity_weights['Absolute'] *= 6.0  # Сильно усиливаем Absolute
-                        if 'Majestic' in rarity_weights:
-                            rarity_weights['Majestic'] *= 8.0  # Максимально усиливаем Majestic
-                    elif fert_effect_type in ('yield', 'mega_yield', 'time'):
-                        # Средний эффект на редкость
-                        if 'Basic' in rarity_weights:
-                            rarity_weights['Basic'] *= 0.7
-                        if 'Medium' in rarity_weights:
-                            rarity_weights['Medium'] *= 1.8
-                        if 'Elite' in rarity_weights:
-                            rarity_weights['Elite'] *= 2.5
-                        if 'Absolute' in rarity_weights:
-                            rarity_weights['Absolute'] *= 3.0
-                        if 'Majestic' in rarity_weights:
-                            rarity_weights['Majestic'] *= 4.0
-                    else:
-                        # Базовые удобрения - умеренный эффект
-                        if 'Basic' in rarity_weights:
-                            rarity_weights['Basic'] *= 0.8
-                        if 'Medium' in rarity_weights:
-                            rarity_weights['Medium'] *= 1.5
-                        if 'Elite' in rarity_weights:
-                            rarity_weights['Elite'] *= 2.0
+                # Смещения весов от удобрений и полива - улучшенные эффекты
+                if fert_applied and fert_effect_types:
+                    # Применяем эффекты от каждого активного удобрения
+                    for fert_effect_type in fert_effect_types:
+                        # Различные эффекты в зависимости от типа удобрения
+                        if fert_effect_type in ('quality', 'complex', 'growth_quality'):
+                            # Усиливаем высокие редкости, снижаем Basic
+                            if 'Basic' in rarity_weights:
+                                rarity_weights['Basic'] *= 0.5  # Сильнее снижаем Basic
+                            if 'Medium' in rarity_weights:
+                                rarity_weights['Medium'] *= 2.5  # Усиливаем Medium
+                            if 'Elite' in rarity_weights:
+                                rarity_weights['Elite'] *= 4.0  # Значительно усиливаем Elite
+                            if 'Absolute' in rarity_weights:
+                                rarity_weights['Absolute'] *= 6.0  # Сильно усиливаем Absolute
+                            if 'Majestic' in rarity_weights:
+                                rarity_weights['Majestic'] *= 8.0  # Максимально усиливаем Majestic
+                        elif fert_effect_type in ('yield', 'mega_yield', 'time'):
+                            # Средний эффект на редкость
+                            if 'Basic' in rarity_weights:
+                                rarity_weights['Basic'] *= 0.7
+                            if 'Medium' in rarity_weights:
+                                rarity_weights['Medium'] *= 1.8
+                            if 'Elite' in rarity_weights:
+                                rarity_weights['Elite'] *= 2.5
+                            if 'Absolute' in rarity_weights:
+                                rarity_weights['Absolute'] *= 3.0
+                            if 'Majestic' in rarity_weights:
+                                rarity_weights['Majestic'] *= 4.0
+                        else:
+                            # Базовые удобрения - умеренный эффект
+                            if 'Basic' in rarity_weights:
+                                rarity_weights['Basic'] *= 0.8
+                            if 'Medium' in rarity_weights:
+                                rarity_weights['Medium'] *= 1.5
+                            if 'Elite' in rarity_weights:
+                                rarity_weights['Elite'] *= 2.0
                 if wc > 0:
                     # Полив чуть усиливает Medium/Elite
                     if 'Medium' in rarity_weights:
@@ -1691,6 +1670,13 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
             bed.status_effect = None
         except Exception:
             pass
+        # Удаляем все активные удобрения (благодаря cascade='all, delete-orphan' они удалятся автоматически)
+        try:
+            if hasattr(bed, 'active_fertilizers'):
+                for bf in list(bed.active_fertilizers):
+                    dbs.delete(bf)
+        except Exception:
+            pass
         dbs.commit()
         return {
             "ok": True,
@@ -1700,8 +1686,8 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
             "rarity_counts": rarity_counts,
             "effects": {
                 "water_count": int(wc),
-                "fertilizer_active": bool(fert_active),
-                "fertilizer_name": fertilizer_name,
+                "fertilizer_active": bool(fert_applied),
+                "fertilizer_names": fertilizer_names,  # Теперь список названий
                 "status_effect": (se or None),
                 "yield_multiplier": float(yield_mult),
             },
@@ -2263,6 +2249,130 @@ def add_drink_to_inventory(user_id, drink_id, rarity):
     finally:
         db.close()
 
+
+# --- Функции для системы "горячих" и "холодных" напитков ---
+
+def record_drink_discovery(drink_id: int):
+    """Записывает находку напитка для статистики."""
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        current_date = int(current_time // 86400)  # День с начала эпохи
+        
+        stats = db.query(DrinkDiscoveryStats).filter_by(drink_id=drink_id).first()
+        if stats:
+            # Обновляем существующую статистику
+            stats.total_discoveries += 1
+            stats.last_discovered_at = current_time
+            
+            # Проверяем, нужно ли сбросить дневной счетчик
+            if stats.last_reset_date != current_date:
+                stats.global_discoveries_today = 1
+                stats.last_reset_date = current_date
+            else:
+                stats.global_discoveries_today += 1
+        else:
+            # Создаем новую запись
+            stats = DrinkDiscoveryStats(
+                drink_id=drink_id,
+                total_discoveries=1,
+                last_discovered_at=current_time,
+                global_discoveries_today=1,
+                last_reset_date=current_date
+            )
+            db.add(stats)
+        
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"Ошибка при записи статистики находки: {e}")
+    finally:
+        db.close()
+
+
+def get_drink_temperature(drink_id: int) -> str:
+    """Определяет 'температуру' напитка на основе статистики.
+    Возвращает: 'hot' (горячий), 'cold' (холодный) или 'neutral' (нейтральный)
+    Напитки без статистики (никогда не находили) считаются 'hot' (редкими).
+    """
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        stats = db.query(DrinkDiscoveryStats).filter_by(drink_id=drink_id).first()
+        
+        if not stats:
+            return 'hot'  # Новые/редкие напитки считаются горячими
+        
+        time_since_discovery = current_time - stats.last_discovered_at
+        
+        # Холодный: нашли в последние 6 часов (21600 сек)
+        if time_since_discovery < 21600:
+            return 'cold'
+        
+        # Горячий: не находили более 48 часов (172800 сек)
+        if time_since_discovery > 172800:
+            return 'hot'
+        
+        # Нейтральный: между 6 и 48 часов
+        return 'neutral'
+    finally:
+        db.close()
+
+
+def get_weighted_drinks_list():
+    """Возвращает список напитков с весами на основе их 'температуры'.
+    Холодные напитки имеют вес 0.5x, горячие 2x, нейтральные 1x.
+    """
+    db = SessionLocal()
+    try:
+        all_drinks = db.query(EnergyDrink).all()
+        weighted_list = []
+        
+        for drink in all_drinks:
+            temp = get_drink_temperature(drink.id)
+            
+            # Определяем вес
+            if temp == 'cold':
+                weight = 0.5
+            elif temp == 'hot':
+                weight = 2.0
+            else:  # neutral
+                weight = 1.0
+            
+            # Добавляем напиток в список с учетом веса
+            # Для упрощения выбора, добавляем напиток несколько раз
+            count = max(1, int(weight * 10))  # Минимум 1 раз
+            weighted_list.extend([drink] * count)
+        
+        return weighted_list
+    finally:
+        db.close()
+
+
+def get_all_drinks_with_temperature():
+    """Возвращает список всех напитков с информацией о их температуре.
+    Полезно для отладки и статистики.
+    """
+    db = SessionLocal()
+    try:
+        all_drinks = db.query(EnergyDrink).all()
+        result = []
+        
+        for drink in all_drinks:
+            temp = get_drink_temperature(drink.id)
+            stats = db.query(DrinkDiscoveryStats).filter_by(drink_id=drink.id).first()
+            
+            result.append({
+                'drink': drink,
+                'temperature': temp,
+                'total_discoveries': stats.total_discoveries if stats else 0,
+                'last_discovered_at': stats.last_discovered_at if stats else 0,
+            })
+        
+        return result
+    finally:
+        db.close()
+
 def get_player_inventory_with_details(user_id):
     """Возвращает полный инвентарь игрока с деталями о каждом напитке."""
     db = SessionLocal()
@@ -2814,7 +2924,8 @@ def purchase_vip(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
 def purchase_vip_plus(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
     """
     Списывает монеты и устанавливает/продлевает VIP+.
-    Возвращает dict: {ok: bool, reason?: str, vip_plus_until?: int, coins_left?: int}
+    Если у пользователя есть активный обычный VIP, 25% оставшегося времени переносится на VIP+.
+    Возвращает dict: {ok: bool, reason?: str, vip_plus_until?: int, coins_left?: int, vip_time_transferred?: int}
     """
     db = SessionLocal()
     try:
@@ -2831,9 +2942,22 @@ def purchase_vip_plus(user_id: int, cost_coins: int, duration_seconds: int) -> d
             return {"ok": False, "reason": "not_enough_coins"}
 
         now_ts = int(time.time())
-        base_ts = int(player.vip_plus_until or 0)
-        start_ts = base_ts if base_ts and base_ts > now_ts else now_ts
-        new_vip_plus_until = start_ts + int(duration_seconds)
+        
+        # Проверяем наличие активного обычного VIP
+        vip_until = int(player.vip_until or 0)
+        vip_plus_until = int(player.vip_plus_until or 0)
+        vip_time_transferred = 0
+        
+        # Если есть активный VIP (но не VIP+), переносим 25% времени
+        if vip_until > now_ts and vip_plus_until <= now_ts:
+            remaining_vip_time = vip_until - now_ts
+            vip_time_transferred = int(remaining_vip_time * 0.25)
+            # Обнуляем обычный VIP после переноса
+            player.vip_until = 0
+        
+        # Рассчитываем новое время VIP+
+        base_ts = vip_plus_until if vip_plus_until and vip_plus_until > now_ts else now_ts
+        new_vip_plus_until = base_ts + int(duration_seconds) + vip_time_transferred
 
         player.coins = current_coins - int(cost_coins)
         try:
@@ -2842,13 +2966,78 @@ def purchase_vip_plus(user_id: int, cost_coins: int, duration_seconds: int) -> d
             # На случай старой схемы без столбца
             pass
         db.commit()
-        return {"ok": True, "vip_plus_until": new_vip_plus_until, "coins_left": int(player.coins)}
+        return {
+            "ok": True, 
+            "vip_plus_until": new_vip_plus_until, 
+            "coins_left": int(player.coins),
+            "vip_time_transferred": vip_time_transferred
+        }
     except Exception as ex:
         try:
             db.rollback()
         except Exception:
             pass
         return {"ok": False, "reason": "exception"}
+    finally:
+        db.close()
+
+def extend_vip(user_id: int, duration_seconds: int) -> int:
+    """
+    Продлевает VIP на указанное количество секунд без списания монет.
+    Используется для наград (например, рулетка ежедневного бонуса).
+    Возвращает новый Unix-timestamp окончания VIP.
+    """
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            # Автосоздание игрока
+            player = Player(user_id=user_id, username=str(user_id))
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        now_ts = int(time.time())
+        base_ts = int(player.vip_until or 0)
+        start_ts = base_ts if base_ts and base_ts > now_ts else now_ts
+        new_vip_until = start_ts + int(duration_seconds)
+
+        player.vip_until = new_vip_until
+        db.commit()
+        return new_vip_until
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+def extend_vip_plus(user_id: int, duration_seconds: int) -> int:
+    """
+    Продлевает VIP+ на указанное количество секунд без списания монет.
+    Используется для наград (например, рулетка ежедневного бонуса).
+    Возвращает новый Unix-timestamp окончания VIP+.
+    """
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            # Автосоздание игрока
+            player = Player(user_id=user_id, username=str(user_id))
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        now_ts = int(time.time())
+        base_ts = int(player.vip_plus_until or 0)
+        start_ts = base_ts if base_ts and base_ts > now_ts else now_ts
+        new_vip_plus_until = start_ts + int(duration_seconds)
+
+        player.vip_plus_until = new_vip_plus_until
+        db.commit()
+        return new_vip_plus_until
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -2864,6 +3053,19 @@ def set_admin_level(user_id: int, level: int) -> bool:
         rec.level = level
         db.commit()
         return True
+    finally:
+        db.close()
+
+def reset_all_daily_bonus() -> int:
+    """Сбрасывает ежедневный бонус для всех пользователей. Возвращает количество обновленных записей."""
+    db = SessionLocal()
+    try:
+        count = db.query(Player).update({Player.last_bonus_claim: 0})
+        db.commit()
+        return count
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -3670,7 +3872,8 @@ def get_group_settings(chat_id: int) -> dict:
             'title': group.title,
             'is_enabled': group.is_enabled,
             'notify_disabled': getattr(group, 'notify_disabled', False),
-            'auto_delete_enabled': getattr(group, 'auto_delete_enabled', False)
+            'auto_delete_enabled': getattr(group, 'auto_delete_enabled', False),
+            'auto_delete_delay_minutes': getattr(group, 'auto_delete_delay_minutes', 5)
         }
     finally:
         db.close()
@@ -3741,5 +3944,245 @@ def migrate_group_settings():
             db.rollback()
         except Exception:
             pass
+    finally:
+        db.close()
+
+
+# --- Функции для работы с запланированными задачами автоудаления ---
+
+def save_scheduled_auto_delete(chat_id: int, message_id: int, delete_at: int):
+    """Сохраняет запланированную задачу автоудаления в БД."""
+    db = SessionLocal()
+    try:
+        scheduled = ScheduledAutoDelete(
+            chat_id=chat_id,
+            message_id=message_id,
+            delete_at=delete_at
+        )
+        db.add(scheduled)
+        db.commit()
+        return scheduled.id
+    except Exception as e:
+        print(f"[AUTO_DELETE_DB] Error saving scheduled delete: {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def get_all_scheduled_auto_deletes():
+    """Получает все запланированные задачи автоудаления."""
+    db = SessionLocal()
+    try:
+        scheduled_list = db.query(ScheduledAutoDelete).all()
+        return [(s.id, s.chat_id, s.message_id, s.delete_at) for s in scheduled_list]
+    finally:
+        db.close()
+
+
+def delete_scheduled_auto_delete(scheduled_id: int):
+    """Удаляет задачу автоудаления из БД по ID."""
+    db = SessionLocal()
+    try:
+        db.query(ScheduledAutoDelete).filter(ScheduledAutoDelete.id == scheduled_id).delete()
+        db.commit()
+    except Exception as e:
+        print(f"[AUTO_DELETE_DB] Error deleting scheduled task {scheduled_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def delete_scheduled_auto_delete_by_message(chat_id: int, message_id: int):
+    """Удаляет задачу автоудаления из БД по chat_id и message_id."""
+    db = SessionLocal()
+    try:
+        db.query(ScheduledAutoDelete).filter(
+            ScheduledAutoDelete.chat_id == chat_id,
+            ScheduledAutoDelete.message_id == message_id
+        ).delete()
+        db.commit()
+    except Exception as e:
+        print(f"[AUTO_DELETE_DB] Error deleting scheduled task for message {message_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def cleanup_old_scheduled_deletes():
+    """Удаляет устаревшие записи (старше 24 часов от времени удаления)."""
+    db = SessionLocal()
+    try:
+        cutoff = int(time.time()) - 24 * 60 * 60
+        deleted = db.query(ScheduledAutoDelete).filter(ScheduledAutoDelete.delete_at < cutoff).delete()
+        db.commit()
+        if deleted > 0:
+            print(f"[AUTO_DELETE_DB] Cleaned up {deleted} old scheduled tasks")
+        return deleted
+    except Exception as e:
+        print(f"[AUTO_DELETE_DB] Error cleaning up old tasks: {e}")
+        db.rollback()
+        return 0
+    finally:
+        db.close()
+
+
+# --- Функции для работы с системой подарков ---
+
+def log_gift(giver_id: int, recipient_id: int, drink_id: int, rarity: str, status: str):
+    """Логирует подарок в историю."""
+    db = SessionLocal()
+    try:
+        gift = GiftHistory(
+            giver_id=giver_id,
+            recipient_id=recipient_id,
+            drink_id=drink_id,
+            rarity=rarity,
+            status=status
+        )
+        db.add(gift)
+        db.commit()
+        return gift.id
+    except Exception as e:
+        print(f"[GIFT_DB] Error logging gift: {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def get_user_gifts_sent_today(user_id: int) -> int:
+    """Возвращает количество подарков, отправленных пользователем сегодня."""
+    db = SessionLocal()
+    try:
+        today_start = int(time.time()) - (int(time.time()) % 86400)  # начало текущего дня UTC
+        count = db.query(GiftHistory).filter(
+            GiftHistory.giver_id == user_id,
+            GiftHistory.created_at >= today_start
+        ).count()
+        return count
+    finally:
+        db.close()
+
+
+def get_user_last_gift_time(user_id: int) -> int:
+    """Возвращает timestamp последнего подарка пользователя или 0."""
+    db = SessionLocal()
+    try:
+        last_gift = db.query(GiftHistory).filter(
+            GiftHistory.giver_id == user_id
+        ).order_by(GiftHistory.created_at.desc()).first()
+        return last_gift.created_at if last_gift else 0
+    finally:
+        db.close()
+
+
+def check_consecutive_gifts(giver_id: int, recipient_id: int, limit: int = 10) -> bool:
+    """
+    Проверяет, дарил ли giver_id последние N раз подряд recipient_id.
+    Возвращает True если превышен лимит (нужна блокировка).
+    """
+    db = SessionLocal()
+    try:
+        # Берем последние 'limit' подарков от дарителя
+        recent_gifts = db.query(GiftHistory).filter(
+            GiftHistory.giver_id == giver_id
+        ).order_by(GiftHistory.created_at.desc()).limit(limit).all()
+        
+        if len(recent_gifts) < limit:
+            return False  # Недостаточно подарков для проверки
+        
+        # Проверяем, все ли они были одному получателю
+        return all(g.recipient_id == recipient_id for g in recent_gifts)
+    finally:
+        db.close()
+
+
+def add_gift_restriction(user_id: int, reason: str, blocked_until: int = None, blocked_by: int = None):
+    """Добавляет блокировку на дарение подарков."""
+    db = SessionLocal()
+    try:
+        # Проверяем, нет ли уже блокировки
+        existing = db.query(GiftRestriction).filter(GiftRestriction.user_id == user_id).first()
+        if existing:
+            # Обновляем существующую
+            existing.reason = reason
+            existing.blocked_at = int(time.time())
+            existing.blocked_until = blocked_until
+            existing.blocked_by = blocked_by
+        else:
+            # Создаем новую
+            restriction = GiftRestriction(
+                user_id=user_id,
+                reason=reason,
+                blocked_until=blocked_until,
+                blocked_by=blocked_by
+            )
+            db.add(restriction)
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[GIFT_DB] Error adding restriction: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def is_user_gift_restricted(user_id: int) -> tuple[bool, str]:
+    """
+    Проверяет, заблокирован ли пользователь для дарения.
+    Возвращает (True/False, причина).
+    """
+    db = SessionLocal()
+    try:
+        restriction = db.query(GiftRestriction).filter(GiftRestriction.user_id == user_id).first()
+        if not restriction:
+            return (False, "")
+        
+        # Проверяем, не истекла ли блокировка
+        if restriction.blocked_until is not None:
+            if int(time.time()) > restriction.blocked_until:
+                # Блокировка истекла, удаляем её
+                db.delete(restriction)
+                db.commit()
+                return (False, "")
+        
+        return (True, restriction.reason or "Нарушение правил дарения")
+    except Exception as e:
+        print(f"[GIFT_DB] Error checking restriction: {e}")
+        return (False, "")
+    finally:
+        db.close()
+
+
+def remove_gift_restriction(user_id: int):
+    """Снимает блокировку с пользователя."""
+    db = SessionLocal()
+    try:
+        db.query(GiftRestriction).filter(GiftRestriction.user_id == user_id).delete()
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[GIFT_DB] Error removing restriction: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def get_gift_stats(user_id: int) -> dict:
+    """Возвращает статистику подарков пользователя."""
+    db = SessionLocal()
+    try:
+        sent = db.query(GiftHistory).filter(GiftHistory.giver_id == user_id).count()
+        received = db.query(GiftHistory).filter(
+            GiftHistory.recipient_id == user_id,
+            GiftHistory.status == 'accepted'
+        ).count()
+        return {
+            'sent': sent,
+            'received': received
+        }
     finally:
         db.close()
