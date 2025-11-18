@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 import database as db
+from database import SessionLocal, Player
 from collections import defaultdict
 import config
 from typing import Dict
@@ -72,6 +73,11 @@ from constants import (
     CASINO_WIN_PROB,
     CASINO_MAX_BET,
     CASINO_MIN_BET,
+    CASINO_GAMES,
+    SLOT_SYMBOLS,
+    SLOT_PAYOUTS,
+    CASINO_ANIMATIONS,
+    CASINO_ACHIEVEMENTS,
     RECEIVER_PRICES,
     RECEIVER_COMMISSION,
     SHOP_PRICES,
@@ -101,6 +107,18 @@ def safe_format_timestamp(timestamp, format_str='%d.%m.%Y %H:%M'):
         logger.warning(f"Invalid timestamp {timestamp}: {e}")
         return None
 
+def create_progress_bar(percent: float, length: int = 10, filled: str = '█', empty: str = '░') -> str:
+    """Создает визуальный прогресс-бар."""
+    if percent < 0:
+        percent = 0
+    elif percent > 100:
+        percent = 100
+    
+    filled_length = int(length * percent / 100)
+    empty_length = length - filled_length
+    
+    return filled * filled_length + empty * empty_length
+
 # --- Константы ---
 # см. constants.py
 
@@ -114,7 +132,7 @@ def safe_format_timestamp(timestamp, format_str='%d.%m.%Y %H:%M'):
 # ADMIN_USERNAMES импортируется из constants.py
 ADMIN_USER_IDS: set[int] = set()  # legacy, больше не используется для прав, оставлено для обратной совместимости
 
-ADD_NAME, ADD_DESCRIPTION, ADD_SPECIAL, ADD_PHOTO = range(4)
+ADD_NAME, ADD_DESCRIPTION, ADD_SPECIAL, ADD_PHOTO, ADDP_NAME, ADDP_DESCRIPTION, ADDP_PHOTO = range(7)
 
 # Константы для conversation handler казино
 CASINO_CUSTOM_BET = range(1)
@@ -152,8 +170,18 @@ SHOP_OFFERS: Dict[int, dict] = {}
 
 TEXTS = {
     'menu_title': {
-        'ru': 'Привет, {user}!\n\nЧто будем делать?',
-        'en': 'Hi, {user}!\n\nWhat shall we do?'
+        'ru': '⚡ <b>Добро пожаловать, {user}!</b>\n\n'
+              '💰 <b>Баланс:</b> {coins} септимов\n'
+              '🔋 <b>Энергетиков:</b> {energy_count}\n'
+              '{vip_status}\n'
+              '━━━━━━━━━━━━━━━━\n'
+              '<i>Выберите действие:</i>',
+        'en': '⚡ <b>Welcome, {user}!</b>\n\n'
+              '💰 <b>Balance:</b> {coins} septims\n'
+              '🔋 <b>Energy drinks:</b> {energy_count}\n'
+              '{vip_status}\n'
+              '━━━━━━━━━━━━━━━━\n'
+              '<i>Choose an action:</i>'
     },
     'search': {'ru': '🔎 Найти энергетик', 'en': '🔎 Find energy'},
     'inventory': {'ru': '📦 Инвентарь', 'en': '📦 Inventory'},
@@ -176,6 +204,12 @@ TEXTS = {
     'auto_disabled': {'ru': 'Автопоиск выключен.', 'en': 'Auto-search disabled.'},
     'auto_limit_reached': {'ru': 'Дневной лимит автопоиска исчерпан. Автопоиск отключён до сброса.', 'en': 'Daily auto-search limit reached. Auto-search disabled until reset.'},
     'auto_vip_expired': {'ru': 'Срок V.I.P. истёк. Автопоиск отключён.', 'en': 'V.I.P. expired. Auto-search has been disabled.'},
+    'autosell': {'ru': '🧾 Автопродажа', 'en': '🧾 Auto-sell'},
+    'autosell_title': {'ru': '🧾 Автопродажа энергетиков', 'en': '🧾 Auto-sell energy drinks'},
+    'autosell_desc': {
+        'ru': 'Выберите, какие редкости продавать автоматически сразу после нахождения. Энергетик не попадёт в инвентарь, а сразу будет продан по цене Приёмника.',
+        'en': 'Choose which rarities to auto-sell immediately after search. The drink will not go to inventory, it will be sold at Receiver price.'
+    },
     'btn_reset': {'ru': '🔄 Сброс данных', 'en': '🔄 Reset data'},
     'btn_back': {'ru': '🔙 Назад', 'en': '🔙 Back'},
     'choose_lang': {'ru': 'Выберите язык:', 'en': 'Choose language:'},
@@ -366,47 +400,85 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(user.id, user.username or user.first_name)
 
     # Проверка кулдауна поиска (VIP+ — x0.25, VIP — x0.5)
-    vip_plus_active = db.is_vip_plus(player.user_id)
-    vip_active = db.is_vip(player.user_id)
+    vip_plus_active = db.is_vip_plus(user.id)
+    vip_active = db.is_vip(user.id)
     
+    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
     if vip_plus_active:
-        search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+        search_cd = base_search_cd / 4  # x0.25 для VIP+
     elif vip_active:
-        search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+        search_cd = base_search_cd / 2  # x0.5 для VIP
     else:
-        search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
-    search_time_left = max(0, search_cd - (time.time() - player.last_search))
-    lang = player.language
+        search_cd = base_search_cd       # x1.0 для обычных
+    last_search_val = float(getattr(player, 'last_search', 0) or 0)
+    search_time_left = max(0, search_cd - (time.time() - last_search_val))
+    lang = getattr(player, 'language', 'ru') or 'ru'
 
     base_search = t(lang, 'search')
     if search_time_left > 0:
         search_status = f"{base_search} (⏳ {int(search_time_left // 60)}:{int(search_time_left % 60):02d})"
     else:
-        search_status = base_search
+        search_status = f"{base_search} ✅"
 
     # Проверка кулдауна ежедневного бонуса (VIP+ — x4 скорость, VIP — x2 скорость)
+    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
     if vip_plus_active:
-        bonus_cd = DAILY_BONUS_COOLDOWN / 4  # x4 скорость для VIP+
+        bonus_cd = base_bonus_cd / 4
     elif vip_active:
-        bonus_cd = DAILY_BONUS_COOLDOWN / 2  # x2 скорость для VIP
+        bonus_cd = base_bonus_cd / 2
     else:
-        bonus_cd = DAILY_BONUS_COOLDOWN
-    bonus_time_left = max(0, bonus_cd - (time.time() - player.last_bonus_claim))
+        bonus_cd = base_bonus_cd
+    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
+    bonus_time_left = max(0, bonus_cd - (time.time() - last_bonus_claim_val))
     base_bonus = t(lang, 'daily_bonus')
     if bonus_time_left > 0:
         hours, remainder = divmod(int(bonus_time_left), 3600)
         minutes, seconds = divmod(remainder, 60)
         bonus_status = f"{base_bonus} (⏳ {hours:02d}:{minutes:02d}:{seconds:02d})"
     else:
-        bonus_status = base_bonus
+        bonus_status = f"{base_bonus} ✅"
 
+    # Формируем текст статуса VIP
+    vip_status_text = ""
+    if vip_plus_active:
+        vip_plus_until_val = int(getattr(player, 'vip_plus_until', 0) or 0)
+        vip_until = safe_format_timestamp(vip_plus_until_val, '%d.%m.%Y %H:%M')
+        if lang == 'ru':
+            vip_status_text = f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_until})"
+        else:
+            vip_status_text = f"💎 <b>Status:</b> {VIP_PLUS_EMOJI} V.I.P+ (until {vip_until})"
+    elif vip_active:
+        vip_until_val = int(getattr(player, 'vip_until', 0) or 0)
+        vip_until = safe_format_timestamp(vip_until_val, '%d.%m.%Y %H:%M')
+        if lang == 'ru':
+            vip_status_text = f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until})"
+        else:
+            vip_status_text = f"👑 <b>Status:</b> {VIP_EMOJI} V.I.P (until {vip_until})"
+    else:
+        if lang == 'ru':
+            vip_status_text = "📊 <b>Статус:</b> Обычный игрок"
+        else:
+            vip_status_text = "📊 <b>Status:</b> Regular player"
+
+    # Получаем количество энергетиков в инвентаре
+    energy_count = len(db.get_player_inventory_with_details(user.id))
+
+    # Улучшенная структура кнопок
     keyboard = [
+        # Основные действия
         [InlineKeyboardButton(search_status, callback_data='find_energy')],
         [InlineKeyboardButton(bonus_status, callback_data='claim_bonus')],
-        [InlineKeyboardButton(t(lang, 'extra_bonuses'), callback_data='extra_bonuses')],
-        [InlineKeyboardButton("🏙️ Города", callback_data='cities_menu')],
-        [InlineKeyboardButton(t(lang, 'inventory'), callback_data='inventory')],
-        [InlineKeyboardButton(t(lang, 'stats'), callback_data='stats')],
+        # Бонусы и города в одной строке
+        [
+            InlineKeyboardButton("🎁 Бонусы", callback_data='extra_bonuses'),
+            InlineKeyboardButton("🏙️ Города", callback_data='cities_menu')
+        ],
+        # Профиль в одной строке
+        [
+            InlineKeyboardButton(t(lang, 'inventory'), callback_data='inventory'),
+            InlineKeyboardButton(t(lang, 'stats'), callback_data='stats')
+        ],
+        # Настройки
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
     ]
     
@@ -418,7 +490,12 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    menu_text = t(lang, 'menu_title').format(user=user.mention_html())
+    menu_text = t(lang, 'menu_title').format(
+        user=user.mention_html(),
+        coins=player.coins,
+        energy_count=energy_count,
+        vip_status=vip_status_text
+    )
     
     query = update.callback_query
     
@@ -427,12 +504,10 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(menu_text, reply_markup=reply_markup)
         return
 
+    # Если это нажатие на кнопку, редактируем/заменяем предыдущее сообщение
     message = query.message
-    
-    # >>>>> ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ <<<<<
-    # Если сообщение, с которого пришел запрос, содержит фото
-    if message.photo:
-        # Мы не можем его отредактировать. Удаляем и отправляем новое.
+    if getattr(message, 'photo', None):
+        # Мы не можем отредактировать сообщение с фото. Удаляем и отправляем новое.
         try:
             await message.delete()
         except BadRequest as e:
@@ -466,7 +541,7 @@ def has_creator_panel_access(user_id: int, username: str | None) -> bool:
 
 
 async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает админ панель для Создателя и админов 3 уровня."""
+    """Показывает улучшенную админ панель для Создателя и админов 3 уровня."""
     query = update.callback_query
     await query.answer()
     
@@ -477,18 +552,46 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
+    # Получаем краткую статистику для отображения
+    try:
+        total_users = db.get_total_users_count()
+        active_vip = db.get_active_vip_count()
+        active_vip_plus = db.get_active_vip_plus_count()
+        total_admins = len(db.get_admin_users())
+    except:
+        total_users = active_vip = active_vip_plus = total_admins = 0
+    
     keyboard = [
-        [InlineKeyboardButton("🔄 Сброс ежедневного бонуса", callback_data='creator_reset_bonus')],
-        [InlineKeyboardButton("💰 Выдача монет", callback_data='creator_give_coins')],
-        [InlineKeyboardButton("📊 Статистика пользователя", callback_data='creator_user_stats')],
+        [InlineKeyboardButton("📈 Статистика бота", callback_data='admin_bot_stats')],
+        [InlineKeyboardButton("📊 Расширенная аналитика", callback_data='admin_analytics')],
+        [InlineKeyboardButton("👤 Управление игроками", callback_data='admin_players_menu')],
+        [InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')],
+        [InlineKeyboardButton("📦 Управление складом", callback_data='admin_stock_menu')],
+        [InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')],
         [InlineKeyboardButton("👥 Админы", callback_data='creator_admins')],
+        [InlineKeyboardButton("📢 Рассылка", callback_data='admin_broadcast_menu')],
+        [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
+        [InlineKeyboardButton("⚙️ Настройки бота", callback_data='admin_settings_menu')],
+        [InlineKeyboardButton("🚫 Модерация", callback_data='admin_moderation_menu')],
+        [InlineKeyboardButton("📝 Логи системы", callback_data='admin_logs_menu')],
+        [InlineKeyboardButton("💼 Экономика", callback_data='admin_economy_menu')],
+        [InlineKeyboardButton("🎮 События", callback_data='admin_events_menu')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
+    try:
+        is_creator = bool(user.username) and (user.username in ADMIN_USERNAMES)
+    except Exception:
+        is_creator = False
+    if is_creator:
+        keyboard.insert(-1, [InlineKeyboardButton("🧨 Вайп", callback_data='creator_wipe')])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     text = (
         "⚙️ <b>Админ панель Создателя</b>\n\n"
-        "Выберите действие:"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"💎 VIP: <b>{active_vip}</b> | VIP+: <b>{active_vip_plus}</b>\n"
+        f"🛡️ Администраторов: <b>{total_admins}</b>\n\n"
+        "Выберите раздел:"
     )
     
     try:
@@ -496,6 +599,383 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except BadRequest:
         pass
 
+
+async def creator_wipe_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not (user.username and user.username in ADMIN_USERNAMES):
+        await query.answer("⛔ Доступ только Создателю!", show_alert=True)
+        return
+    kb = [
+        [InlineKeyboardButton("✅ Подтвердить вайп", callback_data='creator_wipe_confirm')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='creator_panel')],
+    ]
+    try:
+        await query.message.edit_text(
+            "⚠️ Вы собираетесь выполнить ПОЛНЫЙ ВАЙП данных.\n\n"
+            "Будут удалены все пользователи, инвентари, логи, промокоды, настройки и прочее.\n"
+            "Список энергетиков будет сохранён.\n\n"
+            "Подтверждаете?",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+
+
+async def creator_wipe_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not (user.username and user.username in ADMIN_USERNAMES):
+        await query.answer("⛔ Доступ только Создателю!", show_alert=True)
+        return
+    try:
+        users = db.get_all_users_for_broadcast()
+    except Exception:
+        users = []
+    try:
+        groups = db.get_enabled_group_chats()
+    except Exception:
+        groups = []
+    notify_text = (
+        "🧨 Глобальный вайп данных бота выполнен.\n\n"
+        "Все пользовательские данные и прогресс были сброшены.\n"
+        "Список энергетиков сохранён."
+    )
+    ok_u = 0
+    ok_g = 0
+    # Сначала уведомляем группы
+    for g in groups or []:
+        try:
+            await context.bot.send_message(chat_id=getattr(g, 'chat_id', None), text=notify_text)
+            ok_g += 1
+            await asyncio.sleep(0.02)
+        except Exception:
+            pass
+    # Затем пользователей
+    for uid in users or []:
+        try:
+            await context.bot.send_message(chat_id=uid, text=notify_text)
+            ok_u += 1
+            await asyncio.sleep(0.02)
+        except Exception:
+            pass
+    try:
+        db.insert_moderation_log(actor_id=user.id, action='wipe_all', details=f'groups={ok_g}, users={ok_u}')
+    except Exception:
+        pass
+    res = False
+    try:
+        res = db.wipe_all_except_drinks()
+    except Exception:
+        res = False
+    text = "✅ Вайп выполнен" if res else "❌ Ошибка при вайпе"
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')]]))
+    except BadRequest:
+        pass
+
+async def admin_mod_ban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
+    try:
+        await query.message.edit_text(
+            "🚫 Бан пользователя\n\nОтправьте: <code>@username</code> или <code>user_id</code> и опционально длительность (например: 1d, 12h, 30m) и причину.\nПримеры:\n<code>@user 7d спам</code>\n<code>123456 1h флуд</code>\n<code>@user</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'mod_ban'
+
+
+async def admin_mod_unban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
+    try:
+        await query.message.edit_text(
+            "✅ Разбан пользователя\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'mod_unban'
+
+
+async def admin_mod_banlist_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    items = db.list_active_bans(limit=50)
+    if not items:
+        text = "📋 Активные баны: нет"
+    else:
+        lines = ["📋 Активные баны:"]
+        for it in items:
+            uid = it['user_id']
+            until = it.get('banned_until')
+            until_str = safe_format_timestamp(until) if until else 'навсегда'
+            reason = it.get('reason') or '—'
+            lines.append(f"• {uid} — до: {until_str} — {reason}")
+        text = "\n".join(lines)
+    kb = [[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+
+
+async def admin_mod_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
+    try:
+        await query.message.edit_text(
+            "🔍 Проверка игрока\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'mod_check'
+
+
+async def admin_mod_history_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    logs = db.get_moderation_logs(limit=30)
+    if not logs:
+        text = "📝 История модерации пуста"
+    else:
+        lines = ["📝 История модерации:"]
+        for r in logs:
+            ts = safe_format_timestamp(r.get('ts')) or '—'
+            act = r.get('action')
+            tgt = r.get('target_id')
+            det = r.get('details') or ''
+            lines.append(f"• {ts} — {act} → {tgt} {('— ' + det) if det else ''}")
+        text = "\n".join(lines[:50])
+    kb = [[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+
+
+async def admin_mod_warnings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Выдать предупреждение", callback_data='admin_warn_add')],
+        [InlineKeyboardButton("📄 Список предупреждений", callback_data='admin_warn_list')],
+        [InlineKeyboardButton("🗑️ Очистить предупреждения", callback_data='admin_warn_clear')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')],
+    ])
+    try:
+        await query.message.edit_text("⚠️ Предупреждения: выберите действие", reply_markup=kb)
+    except BadRequest:
+        pass
+
+
+async def admin_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
+    try:
+        await query.message.edit_text(
+            "➕ Выдать предупреждение\n\nОтправьте: <code>@username</code> или <code>user_id</code> и причину\nПример: <code>@user спам</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'warn_add'
+
+
+async def admin_warn_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
+    try:
+        await query.message.edit_text(
+            "📄 Список предупреждений\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'warn_list'
+
+
+async def admin_warn_clear_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
+    try:
+        await query.message.edit_text(
+            "🗑️ Очистка предупреждений\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'warn_clear'
+
+
+def _parse_duration_to_seconds(s: str | None) -> int | None:
+    if not s:
+        return None
+    s = s.strip().lower()
+    m = re.fullmatch(r"(\d+)([smhd])", s)
+    if not m:
+        try:
+            val = int(s)
+            return val if val > 0 else None
+        except Exception:
+            return None
+    num = int(m.group(1))
+    unit = m.group(2)
+    mult = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}.get(unit, 1)
+    return num * mult
+
+
+def _resolve_user_identifier(text: str) -> int | None:
+    t = (text or '').strip()
+    if not t:
+        return None
+    # Поддерживаем @username и username с цифрами/подчёркиваниями
+    uname = t[1:] if t.startswith('@') else t
+    if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
+        p = db.get_player_by_username(uname)
+        return int(getattr(p, 'user_id', 0)) if p else None
+    try:
+        return int(t)
+    except Exception:
+        return None
+
+
+async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Проверяет бан пользователя и, если активен, показывает причину и блокирует действие."""
+    try:
+        user = update.effective_user
+        if not user:
+            return False
+        ban = db.get_active_ban(user.id)
+        if not ban:
+            return False
+        reason = ban.get('reason') or '—'
+        until = ban.get('banned_until')
+        until_str = safe_format_timestamp(until) if until else 'навсегда'
+        text = (
+            "🚫 Ваш аккаунт заблокирован.\n"
+            f"Причина: {html.escape(reason)}\n"
+            f"Срок: {until_str}"
+        )
+        q = getattr(update, 'callback_query', None)
+        if q:
+            try:
+                await q.answer(text, show_alert=True)
+            except Exception:
+                pass
+        else:
+            try:
+                await reply_auto_delete_message(update.effective_message, text, context=context)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+async def show_admin_settings_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
+    bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
+    text = (
+        "⏱️ <b>Кулдауны</b>\n\n"
+        f"Поиск: <b>{int(search_cd // 60)} мин</b> ({search_cd} сек)\n"
+        f"Ежедневный бонус: <b>{int(bonus_cd // 3600)} ч</b> ({bonus_cd} сек)\n\n"
+        "Выберите, что изменить:"
+    )
+    kb = [
+        [InlineKeyboardButton("Изменить поиск", callback_data='admin_settings_set_search_cd')],
+        [InlineKeyboardButton("Изменить бонус", callback_data='admin_settings_set_bonus_cd')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
+    ]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_settings_set_search_cd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_cooldowns')]]
+    try:
+        await query.message.edit_text("Введите новый кулдаун поиска в секундах:", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_search_cd'
+
+
+async def admin_settings_set_bonus_cd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_cooldowns')]]
+    try:
+        await query.message.edit_text("Введите новый кулдаун ежедневного бонуса в секундах:", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_bonus_cd'
 
 async def creator_reset_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает процесс сброса ежедневного бонуса."""
@@ -597,7 +1077,7 @@ async def creator_handle_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not action:
         return
     
-    text_input = update.message.text.strip()
+    text_input = (update.message.text or update.message.caption or "").strip()
     
     if action == 'reset_bonus':
         await handle_reset_bonus(update, context, text_input)
@@ -613,9 +1093,475 @@ async def creator_handle_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await handle_admin_demote(update, context, text_input)
     elif action == 'admin_remove':
         await handle_admin_remove(update, context, text_input)
+    elif action == 'vip_give':
+        await handle_vip_give(update, context, text_input)
+    elif action == 'vip_plus_give':
+        await handle_vip_plus_give(update, context, text_input)
+    elif action == 'vip_remove':
+        await handle_vip_remove(update, context, text_input)
+    elif action == 'vip_plus_remove':
+        await handle_vip_plus_remove(update, context, text_input)
+    elif action == 'broadcast':
+        await handle_broadcast(update, context, text_input)
+    elif action == 'player_search':
+        await handle_player_search(update, context, text_input)
     
     # Очищаем состояние
     context.user_data.pop('awaiting_creator_action', None)
+
+
+async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовый ввод для новых админ команд (энергетики, логи, управление игроками)."""
+    user = update.effective_user
+    
+    if not has_creator_panel_access(user.id, user.username):
+        return
+    
+    action = context.user_data.get('awaiting_admin_action')
+    player_action = context.user_data.get('admin_player_action')
+    
+    if not action and not player_action:
+        return
+    
+    text_input = (update.message.text or update.message.caption or "").strip()
+    
+    if player_action == 'balance':
+        await handle_player_balance(update, context, text_input)
+        context.user_data.pop('admin_player_action', None)
+        context.user_data.pop('admin_player_id', None)
+    elif action:
+        if action == 'drink_add':
+            await handle_drink_add(update, context, text_input)
+        elif action == 'drink_edit':
+            await handle_drink_edit(update, context, text_input)
+        elif action == 'drink_delete':
+            await handle_drink_delete(update, context, text_input)
+        elif action == 'drink_search':
+            await handle_drink_search(update, context, text_input)
+        elif action == 'drink_rename_id':
+            try:
+                did = int(text_input)
+                d = db.get_drink_by_id(did)
+                if not d:
+                    await update.message.reply_html("❌ Энергетик не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+                else:
+                    context.user_data['edit_drink_id'] = did
+                    context.user_data['awaiting_admin_action'] = 'drink_rename_value'
+                    await update.message.reply_html("Отправьте новое название", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
+                    return
+            except Exception:
+                await update.message.reply_html("❌ ID должен быть числом", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
+        elif action == 'drink_rename_value':
+            did = context.user_data.get('edit_drink_id')
+            if not did:
+                await update.message.reply_html("❌ Сессия редактирования не найдена", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+            else:
+                context.user_data['pending_rename'] = text_input
+                d = db.get_drink_by_id(int(did))
+                old_name = (d or {}).get('name') if isinstance(d, dict) else None
+                lines = []
+                if old_name is not None:
+                    lines.append(f"Изменить название: <b>{old_name}</b> → <b>{text_input}</b>")
+                else:
+                    lines.append(f"Изменить название на: <b>{text_input}</b>")
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Подтвердить", callback_data='drink_confirm_rename')],
+                    [InlineKeyboardButton("❌ Отмена", callback_data='drink_cancel_rename')]
+                ])
+                await update.message.reply_html("\n".join(lines), reply_markup=kb)
+        elif action == 'drink_redesc_id':
+            try:
+                did = int(text_input)
+                d = db.get_drink_by_id(did)
+                if not d:
+                    await update.message.reply_html("❌ Энергетик не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+                else:
+                    context.user_data['edit_drink_id'] = did
+                    context.user_data['awaiting_admin_action'] = 'drink_redesc_value'
+                    await update.message.reply_html("Отправьте новое описание", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
+                    return
+            except Exception:
+                await update.message.reply_html("❌ ID должен быть числом", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
+        elif action == 'drink_redesc_value':
+            did = context.user_data.get('edit_drink_id')
+            if not did:
+                await update.message.reply_html("❌ Сессия редактирования не найдена", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+            else:
+                context.user_data['pending_redesc'] = text_input
+                d = db.get_drink_by_id(int(did))
+                old_desc = (d or {}).get('description') if isinstance(d, dict) else None
+                lines = []
+                if old_desc is not None:
+                    lines.append("Изменить описание:")
+                    lines.append(f"<i>{old_desc[:300]}</i>")
+                    lines.append("→")
+                    lines.append(f"<i>{text_input[:300]}</i>")
+                else:
+                    lines.append("Новое описание:")
+                    lines.append(f"<i>{text_input[:300]}</i>")
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Подтвердить", callback_data='drink_confirm_redesc')],
+                    [InlineKeyboardButton("❌ Отмена", callback_data='drink_cancel_redesc')]
+                ])
+                await update.message.reply_html("\n".join(lines), reply_markup=kb)
+        elif action == 'drink_update_photo_id':
+            try:
+                did = int(text_input)
+                d = db.get_drink_by_id(did)
+                if not d:
+                    await update.message.reply_html("❌ Энергетик не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+                else:
+                    context.user_data['edit_drink_id'] = did
+                    context.user_data['awaiting_admin_action'] = 'drink_update_photo_wait_file'
+                    await update.message.reply_html("Пришлите фото напитка", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
+                    return
+            except Exception:
+                await update.message.reply_html("❌ ID должен быть числом", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
+        elif action == 'logs_player':
+            await handle_logs_player(update, context, text_input)
+        elif action == 'promo_create':
+            await handle_promo_create(update, context, text_input)
+        elif action == 'promo_deactivate':
+            await handle_promo_deactivate(update, context, text_input)
+        elif action == 'broadcast':
+            if getattr(update.message, 'audio', None):
+                await handle_admin_broadcast_audio(update, context, text_input)
+            else:
+                await handle_admin_broadcast(update, context, text_input)
+        elif action == 'settings_set_search_cd':
+            kb = [[InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')]]
+            try:
+                new_cd = int(text_input.strip())
+                if new_cd <= 0:
+                    raise ValueError
+                ok = db.set_setting_int('search_cooldown', new_cd)
+                if ok:
+                    await update.message.reply_html(f"✅ Кулдаун поиска обновлён: <b>{new_cd}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число секунд (>0)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_bonus_cd':
+            kb = [[InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')]]
+            try:
+                new_cd = int(text_input.strip())
+                if new_cd <= 0:
+                    raise ValueError
+                ok = db.set_setting_int('daily_bonus_cooldown', new_cd)
+                if ok:
+                    await update.message.reply_html(f"✅ Кулдаун ежедневного бонуса обновлён: <b>{new_cd}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число секунд (>0)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'mod_ban':
+            # Формат: <id|@username> [duration] [reason...]
+            parts = text_input.split(maxsplit=2)
+            if not parts:
+                await update.message.reply_html("❌ Укажите пользователя. Пример: <code>@user 7d спам</code>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]))
+            else:
+                ident = parts[0]
+                duration_sec = None
+                reason = None
+                if len(parts) >= 2:
+                    d = _parse_duration_to_seconds(parts[1])
+                    if d:
+                        duration_sec = d
+                        if len(parts) == 3:
+                            reason = parts[2]
+                    else:
+                        # duration не распознан — считаем это началом причины
+                        reason = " ".join(parts[1:])
+                uid = _resolve_user_identifier(ident)
+                if not uid:
+                    await update.message.reply_html(
+                        "❌ Пользователь не найден.\n\n"
+                        "Подсказка:\n"
+                        "• Попросите пользователя написать боту /start (чтобы он появился в базе)\n"
+                        "• Либо введите его числовой ID",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]])
+                    )
+                else:
+                    if db.is_protected_user(uid):
+                        await update.message.reply_html(
+                            "⛔ Нельзя банить администратора или создателя",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]])
+                        )
+                    else:
+                        ok = db.ban_user(uid, banned_by=update.effective_user.id, reason=reason, duration_seconds=duration_sec)
+                        if ok:
+                            until_str = None
+                            if duration_sec:
+                                until_str = safe_format_timestamp(int(time.time()) + int(duration_sec))
+                            text = f"✅ Пользователь {uid} забанен" + (f" до {until_str}" if until_str else " навсегда")
+                            if reason:
+                                text += f"\nПричина: {html.escape(reason)}"
+                            await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]]))
+                        else:
+                            await update.message.reply_html("❌ Не удалось забанить пользователя", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]))
+        elif action == 'mod_unban':
+            ident = text_input.strip()
+            uid = _resolve_user_identifier(ident)
+            if not uid:
+                await update.message.reply_html(
+                    "❌ Пользователь не найден.\n\n"
+                    "Подсказка:\n"
+                    "• Попросите пользователя написать боту /start\n"
+                    "• Либо введите его числовой ID",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]])
+                )
+            else:
+                ok = db.unban_user(uid, unbanned_by=update.effective_user.id)
+                await update.message.reply_html("✅ Пользователь разбанен" if ok else "❌ Не удалось разбанить пользователя", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]]))
+        elif action == 'mod_check':
+            ident = text_input.strip()
+            uid = _resolve_user_identifier(ident)
+            if not uid:
+                await update.message.reply_html("❌ Пользователь не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]))
+            else:
+                player = db.get_player(uid)
+                banned = db.is_user_banned(uid)
+                warns = db.get_warnings(uid, limit=50)
+                vip = db.is_vip(uid)
+                vip_plus = db.is_vip_plus(uid)
+                username = getattr(player, 'username', None) if player else None
+                text_lines = [
+                    "🔍 <b>Проверка игрока</b>",
+                    f"ID: <b>{uid}</b>",
+                    f"Username: <b>@{html.escape(username)}</b>" if username else "Username: —",
+                    f"Баланс: <b>{getattr(player, 'coins', 0) if player else 0}</b>",
+                    f"VIP: {'активен' if vip else '—'} | VIP+: {'активен' if vip_plus else '—'}",
+                    f"Статус: {'🚫 Забанен' if banned else '✅ Активен'}",
+                    f"Предупреждений: <b>{len(warns)}</b>",
+                ]
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]])
+                await update.message.reply_html("\n".join(text_lines), reply_markup=kb)
+        elif action == 'warn_add':
+            parts = text_input.split(maxsplit=1)
+            if not parts:
+                await update.message.reply_html("❌ Укажите пользователя", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]]))
+            else:
+                ident = parts[0]
+                reason = parts[1] if len(parts) > 1 else None
+                uid = _resolve_user_identifier(ident)
+                if not uid:
+                    await update.message.reply_html(
+                        "❌ Пользователь не найден.\n\n"
+                        "Подсказка:\n"
+                        "• Попросите пользователя написать боту /start\n"
+                        "• Либо введите его числовой ID",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]])
+                    )
+                else:
+                    ok = db.add_warning(uid, issued_by=update.effective_user.id, reason=reason)
+                    await update.message.reply_html("✅ Предупреждение выдано" if ok else "❌ Не удалось выдать предупреждение", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
+        elif action == 'warn_list':
+            ident = text_input.strip()
+            uid = _resolve_user_identifier(ident)
+            if not uid:
+                await update.message.reply_html(
+                    "❌ Пользователь не найден.\n\n"
+                    "Подсказка:\n"
+                    "• Попросите пользователя написать боту /start\n"
+                    "• Либо введите его числовой ID",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]])
+                )
+            else:
+                items = db.get_warnings(uid, limit=50)
+                if not items:
+                    text = "📄 У пользователя нет предупреждений"
+                else:
+                    lines = ["📄 Предупреждения:"]
+                    for w in items:
+                        ts = safe_format_timestamp(w.get('issued_at')) or '—'
+                        rs = html.escape(w.get('reason') or '')
+                        lines.append(f"• {ts} — {rs}")
+                    text = "\n".join(lines[:100])
+                await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
+        elif action == 'warn_clear':
+            ident = text_input.strip()
+            uid = _resolve_user_identifier(ident)
+            if not uid:
+                await update.message.reply_html("❌ Пользователь не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]]))
+            else:
+                count = db.clear_warnings(uid)
+                await update.message.reply_html(f"🗑️ Удалено предупреждений: <b>{count}</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
+        
+        # Очищаем состояние
+        context.user_data.pop('awaiting_admin_action', None)
+
+
+async def handle_drink_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает добавление энергетика."""
+    keyboard = [[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    parts = [p.strip() for p in text_input.split('|')]
+    if len(parts) != 3:
+        response = "❌ Неверный формат! Используйте: Название | Описание | Специальный (да/нет)"
+    else:
+        name, description, is_special_str = parts
+        is_special = is_special_str.lower() in ['да', 'yes', 'true', '1']
+        
+        success = db.admin_add_drink(name, description, is_special)
+        if success:
+            response = f"✅ Энергетик <b>{name}</b> успешно добавлен!"
+            # Логируем действие
+            db.log_action(
+                user_id=update.effective_user.id,
+                username=update.effective_user.username,
+                action_type='admin_action',
+                action_details=f'Добавлен энергетик: {name}',
+                success=True
+            )
+        else:
+            response = f"❌ Энергетик с таким названием уже существует!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_drink_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает редактирование энергетика."""
+    keyboard = [[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    parts = [p.strip() for p in text_input.split('|')]
+    if len(parts) != 4:
+        response = "❌ Неверный формат! Используйте: ID | Название | Описание | Специальный (да/нет или -)"
+    else:
+        drink_id_str, name, description, is_special_str = parts
+        
+        try:
+            drink_id = int(drink_id_str)
+            
+            # Получаем текущий напиток
+            drink = db.get_drink_by_id(drink_id)
+            if not drink:
+                response = f"❌ Энергетик с ID {drink_id} не найден!"
+            else:
+                # Определяем, что менять
+                new_name = name if name != '-' else None
+                new_description = description if description != '-' else None
+                new_is_special = None
+                if is_special_str != '-':
+                    new_is_special = is_special_str.lower() in ['да', 'yes', 'true', '1']
+                
+                success = db.admin_update_drink(drink_id, new_name, new_description, new_is_special)
+                if success:
+                    response = f"✅ Энергетик <b>{drink['name']}</b> успешно обновлён!"
+                    # Логируем действие
+                    db.log_action(
+                        user_id=update.effective_user.id,
+                        username=update.effective_user.username,
+                        action_type='admin_action',
+                        action_details=f'Изменён энергетик: {drink["name"]} (ID: {drink_id})',
+                        success=True
+                    )
+                else:
+                    response = f"❌ Ошибка при обновлении энергетика!"
+        except ValueError:
+            response = "❌ ID должен быть числом!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_drink_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает удаление энергетика."""
+    keyboard = [[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        drink_id = int(text_input)
+        
+        # Получаем информацию о напитке перед удалением
+        drink = db.get_drink_by_id(drink_id)
+        if not drink:
+            response = f"❌ Энергетик с ID {drink_id} не найден!"
+        else:
+            drink_name = drink['name']
+            success = db.admin_delete_drink(drink_id)
+            if success:
+                response = f"✅ Энергетик <b>{drink_name}</b> (ID: {drink_id}) успешно удалён!"
+                # Логируем действие
+                db.log_action(
+                    user_id=update.effective_user.id,
+                    username=update.effective_user.username,
+                    action_type='admin_action',
+                    action_details=f'Удалён энергетик: {drink_name} (ID: {drink_id})',
+                    success=True
+                )
+            else:
+                response = f"❌ Ошибка при удалении энергетика!"
+    except ValueError:
+        response = "❌ ID должен быть числом!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_drink_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает поиск энергетика."""
+    keyboard = [[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    drinks = db.search_drinks_by_name(text_input)
+    
+    if drinks:
+        response = f"🔍 <b>Результаты поиска: \"{text_input}\"</b>\n\n"
+        response += f"Найдено: <b>{len(drinks)}</b> напитков\n\n"
+        
+        for drink in drinks[:20]:  # Показываем первые 20
+            special = "⭐" if drink['is_special'] else ""
+            img = "🖼️" if drink['has_image'] else ""
+            response += f"{special}{img} <b>{drink['name']}</b> (ID: {drink['id']})\n"
+            response += f"<i>{drink['description'][:50]}...</i>\n\n"
+        
+        if len(drinks) > 20:
+            response += f"<i>...и ещё {len(drinks) - 20} напитков</i>"
+    else:
+        response = f"❌ Напитки по запросу \"{text_input}\" не найдены"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_logs_player(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает просмотр логов конкретного игрока."""
+    keyboard = [[InlineKeyboardButton("📝 Логи системы", callback_data='admin_logs_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Определяем, это username или user_id
+    player = None
+    if text_input.startswith('@'):
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+    else:
+        try:
+            user_id = int(text_input)
+            player = db.get_or_create_player(user_id, f"User{user_id}")
+        except ValueError:
+            pass
+    
+    if not player:
+        response = f"❌ Пользователь {text_input} не найден!"
+    else:
+        logs = db.get_user_logs(player.user_id, limit=15)
+        
+        response = f"👤 <b>Логи игрока @{player.username or player.user_id}</b>\n\n"
+        
+        if logs:
+            for log in logs:
+                status = "✅" if log['success'] else "❌"
+                timestamp_str = safe_format_timestamp(log['timestamp'])
+                response += f"{status} <i>{log['action_type']}</i>\n"
+                if log['action_details']:
+                    response += f"├ {log['action_details'][:50]}\n"
+                if log['amount']:
+                    sign = "+" if log['amount'] > 0 else ""
+                    response += f"├ {sign}{log['amount']} 💰\n"
+                response += f"└ {timestamp_str}\n\n"
+        else:
+            response += "<i>Логов для этого игрока пока нет</i>"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
 
 
 async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
@@ -661,6 +1607,16 @@ async def handle_give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             player = db.get_player_by_username(username)
             if player:
                 new_balance = db.increment_coins(player.user_id, amount)
+                # Логируем транзакцию
+                admin_user = update.effective_user
+                db.log_action(
+                    user_id=player.user_id,
+                    username=username,
+                    action_type='transaction',
+                    action_details=f'Админская выдача: выдано админом @{admin_user.username or admin_user.first_name}',
+                    amount=amount,
+                    success=True
+                )
                 response = f"✅ Выдано <b>{amount}</b> септимов пользователю @{username}\nНовый баланс: <b>{new_balance}</b>"
             else:
                 response = f"❌ Пользователь @{username} не найден!"
@@ -712,6 +1668,117 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             response = f"❌ Пользователь @{username} не найден!"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_player_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает поиск игрока."""
+    player = None
+    
+    if text_input.startswith('@'):
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+    else:
+        try:
+            user_id = int(text_input)
+            dbs = SessionLocal()
+            try:
+                player = dbs.query(Player).filter(Player.user_id == user_id).first()
+            finally:
+                dbs.close()
+        except ValueError:
+            pass
+    
+    if player:
+        await show_player_details(update, context, player.user_id)
+    else:
+        keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        response = f"❌ Игрок не найден!\n\nИспользуйте:\n• <code>@username</code>\n• <code>user_id</code>"
+        await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает изменение баланса игрока."""
+    player_id = context.user_data.get('admin_player_id')
+    if not player_id:
+        response = "❌ Ошибка: ID игрока не найден!"
+        keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_html(response, reply_markup=reply_markup)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if not player:
+            response = "❌ Игрок не найден!"
+            keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_html(response, reply_markup=reply_markup)
+            return
+        
+        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        current_balance = player.coins
+        
+        # Парсим ввод
+        text_input = text_input.strip()
+        new_balance = None
+        
+        if text_input.startswith('+'):
+            # Добавить
+            try:
+                amount = int(text_input[1:])
+                new_balance = db.increment_coins(player_id, amount)
+                # Логируем транзакцию
+                admin_user = update.effective_user
+                db.log_action(
+                    user_id=player_id,
+                    username=username_display,
+                    action_type='transaction',
+                    action_details=f'Админская выдача: добавлено админом @{admin_user.username or admin_user.first_name}',
+                    amount=amount,
+                    success=True
+                )
+                response = f"✅ Добавлено <b>{amount:,}</b> септимов игроку {username_display}\nНовый баланс: <b>{new_balance:,}</b> 🪙"
+            except ValueError:
+                response = "❌ Неверный формат! Используйте число после +"
+        elif text_input.startswith('-'):
+            # Убрать
+            try:
+                amount = int(text_input[1:])
+                result = db.decrement_coins(player_id, amount)
+                if result['ok']:
+                    new_balance = result['new_balance']
+                    # Логируем транзакцию
+                    admin_user = update.effective_user
+                    db.log_action(
+                        user_id=player_id,
+                        username=username_display,
+                        action_type='transaction',
+                        action_details=f'Админское снятие: убрано админом @{admin_user.username or admin_user.first_name}',
+                        amount=-amount,
+                        success=True
+                    )
+                    response = f"✅ Убрано <b>{amount:,}</b> септимов у игрока {username_display}\nНовый баланс: <b>{new_balance:,}</b> 🪙"
+                else:
+                    response = f"❌ {result.get('reason', 'Ошибка при уменьшении баланса')}"
+            except ValueError:
+                response = "❌ Неверный формат! Используйте число после -"
+        else:
+            # Установить баланс
+            try:
+                amount = int(text_input)
+                db.update_player(player_id, coins=amount)
+                new_balance = amount
+                response = f"✅ Баланс игрока {username_display} установлен: <b>{new_balance:,}</b> 🪙"
+            except ValueError:
+                response = "❌ Неверный формат! Используйте число для установки баланса"
+        
+        keyboard = [[InlineKeyboardButton("🔙 К игроку", callback_data=f'admin_player_details:{player_id}')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_html(response, reply_markup=reply_markup)
+    finally:
+        dbs.close()
 
 
 async def handle_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
@@ -827,6 +1894,162 @@ async def handle_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE
                     response = f"✅ Админ @{username} (уровень {current_level}) уволен!"
                 else:
                     response = "❌ Ошибка при увольнении админа!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_vip_give(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает выдачу VIP."""
+    keyboard = [[InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    parts = text_input.split()
+    if len(parts) != 2 or not parts[0].startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username дни"
+    else:
+        username = parts[0][1:]
+        try:
+            days = int(parts[1])
+            player = db.get_player_by_username(username)
+            if player:
+                duration_seconds = days * 86400
+                success = db.set_vip_for_user(player.user_id, duration_seconds)
+                if success:
+                    response = f"✅ VIP выдан пользователю @{username} на <b>{days}</b> дней!"
+                else:
+                    response = "❌ Ошибка при выдаче VIP!"
+            else:
+                response = f"❌ Пользователь @{username} не найден!"
+        except ValueError:
+            response = "❌ Количество дней должно быть числом!"
+        except Exception as e:
+            logger.error(f"Ошибка выдачи VIP: {e}")
+            response = f"❌ Ошибка: {e}"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_vip_plus_give(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает выдачу VIP+."""
+    keyboard = [[InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    parts = text_input.split()
+    if len(parts) != 2 or not parts[0].startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username дни"
+    else:
+        username = parts[0][1:]
+        try:
+            days = int(parts[1])
+            player = db.get_player_by_username(username)
+            if player:
+                duration_seconds = days * 86400
+                success = db.set_vip_plus_for_user(player.user_id, duration_seconds)
+                if success:
+                    response = f"✅ VIP+ выдан пользователю @{username} на <b>{days}</b> дней!"
+                else:
+                    response = "❌ Ошибка при выдаче VIP+!"
+            else:
+                response = f"❌ Пользователь @{username} не найден!"
+        except ValueError:
+            response = "❌ Количество дней должно быть числом!"
+        except Exception as e:
+            logger.error(f"Ошибка выдачи VIP+: {e}")
+            response = f"❌ Ошибка: {e}"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_vip_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает отзыв VIP."""
+    keyboard = [[InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input.startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username"
+    else:
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+        if player:
+            success = db.remove_vip_from_user(player.user_id)
+            if success:
+                response = f"✅ VIP отозван у пользователя @{username}!"
+            else:
+                response = "❌ Ошибка при отзыве VIP!"
+        else:
+            response = f"❌ Пользователь @{username} не найден!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_vip_plus_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает отзыв VIP+."""
+    keyboard = [[InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input.startswith('@'):
+        response = "❌ Неверный формат! Используйте: @username"
+    else:
+        username = text_input[1:]
+        player = db.get_player_by_username(username)
+        if player:
+            success = db.remove_vip_plus_from_user(player.user_id)
+            if success:
+                response = f"✅ VIP+ отозван у пользователя @{username}!"
+            else:
+                response = "❌ Ошибка при отзыве VIP+!"
+        else:
+            response = f"❌ Пользователь @{username} не найден!"
+    
+    await update.message.reply_html(response, reply_markup=reply_markup)
+
+
+async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    """Обрабатывает рассылку сообщений."""
+    keyboard = [[InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if not text_input or len(text_input) < 3:
+        response = "❌ Сообщение слишком короткое!"
+        await update.message.reply_html(response, reply_markup=reply_markup)
+        return
+    
+    # Получаем список всех пользователей
+    user_ids = db.get_all_users_for_broadcast()
+    total = len(user_ids)
+    
+    await update.message.reply_html(
+        f"📢 <b>Начинаю рассылку...</b>\n\n"
+        f"Всего пользователей: {total}\n"
+        f"Это может занять некоторое время.",
+        reply_markup=reply_markup
+    )
+    
+    # Отправляем сообщения
+    success_count = 0
+    fail_count = 0
+    
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=text_input,
+                parse_mode='HTML'
+            )
+            success_count += 1
+            # Небольшая задержка, чтобы не превысить лимиты Telegram
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            fail_count += 1
+            logger.warning(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+    
+    # Отчёт
+    response = (
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📨 Отправлено: <b>{success_count}</b>\n"
+        f"❌ Не отправлено: <b>{fail_count}</b>\n"
+        f"📊 Всего: <b>{total}</b>"
+    )
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -988,6 +2211,2174 @@ async def creator_admin_remove_start(update: Update, context: ContextTypes.DEFAU
     context.user_data['awaiting_creator_action'] = 'admin_remove'
 
 
+# --- Новые обработчики улучшенной админ панели ---
+
+async def show_bot_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает детальную статистику бота."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем статистику
+    stats = db.get_bot_statistics()
+    
+    text = (
+        "📈 <b>Статистика бота</b>\n\n"
+        "<b>👥 Пользователи:</b>\n"
+        f"• Всего: {stats.get('total_users', 0)}\n"
+        f"• Активны сегодня: {stats.get('active_today', 0)}\n"
+        f"• Активны за неделю: {stats.get('active_week', 0)}\n\n"
+        "<b>💎 VIP:</b>\n"
+        f"• VIP: {stats.get('active_vip', 0)}\n"
+        f"• VIP+: {stats.get('active_vip_plus', 0)}\n\n"
+        "<b>🥤 Напитки:</b>\n"
+        f"• Всего видов: {stats.get('total_drinks', 0)}\n"
+        f"• В инвентарях: {stats.get('total_inventory_items', 0)}\n\n"
+        "<b>💰 Экономика:</b>\n"
+        f"• Всего монет: {stats.get('total_coins', 0):,}\n\n"
+        "<b>🛍️ Покупки:</b>\n"
+        f"• Всего покупок: {stats.get('total_purchases', 0)}\n"
+        f"• Сегодня: {stats.get('purchases_today', 0)}\n\n"
+        "<b>🏆 Топ-5 по монетам:</b>\n"
+    )
+    
+    for i, (user_id, username, coins) in enumerate(stats.get('top_coins', [])[:5], 1):
+        username_display = f"@{username}" if username else f"ID:{user_id}"
+        text += f"{i}. {username_display} — {coins:,} 🪙\n"
+    
+    text += "\n<b>🥤 Топ-5 по напиткам:</b>\n"
+    for i, (user_id, username, total) in enumerate(stats.get('top_drinks', [])[:5], 1):
+        username_display = f"@{username}" if username else f"ID:{user_id}"
+        text += f"{i}. {username_display} — {total}\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_bot_stats')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_players_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления игроками."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем статистику
+    total_users = db.get_total_users_count()
+    active_vip = db.get_active_vip_count()
+    active_vip_plus = db.get_active_vip_plus_count()
+    
+    keyboard = [
+        [InlineKeyboardButton("🔍 Поиск игрока", callback_data='admin_player_search')],
+        [InlineKeyboardButton("📋 Список игроков", callback_data='admin_players_list')],
+        [InlineKeyboardButton("💰 Выдать монеты", callback_data='creator_give_coins')],
+        [InlineKeyboardButton("🔄 Сбросить бонус", callback_data='creator_reset_bonus')],
+        [InlineKeyboardButton("📊 Статистика игрока", callback_data='creator_user_stats')],
+        [InlineKeyboardButton("💎 Топ игроков", callback_data='admin_players_top')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "👤 <b>Управление игроками</b>\n\n"
+        f"👥 Всего игроков: <b>{total_users}</b>\n"
+        f"💎 VIP: <b>{active_vip}</b> | VIP+: <b>{active_vip_plus}</b>\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_player_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс поиска игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "🔍 <b>Поиск игрока</b>\n\n"
+        "Отправьте:\n"
+        "• <code>@username</code> - для поиска по username\n"
+        "• <code>user_id</code> - для поиска по ID (число)\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_players_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'player_search'
+    return 'AWAITING_INPUT'
+
+
+async def admin_players_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список игроков с фильтрами."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем список фильтров из callback_data если есть
+    filter_type = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            filter_type = parts[1]
+    
+    dbs = SessionLocal()
+    try:
+        current_time = int(time.time())
+        
+        if filter_type == 'vip':
+            players = dbs.query(Player).filter(Player.vip_until > current_time).order_by(Player.coins.desc()).limit(20).all()
+            title = "💎 <b>Игроки с VIP</b>\n\n"
+        elif filter_type == 'vip_plus':
+            players = dbs.query(Player).filter(Player.vip_plus_until > current_time).order_by(Player.coins.desc()).limit(20).all()
+            title = "⭐ <b>Игроки с VIP+</b>\n\n"
+        elif filter_type == 'top':
+            players = dbs.query(Player).order_by(Player.coins.desc()).limit(20).all()
+            title = "💎 <b>Топ игроков по балансу</b>\n\n"
+        else:
+            players = dbs.query(Player).order_by(Player.user_id.desc()).limit(20).all()
+            title = "📋 <b>Список игроков</b> (последние 20)\n\n"
+        
+        text = title
+        
+        if players:
+            for idx, player in enumerate(players, 1):
+                username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+                vip_status = ""
+                if player.vip_plus_until and current_time < player.vip_plus_until:
+                    vip_status = " ⭐VIP+"
+                elif player.vip_until and current_time < player.vip_until:
+                    vip_status = " 💎VIP"
+                text += f"{idx}. {username_display}{vip_status}\n"
+                text += f"   💰 <b>{player.coins}</b> септимов\n\n"
+        else:
+            text += "<i>Игроки не найдены</i>\n\n"
+    finally:
+        dbs.close()
+    
+    keyboard = [
+        [InlineKeyboardButton("💎 VIP игроки", callback_data='admin_players_list:vip')],
+        [InlineKeyboardButton("⭐ VIP+ игроки", callback_data='admin_players_list:vip_plus')],
+        [InlineKeyboardButton("🏆 Топ по балансу", callback_data='admin_players_list:top')],
+        [InlineKeyboardButton("📋 Все игроки", callback_data='admin_players_list:all')],
+        [InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_players_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает топ игроков."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        top_players = dbs.query(Player).order_by(Player.coins.desc()).limit(10).all()
+        
+        text = "🏆 <b>Топ 10 игроков по балансу</b>\n\n"
+        
+        if top_players:
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            current_time = int(time.time())
+            
+            for idx, player in enumerate(top_players):
+                medal = medals[idx] if idx < len(medals) else f"{idx + 1}."
+                username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+                vip_status = ""
+                if player.vip_plus_until and current_time < player.vip_plus_until:
+                    vip_status = " ⭐VIP+"
+                elif player.vip_until and current_time < player.vip_until:
+                    vip_status = " 💎VIP"
+                
+                text += f"{medal} {username_display}{vip_status}\n"
+                text += f"   💰 <b>{player.coins:,}</b> септимов\n\n"
+        else:
+            text += "<i>Игроки не найдены</i>\n\n"
+    finally:
+        dbs.close()
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_players_top')],
+        [InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE, player_id: int = None):
+    """Показывает детальную информацию об игроке."""
+    query = update.callback_query if hasattr(update, 'callback_query') and update.callback_query else None
+    
+    # Если это callback с данными
+    if query and query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        if query:
+            await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    user = query.from_user if query else update.effective_user
+    if not has_creator_panel_access(user.id, user.username):
+        if query:
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        
+        if not player:
+            text = f"❌ Игрок с ID {player_id} не найден!"
+            keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            if query:
+                try:
+                    await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+                except BadRequest:
+                    pass
+            else:
+                await update.message.reply_html(text, reply_markup=reply_markup)
+            return
+        
+        # Получаем дополнительную информацию
+        inventory = db.get_player_inventory_with_details(player_id)
+        inventory_count = len(inventory)
+        
+        current_time = int(time.time())
+        vip_status = "Нет"
+        if player.vip_plus_until and current_time < player.vip_plus_until:
+            vip_status = f"⭐ VIP+ до {safe_format_timestamp(player.vip_plus_until)}"
+        elif player.vip_until and current_time < player.vip_until:
+            vip_status = f"💎 VIP до {safe_format_timestamp(player.vip_until)}"
+        
+        last_bonus = safe_format_timestamp(player.last_bonus_claim) if player.last_bonus_claim else "Никогда"
+        last_search = safe_format_timestamp(player.last_search) if player.last_search else "Никогда"
+        
+        # Проверяем, является ли игрок админом
+        admin_level = db.get_admin_level(player_id)
+        admin_status = f"Уровень {admin_level}" if admin_level > 0 else "Нет"
+        
+        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        
+        text = (
+            f"👤 <b>Информация об игроке</b>\n\n"
+            f"<b>Username:</b> {username_display}\n"
+            f"<b>ID:</b> <code>{player.user_id}</code>\n"
+            f"<b>Баланс:</b> <b>{player.coins:,}</b> 🪙\n"
+            f"<b>Инвентарь:</b> {inventory_count} предметов\n"
+            f"<b>VIP статус:</b> {vip_status}\n"
+            f"<b>Админ:</b> {admin_status}\n"
+            f"<b>Последний поиск:</b> {last_search}\n"
+            f"<b>Последний бонус:</b> {last_bonus}\n"
+            f"<b>Язык:</b> {player.language}\n"
+            f"<b>Автопоиск:</b> {'✅' if player.auto_search_enabled else '❌'}"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("💰 Изменить баланс", callback_data=f'admin_player_balance:{player_id}')],
+            [InlineKeyboardButton("💎 Управление VIP", callback_data=f'admin_player_vip:{player_id}')],
+            [InlineKeyboardButton("📝 Логи игрока", callback_data=f'admin_player_logs:{player_id}')],
+            [InlineKeyboardButton("🔄 Сбросить бонус", callback_data=f'admin_player_reset_bonus:{player_id}')],
+            [InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')],
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if query:
+            try:
+                await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except BadRequest:
+                pass
+        else:
+            await update.message.reply_html(text, reply_markup=reply_markup)
+    finally:
+        dbs.close()
+
+
+async def admin_player_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс изменения баланса игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем player_id из callback_data
+    player_id = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    context.user_data['admin_player_action'] = 'balance'
+    context.user_data['admin_player_id'] = player_id
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if player:
+            username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+            text = (
+                f"💰 <b>Изменение баланса</b>\n\n"
+                f"Игрок: {username_display}\n"
+                f"Текущий баланс: <b>{player.coins:,}</b> 🪙\n\n"
+                f"Отправьте новое количество монет или изменение:\n"
+                f"• <code>1000</code> - установить баланс\n"
+                f"• <code>+500</code> - добавить\n"
+                f"• <code>-200</code> - убрать\n\n"
+                f"Или нажмите Отмена"
+            )
+        else:
+            text = "❌ Игрок не найден!"
+    finally:
+        dbs.close()
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data=f'admin_player_details:{player_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_player_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления VIP для конкретного игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем player_id из callback_data
+    player_id = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if not player:
+            await query.answer("❌ Игрок не найден", show_alert=True)
+            return
+        
+        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        current_time = int(time.time())
+        
+        vip_status = "Нет"
+        if player.vip_plus_until and current_time < player.vip_plus_until:
+            vip_status = f"⭐ VIP+ до {safe_format_timestamp(player.vip_plus_until)}"
+        elif player.vip_until and current_time < player.vip_until:
+            vip_status = f"💎 VIP до {safe_format_timestamp(player.vip_until)}"
+        
+        text = (
+            f"💎 <b>Управление VIP</b>\n\n"
+            f"Игрок: {username_display}\n"
+            f"Текущий статус: {vip_status}\n\n"
+            f"Выберите действие:"
+        )
+    finally:
+        dbs.close()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Выдать VIP", callback_data=f'admin_player_vip_give:{player_id}')],
+        [InlineKeyboardButton("➕ Выдать VIP+", callback_data=f'admin_player_vip_plus_give:{player_id}')],
+        [InlineKeyboardButton("❌ Отозвать VIP", callback_data=f'admin_player_vip_remove:{player_id}')],
+        [InlineKeyboardButton("❌ Отозвать VIP+", callback_data=f'admin_player_vip_plus_remove:{player_id}')],
+        [InlineKeyboardButton("🔙 Назад", callback_data=f'admin_player_details:{player_id}')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_player_logs_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает логи конкретного игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем player_id из callback_data
+    player_id = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if not player:
+            await query.answer("❌ Игрок не найден", show_alert=True)
+            return
+        
+        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        logs = db.get_user_logs(player_id, limit=15)
+        
+        text = f"📝 <b>Логи игрока {username_display}</b>\n\n"
+        
+        if logs:
+            for log in logs:
+                status = "✅" if log['success'] else "❌"
+                timestamp_str = safe_format_timestamp(log['timestamp'])
+                text += f"{status} <i>{log['action_type']}</i>\n"
+                if log['action_details']:
+                    text += f"├ {log['action_details'][:50]}\n"
+                if log['amount']:
+                    sign = "+" if log['amount'] > 0 else ""
+                    text += f"├ {sign}{log['amount']} 💰\n"
+                text += f"└ {timestamp_str}\n\n"
+        else:
+            text += "<i>Логов для этого игрока пока нет</i>"
+    finally:
+        dbs.close()
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f'admin_player_details:{player_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_player_reset_bonus_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет сброс бонуса для конкретного игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем player_id из callback_data
+    player_id = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if not player:
+            await query.answer("❌ Игрок не найден", show_alert=True)
+            return
+        
+        db.update_player(player_id, last_bonus_claim=0)
+        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        
+        await query.answer(f"✅ Бонус сброшен для {username_display}!", show_alert=False)
+        
+        # Обновляем страницу игрока
+        await show_player_details(update, context, player_id)
+    finally:
+        dbs.close()
+
+
+async def show_admin_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления VIP."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Выдать VIP", callback_data='admin_vip_give')],
+        [InlineKeyboardButton("➕ Выдать VIP+", callback_data='admin_vip_plus_give')],
+        [InlineKeyboardButton("❌ Отозвать VIP", callback_data='admin_vip_remove')],
+        [InlineKeyboardButton("❌ Отозвать VIP+", callback_data='admin_vip_plus_remove')],
+        [InlineKeyboardButton("📋 Список VIP", callback_data='admin_vip_list')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "💎 <b>Управление VIP</b>\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_stock_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления складом."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    logger.info(f"[ADMIN_STOCK] Пользователь {user.id} (@{user.username}) открывает меню склада")
+    
+    if not has_creator_panel_access(user.id, user.username):
+        logger.warning(f"[ADMIN_STOCK] Отказ в доступе для пользователя {user.id}")
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    try:
+        # Получаем информацию о складе
+        logger.info("[ADMIN_STOCK] Получаем информацию о складе...")
+        stock_info = db.get_stock_info()
+        logger.info(f"[ADMIN_STOCK] Получено записей о складе: {len(stock_info)}")
+        
+        text = "📦 <b>Управление складом</b>\n\n"
+        text += "<b>Текущие остатки:</b>\n"
+        
+        if stock_info:
+            for kind, amount in stock_info.items():
+                text += f"• {kind}: <b>{amount}</b>\n"
+        else:
+            text += "<i>Склад пуст или данные недоступны</i>\n"
+        
+        text += "\n<b>Для изменения склада:</b>\n"
+        text += "• <code>/stockset &lt;вид&gt; &lt;количество&gt;</code>\n"
+        text += "• <code>/stockadd &lt;вид&gt; &lt;число&gt;</code>\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data='admin_stock_menu')],
+            [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest as e:
+            logger.warning(f"Не удалось отредактировать сообщение склада: {e}")
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode='HTML'
+            )
+    except Exception as e:
+        logger.error(f"Ошибка в show_admin_stock_menu: {e}")
+        await query.answer("❌ Произошла ошибка при загрузке склада", show_alert=True)
+
+
+async def show_admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню рассылки."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    total_users = db.get_total_users_count()
+    
+    keyboard = [
+        [InlineKeyboardButton("📢 Начать рассылку", callback_data='admin_broadcast_start')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "📢 <b>Рассылка сообщений</b>\n\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n\n"
+        "⚠️ <b>Внимание!</b>\n"
+        "Рассылка отправит сообщение всем пользователям бота.\n"
+        "Используйте эту функцию осторожно!\n\n"
+        "Нажмите кнопку ниже, чтобы начать."
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс рассылки."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "📝 <b>Создание рассылки</b>\n\n"
+        "Отправьте <b>текст</b> для рассылки\n"
+        "или загрузите <b>аудио (музыку)</b> с подписью.\n"
+        "Поддерживается HTML-разметка в подписи.\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_broadcast_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_admin_action'] = 'broadcast'
+
+
+async def admin_vip_give_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс выдачи VIP."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "➕ <b>Выдача VIP</b>\n\n"
+        "Отправьте в формате:\n"
+        "<code>@username дни</code>\n\n"
+        "Пример: <code>@user 30</code>\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'vip_give'
+
+
+async def admin_vip_plus_give_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс выдачи VIP+."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "➕ <b>Выдача VIP+</b>\n\n"
+        "Отправьте в формате:\n"
+        "<code>@username дни</code>\n\n"
+        "Пример: <code>@user 30</code>\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'vip_plus_give'
+
+
+async def admin_vip_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс отзыва VIP."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "❌ <b>Отзыв VIP</b>\n\n"
+        "Отправьте <code>@username</code> пользователя\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'vip_remove'
+
+
+async def admin_vip_plus_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс отзыва VIP+."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "❌ <b>Отзыв VIP+</b>\n\n"
+        "Отправьте <code>@username</code> пользователя\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_vip_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_creator_action'] = 'vip_plus_remove'
+
+
+async def admin_vip_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список VIP пользователей."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем всех VIP пользователей
+    dbs = db.SessionLocal()
+    try:
+        current_time = int(time.time())
+        vip_users = dbs.query(db.Player).filter(db.Player.vip_until > current_time).order_by(db.Player.vip_until.desc()).limit(20).all()
+        vip_plus_users = dbs.query(db.Player).filter(db.Player.vip_plus_until > current_time).order_by(db.Player.vip_plus_until.desc()).limit(20).all()
+    finally:
+        dbs.close()
+    
+    text = "📋 <b>Список VIP пользователей</b>\n\n"
+    
+    if vip_plus_users:
+        text += "<b>💎 VIP+:</b>\n"
+        for p in vip_plus_users[:10]:
+            username_display = f"@{p.username}" if p.username else f"ID:{p.user_id}"
+            until_str = safe_format_timestamp(p.vip_plus_until)
+            text += f"• {username_display} до {until_str}\n"
+        if len(vip_plus_users) > 10:
+            text += f"<i>...и ещё {len(vip_plus_users) - 10}</i>\n"
+        text += "\n"
+    else:
+        text += "<b>💎 VIP+:</b> <i>нет</i>\n\n"
+    
+    if vip_users:
+        text += "<b>💎 VIP:</b>\n"
+        for p in vip_users[:10]:
+            username_display = f"@{p.username}" if p.username else f"ID:{p.user_id}"
+            until_str = safe_format_timestamp(p.vip_until)
+            text += f"• {username_display} до {until_str}\n"
+        if len(vip_users) > 10:
+            text += f"<i>...и ещё {len(vip_users) - 10}</i>\n"
+    else:
+        text += "<b>💎 VIP:</b> <i>нет</i>\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔙 Управление VIP", callback_data='admin_vip_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+# --- Расширенная аналитика ---
+
+async def show_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает расширенную аналитику бота."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    try:
+        # Получаем полную статистику
+        stats = db.get_bot_statistics()
+        boost_stats = db.get_boost_statistics()
+        
+        # Основная статистика
+        total_users = stats.get('total_users', db.get_total_users_count())
+        total_drinks = stats.get('total_drinks', db.get_total_drinks_count())
+        total_items_in_inventories = stats.get('total_inventory_items', db.get_total_inventory_items())
+        total_coins = stats.get('total_coins', db.get_total_coins_in_system())
+        
+        # VIP статистика
+        active_vip = stats.get('active_vip', db.get_active_vip_count())
+        active_vip_plus = stats.get('active_vip_plus', db.get_active_vip_plus_count())
+        
+        # Активность
+        active_today = stats.get('active_today', db.get_active_users_today())
+        active_week = stats.get('active_week', db.get_active_users_week())
+        
+        # Покупки
+        total_purchases = stats.get('total_purchases', 0)
+        purchases_today = stats.get('purchases_today', 0)
+        
+        # Бусты
+        active_boosts = boost_stats.get('active_boosts', 0)
+        expired_boosts = boost_stats.get('expired_boosts', 0)
+        avg_boost_count = boost_stats.get('average_boost_count', 0)
+        
+        # Дополнительная статистика
+        active_promo = db.get_active_promo_count()
+        banned_users = db.get_banned_users_count()
+        active_events = db.get_active_events_count()
+        
+        # Экономика
+        avg_coins = total_coins // total_users if total_users > 0 else 0
+        active_percent = round((active_today / total_users * 100), 1) if total_users > 0 else 0
+        vip_percent = round(((active_vip + active_vip_plus) / total_users * 100), 1) if total_users > 0 else 0
+        
+        # Топ игроков
+        top_coins = stats.get('top_coins', [])[:5]
+        top_drinks = stats.get('top_drinks', [])[:5]
+        
+        # Формируем текст с расширенной аналитикой
+        text = (
+            "📊 <b>Расширенная аналитика</b>\n\n"
+            
+            "👥 <b>Пользователи:</b>\n"
+            f"├ Всего пользователей: <b>{total_users:,}</b>\n"
+            f"├ Активных сегодня: <b>{active_today:,}</b> ({active_percent}%)\n"
+            f"├ Активных за неделю: <b>{active_week:,}</b>\n"
+            f"└ Заблокированных: <b>{banned_users:,}</b>\n\n"
+            
+            "💎 <b>VIP статистика:</b>\n"
+            f"├ VIP активных: <b>{active_vip:,}</b>\n"
+            f"├ VIP+ активных: <b>{active_vip_plus:,}</b>\n"
+            f"└ Всего VIP: <b>{active_vip + active_vip_plus:,}</b> ({vip_percent}%)\n\n"
+            
+            "🥤 <b>Энергетики:</b>\n"
+            f"├ Всего видов напитков: <b>{total_drinks:,}</b>\n"
+            f"└ Предметов в инвентарях: <b>{total_items_in_inventories:,}</b>\n\n"
+            
+            "💰 <b>Экономика:</b>\n"
+            f"├ Всего монет в системе: <b>{total_coins:,}</b>\n"
+            f"├ Среднее у игрока: <b>{avg_coins:,}</b>\n"
+            f"├ Всего покупок: <b>{total_purchases:,}</b>\n"
+            f"└ Покупок сегодня: <b>{purchases_today:,}</b>\n\n"
+            
+            "⚡ <b>Бусты автопоиска:</b>\n"
+            f"├ Активных бустов: <b>{active_boosts:,}</b>\n"
+            f"├ Истёкших бустов: <b>{expired_boosts:,}</b>\n"
+            f"└ Среднее кол-во: <b>{avg_boost_count}</b>\n\n"
+            
+            "🎯 <b>Дополнительно:</b>\n"
+            f"├ Активных промокодов: <b>{active_promo:,}</b>\n"
+            f"└ Активных событий: <b>{active_events:,}</b>\n"
+        )
+        
+        # Добавляем топ игроков, если есть данные
+        if top_coins:
+            text += "\n🏆 <b>Топ-5 по монетам:</b>\n"
+            for i, (user_id, username, coins) in enumerate(top_coins, 1):
+                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                text += f"{i}. {display_name}: <b>{coins:,}</b>\n"
+        
+        if top_drinks:
+            text += "\n🥤 <b>Топ-5 по напиткам:</b>\n"
+            for i, (user_id, username, drinks) in enumerate(top_drinks, 1):
+                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                text += f"{i}. {display_name}: <b>{drinks:,}</b>\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Обновить", callback_data='admin_analytics')],
+            [InlineKeyboardButton("📈 Экспорт данных", callback_data='admin_analytics_export')],
+            [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    except Exception as e:
+        logger.error(f"Ошибка в show_admin_analytics: {e}")
+        await query.answer("❌ Ошибка при загрузке аналитики", show_alert=True)
+
+
+async def export_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспортирует данные аналитики в текстовом формате."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    try:
+        from datetime import datetime
+        import time
+        
+        # Получаем статистику
+        stats = db.get_bot_statistics()
+        boost_stats = db.get_boost_statistics()
+        
+        # Основная статистика
+        total_users = stats.get('total_users', db.get_total_users_count())
+        total_drinks = stats.get('total_drinks', db.get_total_drinks_count())
+        total_items_in_inventories = stats.get('total_inventory_items', db.get_total_inventory_items())
+        total_coins = stats.get('total_coins', db.get_total_coins_in_system())
+        
+        # VIP статистика
+        active_vip = stats.get('active_vip', db.get_active_vip_count())
+        active_vip_plus = stats.get('active_vip_plus', db.get_active_vip_plus_count())
+        
+        # Активность
+        active_today = stats.get('active_today', db.get_active_users_today())
+        active_week = stats.get('active_week', db.get_active_users_week())
+        
+        # Покупки
+        total_purchases = stats.get('total_purchases', 0)
+        purchases_today = stats.get('purchases_today', 0)
+        
+        # Бусты
+        active_boosts = boost_stats.get('active_boosts', 0)
+        expired_boosts = boost_stats.get('expired_boosts', 0)
+        avg_boost_count = boost_stats.get('average_boost_count', 0)
+        
+        # Дополнительная статистика
+        active_promo = db.get_active_promo_count()
+        banned_users = db.get_banned_users_count()
+        active_events = db.get_active_events_count()
+        
+        # Экономика
+        avg_coins = total_coins // total_users if total_users > 0 else 0
+        active_percent = round((active_today / total_users * 100), 1) if total_users > 0 else 0
+        vip_percent = round(((active_vip + active_vip_plus) / total_users * 100), 1) if total_users > 0 else 0
+        
+        # Топ игроков
+        top_coins = stats.get('top_coins', [])[:10]
+        top_drinks = stats.get('top_drinks', [])[:10]
+        
+        # Формируем экспортируемые данные
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        export_text = (
+            f"📊 ЭКСПОРТ АНАЛИТИКИ БОТА\n"
+            f"Дата экспорта: {timestamp}\n"
+            f"{'='*50}\n\n"
+            
+            f"👥 ПОЛЬЗОВАТЕЛИ:\n"
+            f"├ Всего пользователей: {total_users:,}\n"
+            f"├ Активных сегодня: {active_today:,} ({active_percent}%)\n"
+            f"├ Активных за неделю: {active_week:,}\n"
+            f"└ Заблокированных: {banned_users:,}\n\n"
+            
+            f"💎 VIP СТАТИСТИКА:\n"
+            f"├ VIP активных: {active_vip:,}\n"
+            f"├ VIP+ активных: {active_vip_plus:,}\n"
+            f"└ Всего VIP: {active_vip + active_vip_plus:,} ({vip_percent}%)\n\n"
+            
+            f"🥤 ЭНЕРГЕТИКИ:\n"
+            f"├ Всего видов напитков: {total_drinks:,}\n"
+            f"└ Предметов в инвентарях: {total_items_in_inventories:,}\n\n"
+            
+            f"💰 ЭКОНОМИКА:\n"
+            f"├ Всего монет в системе: {total_coins:,}\n"
+            f"├ Среднее у игрока: {avg_coins:,}\n"
+            f"├ Всего покупок: {total_purchases:,}\n"
+            f"└ Покупок сегодня: {purchases_today:,}\n\n"
+            
+            f"⚡ БУСТЫ АВТОПОИСКА:\n"
+            f"├ Активных бустов: {active_boosts:,}\n"
+            f"├ Истёкших бустов: {expired_boosts:,}\n"
+            f"└ Среднее кол-во: {avg_boost_count}\n\n"
+            
+            f"🎯 ДОПОЛНИТЕЛЬНО:\n"
+            f"├ Активных промокодов: {active_promo:,}\n"
+            f"└ Активных событий: {active_events:,}\n\n"
+        )
+        
+        # Добавляем топ игроков
+        if top_coins:
+            export_text += f"🏆 ТОП-10 ПО МОНЕТАМ:\n"
+            for i, (user_id, username, coins) in enumerate(top_coins, 1):
+                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                export_text += f"{i}. {display_name}: {coins:,}\n"
+            export_text += "\n"
+        
+        if top_drinks:
+            export_text += f"🥤 ТОП-10 ПО НАПИТКАМ:\n"
+            for i, (user_id, username, drinks) in enumerate(top_drinks, 1):
+                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                export_text += f"{i}. {display_name}: {drinks:,}\n"
+        
+        # Отправляем как сообщение (Telegram имеет лимит на длину сообщения)
+        if len(export_text) > 4096:
+            # Если текст слишком длинный, отправляем частями
+            parts = [export_text[i:i+4096] for i in range(0, len(export_text), 4096)]
+            for part in parts:
+                await query.message.reply_text(f"<pre>{part}</pre>", parse_mode='HTML')
+        else:
+            await query.message.reply_text(f"<pre>{export_text}</pre>", parse_mode='HTML')
+        
+        await query.answer("✅ Данные экспортированы!", show_alert=False)
+        
+    except Exception as e:
+        logger.error(f"Ошибка в export_admin_analytics: {e}")
+        await query.answer("❌ Ошибка при экспорте данных", show_alert=True)
+
+
+# --- Управление энергетиками ---
+
+async def show_admin_drinks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления энергетиками."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    context.user_data.pop('awaiting_admin_action', None)
+    context.user_data.pop('edit_drink_id', None)
+    context.user_data.pop('pending_rename', None)
+    context.user_data.pop('pending_redesc', None)
+    context.user_data.pop('pending_photo', None)
+    
+    total_drinks = db.get_total_drinks_count()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить энергетик", callback_data='admin_drink_add')],
+        [InlineKeyboardButton("🖼 Обновить фото", callback_data='admin_drink_update_photo')],
+        [InlineKeyboardButton("✏️ Изм. название", callback_data='admin_drink_rename')],
+        [InlineKeyboardButton("📝 Изм. описание", callback_data='admin_drink_redesc')],
+        [InlineKeyboardButton("❌ Удалить", callback_data='admin_drink_delete')],
+        [InlineKeyboardButton("📋 Список всех", callback_data='admin_drink_list')],
+        [InlineKeyboardButton("🔍 Поиск", callback_data='admin_drink_search')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "🔧 <b>Управление энергетиками</b>\n\n"
+        f"📊 Всего напитков в базе: <b>{total_drinks}</b>\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        message = query.message
+        if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+            try:
+                await message.delete()
+            except BadRequest:
+                pass
+            await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_drink_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс добавления энергетика."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "➕ <b>Добавление энергетика</b>\n\n"
+        "Отправьте данные в формате:\n"
+        "<code>Название | Описание | Специальный</code>\n\n"
+        "Пример:\n"
+        "<code>Red Bull | Классический энергетик | нет</code>\n\n"
+        "Специальный: <code>да</code> или <code>нет</code>\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_admin_action'] = 'drink_add'
+
+
+async def admin_drink_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список всех энергетиков с пагинацией."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем номер страницы
+    data = query.data
+    page = 1
+    if data.startswith('admin_drink_list_p'):
+        try:
+            page = int(data.split('_')[-1])
+        except:
+            page = 1
+    
+    # Получаем список напитков
+    result = db.get_all_drinks_paginated(page=page, page_size=15)
+    drinks = result['drinks']
+    total = result['total']
+    total_pages = result['total_pages']
+    
+    text = f"📋 <b>Список энергетиков</b>\n\n"
+    text += f"Страница <b>{page}</b> из <b>{total_pages}</b>\n"
+    text += f"Всего напитков: <b>{total}</b>\n\n"
+    
+    if drinks:
+        for drink in drinks:
+            special = "⭐" if drink['is_special'] else ""
+            img = "🖼️" if drink['has_image'] else ""
+            text += f"{special}{img} <b>{drink['name']}</b> (ID: {drink['id']})\n"
+            text += f"<i>{drink['description'][:50]}...</i>\n\n"
+    else:
+        text += "<i>Напитков не найдено</i>"
+    
+    # Формируем кнопки пагинации
+    keyboard = []
+    
+    # Навигация
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f'admin_drink_list_p{page-1}'))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f'admin_drink_list_p{page+1}'))
+    if nav_row:
+        keyboard.append(nav_row)
+    
+    keyboard.append([InlineKeyboardButton("🔙 Управление энергетиками", callback_data='admin_drinks_menu')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_drink_list_show_ids(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    drinks = db.get_all_drinks()
+    if not drinks:
+        try:
+            await query.message.reply_text("В базе данных нет энергетиков.")
+        except BadRequest:
+            pass
+        return
+
+    drinks_sorted = sorted(drinks, key=lambda d: d.id)
+    lines = [f"{d.id}: {d.name}" for d in drinks_sorted]
+    header = f"Всего энергетиков: {len(lines)}\n"
+    chunk = header
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            try:
+                await query.message.reply_text(chunk.rstrip())
+            except BadRequest:
+                pass
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        try:
+            await query.message.reply_text(chunk.rstrip())
+        except BadRequest:
+            pass
+
+
+async def admin_drink_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс поиска энергетика."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "🔍 <b>Поиск энергетика</b>\n\n"
+        "Отправьте название или часть названия напитка для поиска\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_admin_action'] = 'drink_search'
+
+
+async def admin_drink_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс редактирования энергетика."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "✏️ <b>Редактирование энергетика</b>\n\n"
+        "Отправьте данные в формате:\n"
+        "<code>ID | Новое название | Новое описание | Специальный</code>\n\n"
+        "Пример:\n"
+        "<code>5 | Red Bull Gold | Золотая версия | да</code>\n\n"
+        "Чтобы не изменять поле, используйте <code>-</code>\n"
+        "Пример: <code>5 | - | Новое описание | -</code>\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_admin_action'] = 'drink_edit'
+
+
+async def admin_drink_rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    text = (
+        "✏️ <b>Изменение названия</b>\n\n"
+        "Отправьте <b>ID</b> энергетика для изменения названия\n\n"
+        "Или нажмите Отмена"
+    )
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'drink_rename_id'
+
+
+async def admin_drink_redesc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    text = (
+        "📝 <b>Изменение описания</b>\n\n"
+        "Отправьте <b>ID</b> энергетика для изменения описания\n\n"
+        "Или нажмите Отмена"
+    )
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'drink_redesc_id'
+
+
+async def admin_drink_update_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    text = (
+        "🖼 <b>Обновление фото</b>\n\n"
+        "Отправьте <b>ID</b> энергетика, затем бот попросит прислать фото.\n\n"
+        "Или нажмите Отмена"
+    )
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'drink_update_photo_id'
+
+
+async def admin_drink_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс удаления энергетика."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "❌ <b>Удаление энергетика</b>\n\n"
+        "⚠️ <b>ВНИМАНИЕ!</b> Удаление напитка также удалит его из всех инвентарей игроков!\n\n"
+        "Отправьте <b>ID</b> энергетика для удаления\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_admin_action'] = 'drink_delete'
+
+
+async def admin_promo_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    text = (
+        "🎁 <b>Создание промокода</b>\n\n"
+        "Формат общий:\n"
+        "<code>CODE | kind | value | max_uses | per_user_limit | expires(YYYY-MM-DD HH:MM или -) | active(да/нет)</code>\n\n"
+        "Для kind = <b>drink</b> используйте <b>8 полей</b> (value = DRINK_ID):\n"
+        "<code>CODE | drink | DRINK_ID | max_uses | per_user_limit | expires | active | rarity</code>\n\n"
+        "Доступные rarity: Basic, Uncommon, Rare, Epic, Legendary"
+    )
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_promo_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'promo_create'
+
+
+async def admin_promo_list_active_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    promos = db.list_promos(active_only=True)
+    lines = ["🎁 <b>Активные промокоды</b>\n"]
+    if promos:
+        for p in promos[:50]:
+            exp = p['expires_at']
+            exp_str = safe_format_timestamp(exp) if exp else '—'
+            extra = f" rarity={p.get('rarity') or '-'}" if str(p.get('kind','')).lower() == 'drink' else ''
+            lines.append(f"• <b>{p['code']}</b> [{p['kind']}] val={p['value']}{extra} used={p['used']}/{p['max_uses'] or '∞'} per_user={p['per_user_limit'] or '∞'} exp={exp_str}")
+    else:
+        lines.append("<i>Нет активных промокодов</i>")
+    lines.append("\n")
+    keyboard = [[InlineKeyboardButton("🔙 Промокоды", callback_data='admin_promo_menu')]]
+    try:
+        await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_promo_list_all_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    promos = db.list_promos(active_only=False)
+    lines = ["🎁 <b>Все промокоды</b>\n"]
+    if promos:
+        for p in promos[:100]:
+            exp = p['expires_at']
+            exp_str = safe_format_timestamp(exp) if exp else '—'
+            active_mark = '✅' if p['active'] else '❌'
+            extra = f" rarity={p.get('rarity') or '-'}" if str(p.get('kind','')).lower() == 'drink' else ''
+            lines.append(f"{active_mark} <b>{p['code']}</b> [{p['kind']}] val={p['value']}{extra} used={p['used']}/{p['max_uses'] or '∞'} per_user={p['per_user_limit'] or '∞'} exp={exp_str}")
+    else:
+        lines.append("<i>Промокодов нет</i>")
+    lines.append("\n")
+    keyboard = [[InlineKeyboardButton("🔙 Промокоды", callback_data='admin_promo_menu')]]
+    try:
+        await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_promo_deactivate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    text = (
+        "❌ <b>Деактивация промокода</b>\n\n"
+        "Отправьте <code>ID</code> или <code>CODE</code> промокода"
+    )
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_promo_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'promo_deactivate'
+
+
+async def admin_promo_stats_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    active_count = db.get_active_promo_count()
+    usage_total = db.get_promo_usage_total()
+    text = (
+        "📈 <b>Статистика промокодов</b>\n\n"
+        f"Активных промокодов: <b>{active_count}</b>\n"
+        f"Всего активаций: <b>{usage_total}</b>"
+    )
+    keyboard = [[InlineKeyboardButton("🔙 Промокоды", callback_data='admin_promo_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def handle_promo_create(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    parts = [p.strip() for p in text_input.split('|')]
+    keyboard = [[InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')]]
+    if len(parts) not in (7, 8):
+        await update.message.reply_html("❌ Неверный формат. См. подсказку вверху экрана.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    code, kind = parts[0], parts[1]
+    kind_l = kind.strip().lower()
+    # Для drink ожидаем 8 полей (включая rarity)
+    if kind_l == 'drink' and len(parts) != 8:
+        await update.message.reply_html("❌ Для kind=drink укажите 8 полей: CODE | drink | DRINK_ID | max_uses | per_user_limit | expires | active | rarity", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if kind_l == 'drink':
+        value_s, max_uses_s, per_user_s, expires_s, active_s, rarity_s = parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+    else:
+        value_s, max_uses_s, per_user_s, expires_s, active_s = parts[2], parts[3], parts[4], parts[5], parts[6]
+        rarity_s = None
+    try:
+        value = int(value_s)
+        max_uses = int(max_uses_s)
+        per_user = int(per_user_s)
+        if expires_s == '-':
+            expires = None
+        else:
+            try:
+                from datetime import datetime
+                expires = int(datetime.strptime(expires_s, "%Y-%m-%d %H:%M").timestamp())
+            except Exception:
+                await update.message.reply_html("❌ Неверная дата. Формат: YYYY-MM-DD HH:MM", reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+        active = active_s.lower() in ['да', 'yes', 'true', '1']
+        # Валидация rarity для drink
+        rarity_final = None
+        if kind_l == 'drink':
+            # Разрешённые значения — ключи RARITIES (без учёта регистра)
+            valid = list(RARITIES.keys())
+            if not rarity_s:
+                await update.message.reply_html("❌ Укажите rarity для drink. Доступно: " + ", ".join(valid), reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+            rarity_map = {r.lower(): r for r in valid}
+            rarity_final = rarity_map.get(rarity_s.strip().lower())
+            if not rarity_final:
+                await update.message.reply_html("❌ Неверная rarity. Доступно: " + ", ".join(valid), reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+        res = db.create_promo(code, kind, value, max_uses, per_user, expires, active, rarity=rarity_final)
+        if res.get('ok'):
+            ok_suffix = f" (rarity: {rarity_final})" if rarity_final else ""
+            await update.message.reply_html(f"✅ Создан промокод <b>{code}</b>{ok_suffix}", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            reason = res.get('reason')
+            await update.message.reply_html(f"❌ Ошибка создания: {reason}", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        await update.message.reply_html("❌ Ошибка обработки входных данных", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_promo_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    keyboard = [[InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')]]
+    s = text_input.strip()
+    ok = False
+    try:
+        pid = int(s)
+        ok = db.deactivate_promo_by_id(pid)
+    except Exception:
+        ok = db.deactivate_promo_by_code(s)
+    await update.message.reply_html("✅ Деактивирован" if ok else "❌ Не найден", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    user = update.effective_user
+    if not has_creator_panel_access(user.id, user.username):
+        return
+    recipients = db.get_all_users_for_broadcast()
+    total = len(recipients)
+    ok = 0
+    fail = 0
+    for uid in recipients:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text_input, parse_mode='HTML')
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    try:
+        db.log_action(user.id, user.username, 'admin_action', f'broadcast: ok={ok}, fail={fail}', success=True)
+    except Exception:
+        pass
+    await update.message.reply_html(f"📢 Рассылка завершена. Успешно: <b>{ok}</b> / Не доставлено: <b>{fail}</b> (всего: {total})")
+
+async def handle_admin_broadcast_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, caption_input: str):
+    user = update.effective_user
+    if not has_creator_panel_access(user.id, user.username):
+        return
+    audio = getattr(update.message, 'audio', None)
+    if not audio:
+        await update.message.reply_html("❌ Пришлите аудио-файл (музыку) или отправьте текстовый пост.")
+        return
+    file_id = audio.file_id
+    recipients = db.get_all_users_for_broadcast()
+    total = len(recipients)
+    ok = 0
+    fail = 0
+    for uid in recipients:
+        try:
+            await context.bot.send_audio(
+                chat_id=uid,
+                audio=file_id,
+                caption=caption_input if caption_input else None,
+                parse_mode='HTML' if caption_input else None,
+            )
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    try:
+        db.log_action(user.id, user.username, 'admin_action', f'broadcast_audio: ok={ok}, fail={fail}', success=True)
+    except Exception:
+        pass
+    await update.message.reply_html(f"🎵 Рассылка аудио завершена. Успешно: <b>{ok}</b> / Не доставлено: <b>{fail}</b> (всего: {total})")
+
+async def show_admin_promo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления промокодами."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    active_promos = db.get_active_promo_count()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Создать промокод", callback_data='admin_promo_create')],
+        [InlineKeyboardButton("📋 Активные промокоды", callback_data='admin_promo_list_active')],
+        [InlineKeyboardButton("🗂️ Все промокоды", callback_data='admin_promo_list_all')],
+        [InlineKeyboardButton("❌ Деактивировать", callback_data='admin_promo_deactivate')],
+        [InlineKeyboardButton("📊 Статистика использования", callback_data='admin_promo_stats')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "🎁 <b>Управление промокодами</b>\n\n"
+        f"✅ Активных промокодов: <b>{active_promos}</b>\n\n"
+        "Промокоды позволяют выдавать игрокам:\n"
+        "• 💰 Монеты\n"
+        "• 💎 VIP/VIP+ статус\n"
+        "• 🥤 Энергетики\n"
+        "• 🎁 Специальные награды\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+# --- Настройки бота ---
+
+async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню настроек бота."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')],
+        [InlineKeyboardButton("💰 Лимиты монет", callback_data='admin_settings_limits')],
+        [InlineKeyboardButton("🎰 Настройки казино", callback_data='admin_settings_casino')],
+        [InlineKeyboardButton("🏪 Настройки магазина", callback_data='admin_settings_shop')],
+        [InlineKeyboardButton("🔔 Уведомления", callback_data='admin_settings_notifications')],
+        [InlineKeyboardButton("🌐 Локализация", callback_data='admin_settings_localization')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "⚙️ <b>Настройки бота</b>\n\n"
+        "Управление параметрами работы бота:\n\n"
+        "⏱️ <b>Кулдауны</b> - время ожидания между действиями\n"
+        "💰 <b>Лимиты</b> - ограничения на операции\n"
+        "🎰 <b>Казино</b> - настройки игр и шансов\n"
+        "🏪 <b>Магазин</b> - цены и ассортимент\n"
+        "🔔 <b>Уведомления</b> - напоминания пользователям\n"
+        "🌐 <b>Локализация</b> - языки интерфейса\n\n"
+        "Выберите раздел:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+# --- Модерация ---
+
+async def show_admin_moderation_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню модерации."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    banned_users = db.get_banned_users_count()
+    
+    keyboard = [
+        [InlineKeyboardButton("🚫 Забанить пользователя", callback_data='admin_mod_ban')],
+        [InlineKeyboardButton("✅ Разбанить пользователя", callback_data='admin_mod_unban')],
+        [InlineKeyboardButton("⚠️ Предупреждения", callback_data='admin_mod_warnings')],
+        [InlineKeyboardButton("📋 Список банов", callback_data='admin_mod_banlist')],
+        [InlineKeyboardButton("🔍 Проверить игрока", callback_data='admin_mod_check')],
+        [InlineKeyboardButton("📝 История действий", callback_data='admin_mod_history')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "🚫 <b>Модерация</b>\n\n"
+        f"Заблокировано пользователей: <b>{banned_users}</b>\n\n"
+        "<b>Доступные действия:</b>\n"
+        "• Блокировка/разблокировка игроков\n"
+        "• Система предупреждений\n"
+        "• Проверка активности\n"
+        "• История нарушений\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+# --- Логи системы ---
+
+async def show_admin_logs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню логов системы."""
+    try:
+        query = update.callback_query
+        if not query:
+            logger.error("show_admin_logs_menu: query is None")
+            return
+        
+        await query.answer()
+        
+        user = query.from_user
+        if not user:
+            logger.error("show_admin_logs_menu: user is None")
+            return
+        
+        if not has_creator_panel_access(user.id, user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 Последние действия", callback_data='admin_logs_recent')],
+            [InlineKeyboardButton("💰 Транзакции", callback_data='admin_logs_transactions')],
+            [InlineKeyboardButton("🎰 Игры в казино", callback_data='admin_logs_casino')],
+            [InlineKeyboardButton("🛒 Покупки", callback_data='admin_logs_purchases')],
+            [InlineKeyboardButton("👤 Действия игрока", callback_data='admin_logs_player')],
+            [InlineKeyboardButton("⚠️ Ошибки системы", callback_data='admin_logs_errors')],
+            [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        text = (
+            "📝 <b>Логи системы</b>\n\n"
+            "Просмотр истории действий в боте:\n\n"
+            "📊 <b>Последние действия</b> - общая активность\n"
+            "💰 <b>Транзакции</b> - перемещение монет\n"
+            "🎰 <b>Казино</b> - игры и ставки\n"
+            "🛒 <b>Покупки</b> - магазин и обмены\n"
+            "👤 <b>Игрок</b> - действия конкретного пользователя\n"
+            "⚠️ <b>Ошибки</b> - системные проблемы\n\n"
+            "Выберите тип логов:"
+        )
+        
+        if not query.message:
+            logger.error("show_admin_logs_menu: query.message is None")
+            return
+        
+        try:
+            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest as e:
+            logger.error(f"BadRequest при редактировании сообщения в show_admin_logs_menu: {e}")
+            # Попробуем отправить новое сообщение, если не удалось отредактировать
+            try:
+                await context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode='HTML'
+                )
+            except Exception as send_error:
+                logger.error(f"Ошибка при отправке нового сообщения: {send_error}")
+    except Exception as e:
+        logger.error(f"Ошибка в show_admin_logs_menu: {e}", exc_info=True)
+        query = getattr(update, 'callback_query', None)
+        if query:
+            try:
+                await query.answer("❌ Ошибка при открытии меню логов", show_alert=True)
+            except:
+                pass
+
+
+async def show_admin_logs_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает последние действия в системе."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    logs = db.get_recent_logs(limit=20)
+    
+    text = "📊 <b>Последние действия</b>\n\n"
+    
+    if logs:
+        for log in logs:
+            status = "✅" if log['success'] else "❌"
+            timestamp_str = safe_format_timestamp(log['timestamp'])
+            text += f"{status} <b>{log['username']}</b> ({log['user_id']})\n"
+            text += f"├ Действие: <i>{log['action_type']}</i>\n"
+            if log['action_details']:
+                details = log['action_details'][:50]
+                text += f"├ Детали: {details}\n"
+            if log['amount']:
+                text += f"└ Сумма: {log['amount']}\n"
+            text += f"⏰ {timestamp_str}\n\n"
+    else:
+        text += "<i>Логов пока нет</i>"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_recent')],
+        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_logs_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает логи транзакций."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    logs = db.get_logs_by_type('transaction', limit=20)
+    
+    text = "💰 <b>Транзакции</b>\n\n"
+    
+    if logs:
+        for log in logs:
+            status = "✅" if log['success'] else "❌"
+            timestamp_str = safe_format_timestamp(log['timestamp'])
+            text += f"{status} <b>{log['username']}</b>\n"
+            if log['amount']:
+                sign = "+" if log['amount'] > 0 else ""
+                text += f"├ Сумма: {sign}{log['amount']} 💰\n"
+            if log['action_details']:
+                text += f"├ {log['action_details'][:60]}\n"
+            text += f"└ {timestamp_str}\n\n"
+    else:
+        text += "<i>Транзакций пока нет</i>"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_transactions')],
+        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_logs_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает логи игр в казино."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    logs = db.get_logs_by_type('casino', limit=20)
+    
+    text = "🎰 <b>Игры в казино</b>\n\n"
+    
+    if logs:
+        for log in logs:
+            status = "✅ Выигрыш" if log['success'] else "❌ Проигрыш"
+            timestamp_str = safe_format_timestamp(log['timestamp'])
+            text += f"{status} - <b>{log['username']}</b>\n"
+            if log['amount']:
+                sign = "+" if log['amount'] > 0 else ""
+                text += f"├ {sign}{log['amount']} 💰\n"
+            if log['action_details']:
+                text += f"├ {log['action_details'][:60]}\n"
+            text += f"└ {timestamp_str}\n\n"
+    else:
+        text += "<i>Логов казино пока нет</i>"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_casino')],
+        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_logs_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает логи покупок."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    logs = db.get_logs_by_type('purchase', limit=20)
+    
+    text = "🛒 <b>Покупки</b>\n\n"
+    
+    if logs:
+        for log in logs:
+            status = "✅" if log['success'] else "❌"
+            timestamp_str = safe_format_timestamp(log['timestamp'])
+            text += f"{status} <b>{log['username']}</b>\n"
+            if log['amount']:
+                text += f"├ Цена: {log['amount']} 💰\n"
+            if log['action_details']:
+                text += f"├ {log['action_details'][:60]}\n"
+            text += f"└ {timestamp_str}\n\n"
+    else:
+        text += "<i>Покупок пока нет</i>"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_purchases')],
+        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_logs_player_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс просмотра логов игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    text = (
+        "👤 <b>Действия игрока</b>\n\n"
+        "Отправьте <code>@username</code> или <code>user_id</code> игрока\n\n"
+        "Или нажмите Отмена"
+    )
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_logs_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+    
+    context.user_data['awaiting_admin_action'] = 'logs_player'
+
+
+async def show_admin_logs_errors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает логи ошибок."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    logs = db.get_error_logs(limit=20)
+    
+    text = "⚠️ <b>Ошибки системы</b>\n\n"
+    
+    if logs:
+        for log in logs:
+            timestamp_str = safe_format_timestamp(log['timestamp'])
+            text += f"❌ <b>{log['username']}</b> ({log['user_id']})\n"
+            text += f"├ Действие: <i>{log['action_type']}</i>\n"
+            if log['action_details']:
+                text += f"├ {log['action_details'][:60]}\n"
+            text += f"└ {timestamp_str}\n\n"
+    else:
+        text += "✅ <i>Ошибок не обнаружено!</i>"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_errors')],
+        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+# --- Управление экономикой ---
+
+async def show_admin_economy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления экономикой."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    total_coins = db.get_total_coins_in_system()
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 Цены в магазине", callback_data='admin_econ_shop_prices')],
+        [InlineKeyboardButton("🎰 Ставки казино", callback_data='admin_econ_casino_bets')],
+        [InlineKeyboardButton("🎁 Награды", callback_data='admin_econ_rewards')],
+        [InlineKeyboardButton("📈 Инфляция", callback_data='admin_econ_inflation')],
+        [InlineKeyboardButton("💎 Стоимость VIP", callback_data='admin_econ_vip_prices')],
+        [InlineKeyboardButton("🔄 Курсы обмена", callback_data='admin_econ_exchange')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "💼 <b>Управление экономикой</b>\n\n"
+        f"💰 Монет в системе: <b>{total_coins:,}</b>\n\n"
+        "<b>Настройка экономических параметров:</b>\n"
+        "• Цены на товары и услуги\n"
+        "• Размеры наград и бонусов\n"
+        "• Ставки в играх\n"
+        "• Курсы обмена\n\n"
+        "Выберите раздел:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+# --- События ---
+
+async def show_admin_events_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню управления событиями."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    active_events = db.get_active_events_count()
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Создать событие", callback_data='admin_event_create')],
+        [InlineKeyboardButton("📋 Активные события", callback_data='admin_event_list_active')],
+        [InlineKeyboardButton("🗂️ Все события", callback_data='admin_event_list_all')],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data='admin_event_edit')],
+        [InlineKeyboardButton("❌ Завершить событие", callback_data='admin_event_end')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_event_stats')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "🎮 <b>Управление событиями</b>\n\n"
+        f"🎪 Активных событий: <b>{active_events}</b>\n\n"
+        "<b>Типы событий:</b>\n"
+        "🎉 Временные акции\n"
+        "💰 Бонусные периоды\n"
+        "🎁 Раздачи наград\n"
+        "🏆 Конкурсы\n"
+        "⚡ Усиленные дропы\n\n"
+        "Выберите действие:"
+    )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
 async def search_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: напоминание о завершении кулдауна поиска."""
     try:
@@ -998,12 +4389,42 @@ async def search_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: напоминание о возможности полива грядки."""
     try:
+        if not hasattr(context, 'job') or not context.job:
+            return
+        user_id = context.job.chat_id
         bed_index = context.job.data.get('bed_index', 0)
+
+        auto_res = db.try_farmer_autowater(user_id, bed_index)
+
         keyboard = [[InlineKeyboardButton("🌱 Перейти к плантациям", callback_data='market_plantation')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if auto_res.get('ok'):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"👨‍🌾 Селюк фермер полил грядку {bed_index} (−50 септимов с его баланса).",
+                reply_markup=reply_markup
+            )
+            return
+
+        reason = auto_res.get('reason') if isinstance(auto_res, dict) else None
+        if reason == 'remind_disabled':
+            text = (
+                f"💧 Грядка {bed_index} готова к поливу!\n\n"
+                "👨‍🌾 Селюк фермер не может работать, пока выключены напоминания о поливе.\n"
+                "Включите напоминания в настройках, чтобы фермер поливал грядки автоматически."
+            )
+        elif reason == 'no_funds':
+            text = (
+                f"💧 Грядка {bed_index} готова к поливу!\n\n"
+                "👨‍🌾 Селюку фермеру не хватает септимов на балансе, полей грядку вручную или пополни баланс селюка."
+            )
+        else:
+            text = f"💧 Грядка {bed_index} готова к поливу!"
+
         await context.bot.send_message(
-            chat_id=context.job.chat_id, 
-            text=f"💧 Грядка {bed_index} готова к поливу!",
+            chat_id=user_id,
+            text=text,
             reply_markup=reply_markup
         )
     except Exception as ex:
@@ -1015,7 +4436,14 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
     Останавливается при исчерпании лимита/окончании VIP/выключении пользователем.
     """
     try:
+        # Безопасное получение user_id
+        if not hasattr(context, 'job') or not context.job:
+            logger.warning("[AUTO] context.job отсутствует в auto_search_job")
+            return
         user_id = context.job.chat_id
+        if not user_id:
+            logger.warning("[AUTO] user_id отсутствует в auto_search_job")
+            return
         player = db.get_or_create_player(user_id, str(user_id))
 
         # Если пользователь успел выключить автопоиск — выходим (не переназначаем)
@@ -1056,12 +4484,13 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
         vip_plus_active = db.is_vip_plus(user_id)
         vip_active = db.is_vip(user_id)  # сначала проверяли VIP выше
         
+        base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
         if vip_plus_active:
-            eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+            eff_search_cd = base_search_cd / 4
         elif vip_active:
-            eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+            eff_search_cd = base_search_cd / 2
         else:
-            eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
+            eff_search_cd = base_search_cd
         time_since_last = time.time() - float(getattr(player, 'last_search', 0) or 0.0)
         if time_since_last < eff_search_cd:
             delay = max(1.0, eff_search_cd - time_since_last)
@@ -1072,8 +4501,8 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=user_id,
                     name=f"auto_search_{user_id}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (кулдаун) для {user_id}: {e}")
             return
 
         # Анти-гонки: используем общий локер для поиска
@@ -1087,8 +4516,8 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=user_id,
                     name=f"auto_search_{user_id}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (lock) для {user_id}: {e}")
             return
         async with lock:
             result = await _perform_energy_search(user_id, player.username or str(user_id), context)
@@ -1143,8 +4572,9 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=user_id,
                     name=f"auto_search_{user_id}",
                 )
-            except Exception:
-                pass
+                logger.debug(f"[AUTO] Запланирован следующий автопоиск для {user_id} через {eff_search_cd} сек")
+            except Exception as e:
+                logger.error(f"[AUTO] Критическая ошибка: не удалось запланировать следующий автопоиск для {user_id}: {e}")
             return
 
         elif result.get('status') == 'cooldown':
@@ -1156,8 +4586,8 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=user_id,
                     name=f"auto_search_{user_id}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (cooldown result) для {user_id}: {e}")
             return
         elif result.get('status') == 'no_drinks':
             # Сообщим один раз и попробуем через 10 минут
@@ -1172,21 +4602,23 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     chat_id=user_id,
                     name=f"auto_search_{user_id}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (no_drinks) для {user_id}: {e}")
             return
     except Exception:
         logger.exception("[AUTO] Ошибка в auto_search_job")
         # На случай исключений попробуем снова через 1 минуту
         try:
-            context.application.job_queue.run_once(
-                auto_search_job,
-                when=60,
-                chat_id=context.job.chat_id if getattr(context, 'job', None) else None,
-                name=f"auto_search_{context.job.chat_id}" if getattr(context, 'job', None) else None,
-            )
-        except Exception:
-            pass
+            if hasattr(context, 'job') and context.job and context.job.chat_id:
+                user_id = context.job.chat_id
+                context.application.job_queue.run_once(
+                    auto_search_job,
+                    when=60,
+                    chat_id=user_id,
+                    name=f"auto_search_{user_id}",
+                )
+        except Exception as e:
+            logger.warning(f"[AUTO] Не удалось перезапустить auto_search_job после ошибки: {e}")
 
 async def silk_harvest_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """Периодическая проверка готовности урожая шёлка."""
@@ -1271,12 +4703,13 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     vip_plus_active = db.is_vip_plus(user_id)
     vip_active = db.is_vip(user_id)
     
+    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
     if vip_plus_active:
-        eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+        eff_search_cd = base_search_cd / 4
     elif vip_active:
-        eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+        eff_search_cd = base_search_cd / 2
     else:
-        eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
+        eff_search_cd = base_search_cd
     if current_time - player.last_search < eff_search_cd:
         time_left = eff_search_cd - (current_time - player.last_search)
         return {"status": "cooldown", "time_left": time_left}
@@ -1300,15 +4733,41 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     else:
         rarity = random.choices(list(RARITIES.keys()), weights=list(RARITIES.values()), k=1)[0]
 
-    # Добавляем в инвентарь и обновляем игрока + награда септимами
+    # Базовая награда монет за факт поиска
     septims_reward = random.randint(5, 10)
     if vip_active:
         septims_reward *= 2
-    new_coins = (player.coins or 0) + septims_reward
-    db.add_drink_to_inventory(user_id=user_id, drink_id=found_drink.id, rarity=rarity)
-    db.update_player(user_id, last_search=current_time, coins=new_coins)
+
+    coins_before = int(player.coins or 0)
+    coins_after = coins_before + septims_reward
+
+    # Автопродажа: если включена для данной редкости и такой напиток уже есть в инвентаре,
+    # не кладём новый экземпляр в инвентарь, а сразу продаём по цене Приёмника.
+    autosell_enabled = False
+    autosell_payout = 0
+    try:
+        # Эксклюзивность: если в инвентаре ещё нет такого drink_id+rarity, НЕ автопродаём
+        already_have = db.has_inventory_item(user_id, found_drink.id, rarity)
+        if already_have and db.is_autosell_enabled(user_id, rarity):
+            autosell_enabled = True
+            try:
+                unit_payout = int(db.get_receiver_unit_payout(rarity) or 0)
+            except Exception:
+                unit_payout = 0
+            if unit_payout > 0:
+                autosell_payout = unit_payout
+                coins_after += autosell_payout
+    except Exception:
+        autosell_enabled = False
+
+    # Если автопродажа не сработала (отключена или цена 0) — добавляем напиток в инвентарь
+    if not autosell_enabled or autosell_payout <= 0:
+        db.add_drink_to_inventory(user_id=user_id, drink_id=found_drink.id, rarity=rarity)
+
+    # Обновляем игрока: фиксируем время поиска и новый баланс
+    db.update_player(user_id, last_search=current_time, coins=coins_after)
     logger.info(
-        f"[SEARCH] User {username} ({user_id}) found {found_drink.name} | rarity={rarity} | +{septims_reward} coins -> {new_coins}"
+        f"[SEARCH] User {username} ({user_id}) found {found_drink.name} | rarity={rarity} | +{septims_reward} coins, autosell={autosell_payout} -> {coins_after}"
     )
 
     # Планируем автонапоминание через JobQueue, если включено (учёт VIP-кулдауна)
@@ -1349,14 +4808,23 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     else:
         vip_line = ''
     
-    caption = (
-        f"🎉 Ты нашел энергетик!{vip_line}\n\n"
-        f"<b>Название:</b> {found_drink.name}\n"
-        f"<b>Редкость:</b> {rarity_emoji} {rarity}\n"
-        f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>\n"
-        f"💰 <b>Награда:</b> +{septims_reward} септимов (баланс: {new_coins})\n\n"
-        f"<i>{found_drink.description}</i>"
-    )
+    caption_lines = [
+        f"🎉 Ты нашел энергетик!{vip_line}",
+        "",
+        f"<b>Название:</b> {found_drink.name}",
+        f"<b>Редкость:</b> {rarity_emoji} {rarity}",
+        f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>",
+        f"💰 <b>Награда:</b> +{septims_reward} септимов",
+    ]
+
+    if autosell_enabled and autosell_payout > 0:
+        caption_lines.append(f"🧾 <b>Автопродажа:</b> +{autosell_payout} септимов (энергетик сразу продан через Приёмник)")
+
+    caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
+    caption_lines.append("")
+    caption_lines.append(f"<i>{found_drink.description}</i>")
+
+    caption = "\n".join(caption_lines)
     image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path) if found_drink.image_path else None
     
     return {
@@ -1382,13 +4850,13 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         vip_plus_active = db.is_vip_plus(user.id)
         vip_active = db.is_vip(user.id)
-        
+        base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
         if vip_plus_active:
-            eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+            eff_search_cd = base_search_cd / 4
         elif vip_active:
-            eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+            eff_search_cd = base_search_cd / 2
         else:
-            eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
+            eff_search_cd = base_search_cd
         if time.time() - player.last_search < eff_search_cd:
             await query.answer("Ещё не время! Подожди немного.", show_alert=True)
             return
@@ -1464,8 +4932,8 @@ async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: i
     )
     
     # Анимация: прокручиваем рулетку 3 секунды
-    duration = 3.0  # секунд
-    frames = 25  # количество кадров анимации
+    duration = 1.2  # секунд
+    frames = 8  # количество кадров анимации
     frame_delay = duration / frames  # задержка между кадрами
     
     # Создаём случайную последовательность для эффекта прокрутки
@@ -1535,13 +5003,13 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_time = time.time()
         vip_plus_active = db.is_vip_plus(user.id)
         vip_active = db.is_vip(user.id)
-        
+        base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
         if vip_plus_active:
-            eff_bonus_cd = DAILY_BONUS_COOLDOWN / 4  # x4 скорость для VIP+
+            eff_bonus_cd = base_bonus_cd / 4
         elif vip_active:
-            eff_bonus_cd = DAILY_BONUS_COOLDOWN / 2  # x2 скорость для VIP
+            eff_bonus_cd = base_bonus_cd / 2
         else:
-            eff_bonus_cd = DAILY_BONUS_COOLDOWN
+            eff_bonus_cd = base_bonus_cd
         if current_time - player.last_bonus_claim < eff_bonus_cd:
             time_left = int(eff_bonus_cd - (current_time - player.last_bonus_claim))
             hours, remainder = divmod(time_left, 3600)
@@ -1758,13 +5226,15 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
                 inventory_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
                 current_rarity = item.rarity
-            inventory_text += f"• {item.drink.name} — <b>{item.quantity} шт.</b>\n"
+            display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+            inventory_text += f"• {display_name} — <b>{item.quantity} шт.</b>\n"
 
         # Клавиатура с кнопками предметов (2 в строке)
         keyboard_rows = []
         current_row = []
         for item in page_items:
-            btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {item.drink.name}"
+            display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+            btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
             callback = f"view_{item.id}_p{page}"
             current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
             if len(current_row) == 2:
@@ -1926,13 +5396,15 @@ async def show_inventory_search_results(update: Update, context: ContextTypes.DE
             rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
             search_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
             current_rarity = item.rarity
-        search_text += f"• {item.drink.name} — <b>{item.quantity} шт.</b>\n"
+        display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+        search_text += f"• {display_name} — <b>{item.quantity} шт.</b>\n"
     
     # Клавиатура с кнопками предметов (2 в строке)
     keyboard_rows = []
     current_row = []
     for item in page_items:
-        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {item.drink.name}"
+        display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
         callback = f"view_{item.id}_sp{page}"
         current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
         if len(current_row) == 2:
@@ -1991,12 +5463,14 @@ async def inventory_search_cancel(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает статистику игрока."""
+    """Показывает расширенную статистику игрока."""
     query = update.callback_query
     await query.answer()
     
-    user_id = query.from_user.id
-    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    user = query.from_user
+    user_id = user.id
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    lang = player.language
     inventory_items = db.get_player_inventory_with_details(user_id)
     
     total_drinks = sum(item.quantity for item in inventory_items)
@@ -2019,40 +5493,166 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip_active = bool(vip_ts and time.time() < vip_ts)
     vip_plus_active = bool(vip_plus_ts and time.time() < vip_plus_ts)
     
+    # === ЗАГОЛОВОК И ПРОФИЛЬ ===
+    stats_text = f"<b>📊 Статистика игрока</b>\n"
+    stats_text += f"━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    # Информация о пользователе
+    username_display = f"@{user.username}" if user.username else user.first_name
+    stats_text += f"👤 <b>Игрок:</b> {username_display}\n"
+    stats_text += f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+    
+    # VIP статус
     if vip_plus_active:
-        vip_line = (
-            f"{VIP_PLUS_EMOJI} V.I.P+ до: {safe_format_timestamp(vip_plus_ts) or 'Невалидная дата'}\n"
-        )
+        vip_until_str = safe_format_timestamp(vip_plus_ts, '%d.%m.%Y %H:%M')
+        stats_text += f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_until_str})\n"
     elif vip_active:
-        vip_line = (
-            f"{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts) or 'Невалидная дата'}\n"
-        )
+        vip_until_str = safe_format_timestamp(vip_ts, '%d.%m.%Y %H:%M')
+        stats_text += f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until_str})\n"
     else:
-        vip_line = f"{VIP_EMOJI} V.I.P: нет\n"
+        stats_text += f"📊 <b>Статус:</b> Обычный игрок\n"
+    
+    stats_text += f"\n"
 
-    stats_text = (
-        f"<b>📊 Твоя статистика:</b>\n\n"
-        f"{vip_line}"
-        f"💰 Монет: {player.coins}\n"
-        f"🥤 Всего энергетиков: {total_drinks}\n"
-        f"🔑 Уникальных видов: {unique_drinks}\n\n"
-    )
+    # === БАЛАНС И КОЛЛЕКЦИЯ ===
+    stats_text += f"<b>💰 Экономика и коллекция:</b>\n"
+    stats_text += f"• Монет: <b>{player.coins:,}</b> 🪙\n"
+    stats_text += f"• Всего энергетиков: <b>{total_drinks}</b> 🥤\n"
+    stats_text += f"• Уникальных видов: <b>{unique_drinks}</b> 🔑\n"
+    
+    # Прогресс коллекции (процент от всех напитков)
+    try:
+        total_unique_drinks = db.count_all_drinks()
+        if total_unique_drinks > 0:
+            collection_percent = (unique_drinks / total_unique_drinks) * 100
+            progress_bar = create_progress_bar(collection_percent, length=10)
+            stats_text += f"• Прогресс коллекции: {progress_bar} {collection_percent:.1f}%\n"
+    except:
+        pass
+    
+    stats_text += f"\n"
 
-    # Добавляем сводку по редкостям
-    stats_text += "<b>По редкостям:</b>\n"
-    for rarity in RARITY_ORDER:
-        if rarity in rarity_counter:
-            emoji = COLOR_EMOJIS.get(rarity, '⚫')
-            stats_text += f"{emoji} {rarity}: {rarity_counter[rarity]}\n"
-    stats_text += "\n"
+    # === АКТИВНОСТЬ ===
+    stats_text += f"<b>⚡ Активность:</b>\n"
+    
+    # Последний поиск
+    if player.last_search:
+        last_search_str = safe_format_timestamp(player.last_search, '%d.%m.%Y %H:%M')
+        stats_text += f"• Последний поиск: {last_search_str}\n"
+    else:
+        stats_text += f"• Последний поиск: Еще не было\n"
+    
+    # Последний бонус
+    if player.last_bonus_claim:
+        last_bonus_str = safe_format_timestamp(player.last_bonus_claim, '%d.%m.%Y %H:%M')
+        stats_text += f"• Последний бонус: {last_bonus_str}\n"
+    else:
+        stats_text += f"• Последний бонус: Еще не было\n"
+    
+    # Автопоиск (только для VIP)
+    if vip_active or vip_plus_active:
+        auto_status = "Включен ✅" if player.auto_search_enabled else "Выключен ❌"
+        stats_text += f"• Автопоиск: {auto_status}\n"
+        
+        # Получаем актуальный счетчик с учетом сброса
+        now_ts = int(time.time())
+        reset_ts = int(player.auto_search_reset_ts or 0)
+        current_count = int(player.auto_search_count or 0)
+        
+        # Если время сброса прошло, счетчик должен быть 0
+        if reset_ts == 0 or now_ts >= reset_ts:
+            current_count = 0
+        
+        # Получаем правильный лимит с учетом VIP+ и бустов
+        try:
+            daily_limit = db.get_auto_search_daily_limit(user_id)
+        except:
+            # Если ошибка, используем базовый лимит
+            daily_limit = AUTO_SEARCH_DAILY_LIMIT
+            if vip_plus_active:
+                daily_limit *= 2
+        
+        stats_text += f"  └ Поисков сегодня: {current_count}/{daily_limit}\n"
+        
+        # Показываем время до сброса если счетчик активен
+        if reset_ts > now_ts and current_count > 0:
+            time_to_reset = reset_ts - now_ts
+            hours = time_to_reset // 3600
+            minutes = (time_to_reset % 3600) // 60
+            if hours > 0:
+                stats_text += f"  └ Сброс через: {hours} ч. {minutes} мин.\n"
+            elif minutes > 0:
+                stats_text += f"  └ Сброс через: {minutes} мин.\n"
+    
+    stats_text += f"\n"
 
-    # Топ-3 редких напитка
+    # === СТАТИСТИКА КАЗИНО ===
+    casino_total_games = (player.casino_wins or 0) + (player.casino_losses or 0)
+    if casino_total_games > 0:
+        stats_text += f"<b>🎰 Статистика казино:</b>\n"
+        stats_text += f"• Всего игр: <b>{casino_total_games}</b>\n"
+        stats_text += f"• Побед: <b>{player.casino_wins or 0}</b> 🎉\n"
+        stats_text += f"• Поражений: <b>{player.casino_losses or 0}</b> 😔\n"
+        
+        if casino_total_games > 0:
+            win_rate = (player.casino_wins or 0) / casino_total_games * 100
+            stats_text += f"• Винрейт: <b>{win_rate:.1f}%</b>\n"
+        
+        stats_text += f"\n"
+
+    # === ПО РЕДКОСТЯМ ===
+    if rarity_counter:
+        stats_text += f"<b>🎨 По редкостям:</b>\n"
+        for rarity in RARITY_ORDER:
+            if rarity in rarity_counter:
+                emoji = COLOR_EMOJIS.get(rarity, '⚫')
+                stats_text += f"{emoji} {rarity}: <b>{rarity_counter[rarity]}</b>\n"
+        stats_text += f"\n"
+
+    # === ТОП-3 РЕДКИХ НАХОДОК ===
     if top_items:
-        stats_text += "<b>🏆 Твои редкие находки:</b>\n"
+        stats_text += f"<b>🏆 Редкие находки:</b>\n"
         for idx, item in enumerate(top_items, start=1):
             emoji = ['🥇', '🥈', '🥉'][idx - 1] if idx <= 3 else '▫️'
             rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
-            stats_text += f"{emoji} {item.drink.name} ({rarity_emoji} {item.rarity}) — {item.quantity} шт.\n"
+            stats_text += f"{emoji} {item.drink.name} ({rarity_emoji} {item.rarity}) × {item.quantity}\n"
+        stats_text += f"\n"
+
+    # === ДОСТИЖЕНИЯ ===
+    achievements = []
+    
+    # Достижения по коллекции
+    if unique_drinks >= 100:
+        achievements.append("🏅 Коллекционер (100+ видов)")
+    elif unique_drinks >= 50:
+        achievements.append("🎖️ Собиратель (50+ видов)")
+    elif unique_drinks >= 25:
+        achievements.append("⭐ Энтузиаст (25+ видов)")
+    
+    # Достижения по балансу
+    if player.coins >= 1000000:
+        achievements.append("💎 Миллионер")
+    elif player.coins >= 100000:
+        achievements.append("💰 Богач")
+    
+    # Достижения казино
+    if (player.casino_wins or 0) >= 100:
+        achievements.append("🎰 Мастер казино")
+    elif (player.casino_wins or 0) >= 50:
+        achievements.append("🎲 Везунчик")
+    
+    # Достижения VIP
+    if vip_plus_active:
+        achievements.append("💎 VIP+ персона")
+    elif vip_active:
+        achievements.append("👑 VIP персона")
+    
+    if achievements:
+        stats_text += f"<b>🏅 Достижения:</b>\n"
+        for achievement in achievements:
+            stats_text += f"• {achievement}\n"
+    
+    stats_text += f"\n━━━━━━━━━━━━━━━━━━━"
 
     keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]
 
@@ -2343,6 +5943,17 @@ async def handle_sell_action(update: Update, context: ContextTypes.DEFAULT_TYPE,
         coins_after = int(result.get("coins_after", 0))
         left = int(result.get("item_left_qty", 0))
 
+        # Логируем транзакцию
+        user = query.from_user
+        db.log_action(
+            user_id=user_id,
+            username=user.username or user.first_name,
+            action_type='transaction',
+            action_details=f'Приёмник: продано {qsold} шт. по {unit} монет за шт.',
+            amount=total,
+            success=True
+        )
+
         # Обновляем инвентарь (внутри будет ответ на callback_query)
         await show_inventory(update, context)
 
@@ -2503,24 +6114,36 @@ async def show_extra_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Экран Казино в городе ХайТаун."""
+    """Экран Казино в городе ХайТаун - главное меню с выбором игр."""
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     coins = int(getattr(player, 'coins', 0) or 0)
+    
+    # Получаем статистику казино
+    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+    casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
+    casino_total = casino_wins + casino_losses
+    win_rate = (casino_wins / casino_total * 100) if casino_total > 0 else 0
 
     text = (
-        "<b>🎰 Казино ХайТаун</b>\n"
-        f"Ваш баланс: <b>{coins}</b> септимов.\n\n"
-        f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+        "<b>🎰 Казино ХайТаун</b>\n\n"
+        f"💰 Ваш баланс: <b>{coins}</b> септимов\n"
+        f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
+        "🎮 <b>Выберите игру:</b>\n"
     )
+
     keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-        [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
-        [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
-        [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+        [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
+        [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
+         InlineKeyboardButton("📊 Больше/Меньше", callback_data='casino_game_high_low')],
+        [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
+         InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
+        [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
+         InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2540,17 +6163,52 @@ async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_casino_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает правила всех игр казино."""
     query = update.callback_query
     await query.answer()
 
     text = (
-        "<b>📜 Правила Казино</b>\n\n"
-        f"• Игра: подбрасывание монеты (шанс ~{int(CASINO_WIN_PROB * 100)}% в пользу заведения).\n"
-        "• Выплата: 1 к 1 (вы получаете свою ставку и столько же сверху).\n"
-        "• Ставка списывается сразу. При победе начисляется двойная сумма.\n"
-        f"• Минимальная ставка: {CASINO_MIN_BET} септимов.\n"
-        f"• Максимальная ставка: {CASINO_MAX_BET} септимов.\n"
-        "• Играйте ответственно."
+        "<b>📜 Правила Казино ХайТаун</b>\n\n"
+        "🎮 <b>Доступные игры:</b>\n\n"
+        
+        "🪙 <b>Монетка</b>\n"
+        "├ Выберите Орёл или Решка\n"
+        "├ Шанс: 50%\n"
+        "└ Выплата: x2\n\n"
+        
+        "🎲 <b>Кости</b>\n"
+        "├ Выберите число от 1 до 6\n"
+        "├ Шанс: ~17%\n"
+        "└ Выплата: x5.5\n\n"
+        
+        "📊 <b>Больше/Меньше</b>\n"
+        "├ Выберите больше или меньше 50\n"
+        "├ Шанс: 49%\n"
+        "└ Выплата: x1.95\n\n"
+        
+        "🎡 <b>Рулетка (цвет)</b>\n"
+        "├ Выберите Красное или Чёрное\n"
+        "├ Шанс: ~49%\n"
+        "└ Выплата: x2\n\n"
+        
+        "🎯 <b>Рулетка (число)</b>\n"
+        "├ Угадай число 0-36\n"
+        "├ Шанс: ~3%\n"
+        "└ Выплата: x35\n\n"
+        
+        "🎰 <b>Слоты</b>\n"
+        "├ Три символа в ряд\n"
+        "├ Шанс: 15%\n"
+        "└ Выплата: до x20\n\n"
+        
+        f"⚙️ <b>Лимиты:</b>\n"
+        f"• Мин. ставка: {CASINO_MIN_BET} септимов\n"
+        f"• Макс. ставка: {CASINO_MAX_BET} септимов\n\n"
+        
+        "🏆 <b>Достижения:</b>\n"
+        "Получайте награды за победы!\n\n"
+        
+        "⚠️ Играйте ответственно!"
     )
     keyboard = [
         [InlineKeyboardButton("🔙 В Казино", callback_data='city_casino')],
@@ -2560,6 +6218,468 @@ async def show_casino_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     except BadRequest:
         await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+# === НОВЫЕ ФУНКЦИИ ДЛЯ ИГР КАЗИНО ===
+
+async def show_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str):
+    """Показывает экран выбора для конкретной игры - сначала выбор, потом ставка."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+
+    game_info = CASINO_GAMES.get(game_type, CASINO_GAMES['coin_flip'])
+    
+    # Для игр с выбором показываем экран выбора, для слотов - сразу ставки
+    if game_type in ['coin_flip', 'dice', 'high_low', 'roulette_color', 'roulette_number']:
+        await show_game_choice_screen(update, context, game_type, game_info, coins)
+    else:  # slots и другие игры без выбора
+        await show_bet_selection_screen(update, context, game_type, game_info, coins, None)
+
+
+async def show_game_choice_screen(update, context, game_type: str, game_info: dict, coins: int):
+    """Показывает экран выбора варианта для игры."""
+    query = update.callback_query
+    user = query.from_user
+    
+    text = (
+        f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
+        f"📋 {game_info['description']}\n"
+        f"🎯 Шанс выигрыша: {int(game_info['win_prob'] * 100)}%\n"
+        f"💰 Множитель: x{game_info['multiplier']}\n\n"
+        f"💵 Ваш баланс: <b>{coins}</b> септимов\n\n"
+    )
+    
+    keyboard = []
+    
+    if game_type == 'coin_flip':
+        text += "Выберите на что ставите:"
+        keyboard = [
+            [InlineKeyboardButton("🦅 Орёл", callback_data=f'casino_choice_{game_type}_heads'),
+             InlineKeyboardButton("🪙 Решка", callback_data=f'casino_choice_{game_type}_tails')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
+        ]
+    
+    elif game_type == 'dice':
+        text += "Выберите число от 1 до 6:"
+        keyboard = [
+            [InlineKeyboardButton("1️⃣", callback_data=f'casino_choice_{game_type}_1'),
+             InlineKeyboardButton("2️⃣", callback_data=f'casino_choice_{game_type}_2'),
+             InlineKeyboardButton("3️⃣", callback_data=f'casino_choice_{game_type}_3')],
+            [InlineKeyboardButton("4️⃣", callback_data=f'casino_choice_{game_type}_4'),
+             InlineKeyboardButton("5️⃣", callback_data=f'casino_choice_{game_type}_5'),
+             InlineKeyboardButton("6️⃣", callback_data=f'casino_choice_{game_type}_6')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
+        ]
+    
+    elif game_type == 'high_low':
+        text += "Число будет больше или меньше 50?"
+        keyboard = [
+            [InlineKeyboardButton("📈 Больше 50", callback_data=f'casino_choice_{game_type}_high'),
+             InlineKeyboardButton("📉 Меньше 50", callback_data=f'casino_choice_{game_type}_low')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
+        ]
+    
+    elif game_type == 'roulette_color':
+        text += "Выберите цвет:"
+        keyboard = [
+            [InlineKeyboardButton("🔴 Красное", callback_data=f'casino_choice_{game_type}_red'),
+             InlineKeyboardButton("⚫ Чёрное", callback_data=f'casino_choice_{game_type}_black')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
+        ]
+    
+    elif game_type == 'roulette_number':
+        text += "Выберите число от 0 до 36:"
+        # Показываем по 6 чисел в строке
+        keyboard = []
+        for i in range(0, 37, 6):
+            row = []
+            for num in range(i, min(i+6, 37)):
+                row.append(InlineKeyboardButton(str(num), callback_data=f'casino_choice_{game_type}_{num}'))
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='city_casino')])
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_bet_selection_screen(update, context, game_type: str, game_info: dict, coins: int, choice):
+    """Показывает экран выбора ставки после выбора варианта."""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Формируем текст с выбором игрока
+    choice_text = ""
+    if choice:  # Если был выбор (не слоты)
+        if game_type == 'coin_flip':
+            choice_text = f"Ваш выбор: <b>{'🦅 Орёл' if choice == 'heads' else '🪙 Решка'}</b>\n"
+        elif game_type == 'dice':
+            choice_text = f"Ваше число: <b>{choice}</b>\n"
+        elif game_type == 'high_low':
+            choice_text = f"Ваш выбор: <b>{'📈 Больше 50' if choice == 'high' else '📉 Меньше 50'}</b>\n"
+        elif game_type == 'roulette_color':
+            choice_text = f"Ваш цвет: <b>{'🔴 Красное' if choice == 'red' else '⚫ Чёрное'}</b>\n"
+        elif game_type == 'roulette_number':
+            choice_text = f"Ваше число: <b>{choice}</b>\n"
+    
+    text = (
+        f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
+        f"{choice_text}"
+        f"🎯 Шанс выигрыша: {int(game_info['win_prob'] * 100)}%\n"
+        f"💰 Множитель: до x{game_info['multiplier'] if game_type != 'slots' else '20'}\n\n"
+        f"💵 Ваш баланс: <b>{coins}</b> септимов\n\n"
+        "Выберите ставку:"
+    )
+
+    # Формируем callback_data в зависимости от наличия выбора
+    if choice:
+        bet_callback = f'casino_bet_{game_type}_{choice}'
+        change_button = [InlineKeyboardButton("🔙 Изменить выбор", callback_data=f'casino_game_{game_type}')]
+    else:
+        bet_callback = f'casino_bet_{game_type}_none'
+        change_button = []
+
+    keyboard = [
+        [InlineKeyboardButton("💵 100", callback_data=f'{bet_callback}_100'),
+         InlineKeyboardButton("💵 500", callback_data=f'{bet_callback}_500')],
+        [InlineKeyboardButton("💵 1,000", callback_data=f'{bet_callback}_1000'),
+         InlineKeyboardButton("💵 5,000", callback_data=f'{bet_callback}_5000')],
+        [InlineKeyboardButton("💵 10,000", callback_data=f'{bet_callback}_10000'),
+         InlineKeyboardButton("💵 25,000", callback_data=f'{bet_callback}_25000')],
+    ]
+    
+    if change_button:
+        keyboard.append(change_button)
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад в казино", callback_data='city_casino')])
+
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def play_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, player_choice: str, bet_amount: int):
+    """Играет в выбранную игру казино с выбором игрока."""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Проверка лимитов
+    if bet_amount < CASINO_MIN_BET or bet_amount > CASINO_MAX_BET:
+        await query.answer(f"Ставка должна быть от {CASINO_MIN_BET} до {CASINO_MAX_BET}", show_alert=True)
+        return
+
+    lock = _get_lock(f"user:{user.id}:casino")
+    if lock.locked():
+        await query.answer("Игра уже обрабатывается...", show_alert=True)
+        return
+
+    async with lock:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        coins = int(getattr(player, 'coins', 0) or 0)
+
+        if coins < bet_amount:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
+
+        # Списываем ставку
+        db.increment_coins(user.id, -bet_amount)
+
+        # Получаем информацию об игре
+        game_info = CASINO_GAMES.get(game_type, CASINO_GAMES['coin_flip'])
+        
+        # Определяем результат в зависимости от игры с учётом выбора игрока
+        win = False
+        result_text = ""
+        multiplier = game_info['multiplier']
+        
+        if game_type == 'coin_flip':
+            win, result_text = play_coin_flip(game_info, player_choice)
+        elif game_type == 'dice':
+            win, result_text, multiplier = play_dice(game_info, player_choice)
+        elif game_type == 'high_low':
+            win, result_text = play_high_low(game_info, player_choice)
+        elif game_type == 'roulette_color':
+            win, result_text = play_roulette_color(game_info, player_choice)
+        elif game_type == 'roulette_number':
+            win, result_text, multiplier = play_roulette_number(game_info, player_choice)
+        elif game_type == 'slots':
+            win, result_text, multiplier = play_slots(game_info)
+        else:
+            win = random.random() < game_info['win_prob']
+            result_text = "🎲 Результат определён"
+
+        # Начисляем выигрыш
+        winnings = 0
+        if win:
+            winnings = int(bet_amount * multiplier)
+            db.increment_coins(user.id, winnings)
+            # Обновляем статистику побед
+            current_wins = int(getattr(player, 'casino_wins', 0) or 0)
+            db.update_player_stats(user.id, casino_wins=current_wins + 1)
+            # Логируем выигрыш
+            db.log_action(
+                user_id=user.id,
+                username=user.username or user.first_name,
+                action_type='casino',
+                action_details=f'{game_type}: ставка {bet_amount}, выигрыш {winnings}',
+                amount=winnings,
+                success=True
+            )
+        else:
+            # Обновляем статистику поражений
+            current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+            db.update_player_stats(user.id, casino_losses=current_losses + 1)
+            # Логируем проигрыш
+            db.log_action(
+                user_id=user.id,
+                username=user.username or user.first_name,
+                action_type='casino',
+                action_details=f'{game_type}: ставка {bet_amount}, проигрыш',
+                amount=-bet_amount,
+                success=False
+            )
+
+        # Проверяем достижения
+        achievement_bonus = check_casino_achievements(user.id, player)
+
+        # Формируем сообщение о результате
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        new_balance = int(getattr(player, 'coins', 0) or 0)
+        
+        # Логируем результат для отладки
+        logger.info(f"Casino game result - Type: {game_type}, Win: {win}, Result text: {result_text[:50]}...")
+        
+        await show_game_result(query, user, game_info, bet_amount, win, winnings, 
+                              new_balance, result_text, achievement_bonus, context)
+
+
+def play_coin_flip(game_info, player_choice):
+    """Игра: подбрасывание монеты."""
+    # player_choice: 'heads' или 'tails'
+    result = random.choice(['heads', 'tails'])
+    win = (result == player_choice)
+    
+    result_emoji = '🦅 Орёл' if result == 'heads' else '🪙 Решка'
+    choice_emoji = '🦅 Орёл' if player_choice == 'heads' else '🪙 Решка'
+    
+    result_text = (
+        f"🎲 Ваш выбор: <b>{choice_emoji}</b>\n"
+        f"🪙 Выпало: <b>{result_emoji}</b>\n"
+        f"{'✅ Совпадение!' if win else '❌ Не угадали'}"
+    )
+    return win, result_text
+
+
+def play_dice(game_info, player_choice):
+    """Игра: игральная кость."""
+    # player_choice: '1' до '6'
+    player_number = int(player_choice)
+    dice_result = random.randint(1, 6)
+    win = (dice_result == player_number)
+    
+    result_text = (
+        f"🎯 Ваше число: <b>{player_number}</b>\n"
+        f"🎲 Выпало: <b>{dice_result}</b>\n"
+        f"{'✅ Угадали!' if win else '❌ Не угадали'}"
+    )
+    multiplier = game_info['multiplier'] if win else game_info['multiplier']
+    return win, result_text, multiplier
+
+
+def play_high_low(game_info, player_choice):
+    """Игра: больше/меньше 50."""
+    # player_choice: 'high' или 'low'
+    number = random.randint(1, 100)
+    
+    is_higher = number > 50
+    is_correct = (is_higher and player_choice == 'high') or (not is_higher and player_choice == 'low')
+    win = is_correct
+    
+    choice_text = '📈 Больше 50' if player_choice == 'high' else '📉 Меньше 50'
+    actual_text = '📈 Больше 50' if is_higher else '📉 Меньше 50'
+    result_text = (
+        f"🎯 Ваш выбор: <b>{choice_text}</b>\n"
+        f"📊 Выпало: <b>{number}</b> ({actual_text})\n"
+        f"{'✅ Угадали!' if win else '❌ Не угадали'}"
+    )
+    return win, result_text
+
+
+def play_roulette_color(game_info, player_choice):
+    """Игра: рулетка - красное/чёрное."""
+    # player_choice: 'red' или 'black'
+    number = random.randint(0, 36)
+    
+    if number == 0:
+        color = '🟢 Зелёное'
+        color_code = 'green'
+        win = False
+    else:
+        # Красные: 1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36
+        red_numbers = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
+        is_red = number in red_numbers
+        color = '🔴 Красное' if is_red else '⚫ Чёрное'
+        color_code = 'red' if is_red else 'black'
+        win = (color_code == player_choice)
+    
+    choice_text = '🔴 Красное' if player_choice == 'red' else '⚫ Чёрное'
+    result_text = (
+        f"🎯 Ваш выбор: <b>{choice_text}</b>\n"
+        f"🎡 Выпало: <b>{number}</b> ({color})\n"
+        f"{'✅ Угадали!' if win else '❌ Не угадали' if color_code != 'green' else '❌ Выпал зелёный 0'}"
+    )
+    return win, result_text
+
+
+def play_roulette_number(game_info, player_choice):
+    """Игра: рулетка - угадай число."""
+    # player_choice: '0' до '36'
+    player_number = int(player_choice)
+    number = random.randint(0, 36)
+    win = (number == player_number)
+    
+    result_text = (
+        f"🎯 Ваше число: <b>{player_number}</b>\n"
+        f"🎡 Выпало: <b>{number}</b>\n"
+        f"{'✅ Точное попадание!' if win else '❌ Не угадали'}"
+    )
+    multiplier = game_info['multiplier'] if win else game_info['multiplier']
+    return win, result_text, multiplier
+
+
+def play_slots(game_info):
+    """Игра: слоты."""
+    # Взвешенная вероятность для символов
+    symbols_weights = [20, 15, 12, 10, 8, 3, 2]  # Вероятности для каждого символа
+    slot1 = random.choices(SLOT_SYMBOLS, weights=symbols_weights)[0]
+    slot2 = random.choices(SLOT_SYMBOLS, weights=symbols_weights)[0]
+    slot3 = random.choices(SLOT_SYMBOLS, weights=symbols_weights)[0]
+    
+    combination = f"{slot1}{slot2}{slot3}"
+    win = (slot1 == slot2 == slot3)
+    
+    # Определяем множитель выплаты
+    multiplier = SLOT_PAYOUTS.get(combination, 3.0) if win else 0
+    
+    # Формируем красивый результат
+    if win:
+        result_text = (
+            f"🎰 Результат:\n"
+            f"┏━━━━━━━━━━━━━┓\n"
+            f"┃  <b>{slot1} {slot2} {slot3}</b>  ┃\n"
+            f"┗━━━━━━━━━━━━━┛\n"
+            f"💫 Множитель: <b>x{int(multiplier)}</b>"
+        )
+    else:
+        result_text = (
+            f"🎰 Результат:\n"
+            f"┏━━━━━━━━━━━━━┓\n"
+            f"┃  <b>{slot1} {slot2} {slot3}</b>  ┃\n"
+            f"┗━━━━━━━━━━━━━┛"
+        )
+    
+    return win, result_text, multiplier
+
+
+def check_casino_achievements(user_id, player):
+    """Проверяет и выдает достижения казино."""
+    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+    unlocked_achievements = getattr(player, 'casino_achievements', '') or ''
+    
+    bonus = 0
+    new_achievement = None
+    
+    for ach_id, ach_data in CASINO_ACHIEVEMENTS.items():
+        if ach_id not in unlocked_achievements and casino_wins >= ach_data['wins']:
+            # Выдаем достижение
+            unlocked_achievements += f"{ach_id},"
+            db.update_player_stats(user_id, casino_achievements=unlocked_achievements)
+            bonus = ach_data['reward']
+            new_achievement = ach_data
+            db.increment_coins(user_id, bonus)
+            break
+    
+    return {'bonus': bonus, 'achievement': new_achievement} if new_achievement else None
+
+
+async def show_game_result(query, user, game_info, bet_amount, win, winnings, 
+                           new_balance, result_text, achievement_bonus, context):
+    """Показывает результат игры."""
+    if win:
+        profit = winnings - bet_amount
+        result_line = f"🎉 <b>ПОБЕДА!</b> 🎉\n💰 Выигрыш: +{profit} септимов"
+    else:
+        result_line = f"💥 <b>Поражение</b>\n💸 Потеряно: {bet_amount} септимов"
+
+    achievement_text = ""
+    if achievement_bonus:
+        ach = achievement_bonus['achievement']
+        achievement_text = f"\n\n🏆 <b>Достижение разблокировано!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']} септимов"
+
+    # Добавляем разделитель для лучшей читаемости
+    text = (
+        f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{result_text}\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"{result_line}\n"
+        f"💵 Баланс: <b>{new_balance}</b> септимов"
+        f"{achievement_text}"
+    )
+    
+    # Логируем для отладки
+    logger.info(f"Showing casino result, text length: {len(text)}, has result_text: {bool(result_text)}")
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 Играть ещё", callback_data=f'casino_game_{list(CASINO_GAMES.keys())[list(CASINO_GAMES.values()).index(game_info)]}')],
+        [InlineKeyboardButton("🎮 Другая игра", callback_data='city_casino')],
+        [InlineKeyboardButton("🔙 Выход", callback_data='city_hightown')],
+    ]
+
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_casino_achievements_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает страницу достижений казино."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    
+    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+    unlocked = getattr(player, 'casino_achievements', '') or ''
+
+    text = "<b>🏆 Достижения Казино</b>\n\n"
+    
+    for ach_id, ach_data in CASINO_ACHIEVEMENTS.items():
+        if ach_id in unlocked:
+            status = "✅"
+        else:
+            status = "🔒"
+        
+        text += f"{status} <b>{ach_data['name']}</b>\n"
+        text += f"   {ach_data['desc']}\n"
+        text += f"   Награда: {ach_data['reward']} септимов\n"
+        text += f"   Прогресс: {casino_wins}/{ach_data['wins']}\n\n"
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 В Казино", callback_data='city_casino')],
+    ]
+
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
@@ -2603,21 +6723,38 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if win:
             coins_after = db.increment_coins(user.id, int(amount) * 2) or after_debit + int(amount) * 2
             result_line = f"🎉 Победа! Вы получаете +{amount} септимов."
+            # Обновляем статистику побед
+            current_wins = int(getattr(player, 'casino_wins', 0) or 0)
+            db.update_player_stats(user.id, casino_wins=current_wins + 1)
         else:
             result_line = f"💥 Поражение! Списано {amount} септимов."
+            # Обновляем статистику поражений
+            current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+            db.update_player_stats(user.id, casino_losses=current_losses + 1)
 
-        # Перерисовываем экран с обновлённым балансом и результатом
+        # Перерисовываем экран с обновлённым балансом и результатом (новое меню)
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+        casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
+        casino_total = casino_wins + casino_losses
+        win_rate = (casino_wins / casino_total * 100) if casino_total > 0 else 0
+        
         text = (
-            "<b>🎰 Казино ХайТаун</b>\n"
+            "<b>🎰 Казино ХайТаун</b>\n\n"
             f"{result_line}\n"
-            f"Баланс: <b>{int(coins_after)}</b> септимов.\n\n"
-            f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+            f"💵 Баланс: <b>{int(coins_after)}</b> септимов\n"
+            f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
+            "🎮 <b>Выберите игру:</b>"
         )
         keyboard = [
-            [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-            [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
-            [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
-            [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+            [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
+            [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
+             InlineKeyboardButton("📊 Больше/Меньше", callback_data='casino_game_high_low')],
+            [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
+             InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
+            [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+            [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
+             InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
             [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         ]
         try:
@@ -2632,17 +6769,29 @@ async def open_casino_from_text(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     coins = int(getattr(player, 'coins', 0) or 0)
+    
+    # Получаем статистику казино
+    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+    casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
+    casino_total = casino_wins + casino_losses
+    win_rate = (casino_wins / casino_total * 100) if casino_total > 0 else 0
 
     text = (
-        "<b>🎰 Казино ХайТаун</b>\n"
-        f"Ваш баланс: <b>{coins}</b> септимов.\n\n"
-        f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+        "<b>🎰 Казино ХайТаун</b>\n\n"
+        f"💰 Ваш баланс: <b>{coins}</b> септимов\n"
+        f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
+        "🎮 <b>Выберите игру:</b>\n"
     )
+
     keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-        [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
-        [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
-        [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+        [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
+        [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
+         InlineKeyboardButton("📊 Больше/Меньше", callback_data='casino_game_high_low')],
+        [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
+         InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
+        [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
+         InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
     ]
     await msg.reply_html(text=text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -2740,21 +6889,38 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
         if win:
             coins_after = db.increment_coins(user.id, bet_amount * 2) or after_debit + bet_amount * 2
             result_line = f"🎉 Победа! Вы получаете +{bet_amount} септимов."
+            # Обновляем статистику побед
+            current_wins = int(getattr(player, 'casino_wins', 0) or 0)
+            db.update_player_stats(user.id, casino_wins=current_wins + 1)
         else:
             result_line = f"💥 Поражение! Списано {bet_amount} септимов."
+            # Обновляем статистику поражений
+            current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+            db.update_player_stats(user.id, casino_losses=current_losses + 1)
         
-        # Показываем результат
+        # Показываем результат с новым главным меню
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+        casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
+        casino_total = casino_wins + casino_losses
+        win_rate = (casino_wins / casino_total * 100) if casino_total > 0 else 0
+        
         text = (
-            "<b>🎰 Казино ХайТаун</b>\n"
+            "<b>🎰 Казино ХайТаун</b>\n\n"
             f"{result_line}\n"
-            f"Баланс: <b>{int(coins_after)}</b> септимов.\n\n"
-            f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+            f"💵 Баланс: <b>{int(coins_after)}</b> септимов\n"
+            f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
+            "🎮 <b>Выберите игру:</b>"
         )
         keyboard = [
-            [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-            [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
-            [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
-            [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+            [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
+            [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
+             InlineKeyboardButton("📊 Больше/Меньше", callback_data='casino_game_high_low')],
+            [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
+             InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
+            [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+            [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
+             InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
             [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         ]
         
@@ -2778,16 +6944,28 @@ async def show_casino_after_custom_bet(msg, user, context):
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     coins = int(getattr(player, 'coins', 0) or 0)
     
+    # Получаем статистику казино
+    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
+    casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
+    casino_total = casino_wins + casino_losses
+    win_rate = (casino_wins / casino_total * 100) if casino_total > 0 else 0
+
     text = (
-        "<b>🎰 Казино ХайТаун</b>\n"
-        f"Ваш баланс: <b>{coins}</b> септимов.\n\n"
-        f"Ставка 1:1, шанс ~{int(CASINO_WIN_PROB * 100)}%. Играть на свой риск!"
+        "<b>🎰 Казино ХайТаун</b>\n\n"
+        f"💰 Ваш баланс: <b>{coins}</b> септимов\n"
+        f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
+        "🎮 <b>Выберите игру:</b>\n"
     )
+
     keyboard = [
-        [InlineKeyboardButton("🎲 Ставка 100", callback_data='casino_bet_100'), InlineKeyboardButton("🎲 500", callback_data='casino_bet_500')],
-        [InlineKeyboardButton("🎲 1000", callback_data='casino_bet_1000'), InlineKeyboardButton("🎲 5000", callback_data='casino_bet_5000')],
-        [InlineKeyboardButton("💰 Своя ставка", callback_data='casino_custom_bet')],
-        [InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
+        [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
+        [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
+         InlineKeyboardButton("📊 Больше/Меньше", callback_data='casino_game_high_low')],
+        [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
+         InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
+        [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
+         InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
     ]
     
@@ -2860,6 +7038,8 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
+    context.user_data['last_plantation_screen'] = 'market'
+
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
@@ -2904,6 +7084,7 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     user = query.from_user
+    context.user_data['last_plantation_screen'] = 'beds'
     # Гарантируем грядки и читаем текущее состояние
     try:
         db.ensure_player_beds(user.id)
@@ -3280,7 +7461,14 @@ async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes
     else:
         lines.append("\n⚠️ Нет удобрений в выбранной категории.")
     
-    keyboard.append([InlineKeyboardButton("🔙 Назад в меню", callback_data='market_plantation')])
+    # Кнопки возврата: если пришли из грядок, даём прямой возврат к ним
+    if context.user_data.get('last_plantation_screen') == 'beds':
+        keyboard.append([
+            InlineKeyboardButton("🔙 Назад в грядки", callback_data='plantation_my_beds'),
+            InlineKeyboardButton("🔙 Назад в меню", callback_data='market_plantation')
+        ])
+    else:
+        keyboard.append([InlineKeyboardButton("🔙 Назад в меню", callback_data='market_plantation')])
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def handle_fertilizer_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int, quantity: int):
@@ -3304,7 +7492,11 @@ async def handle_fertilizer_buy(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         else:
             await query.answer(f"Куплено! Баланс: {res.get('coins_left')}", show_alert=False)
-        await show_plantation_fertilizers_shop(update, context)
+
+        if context.user_data.get('last_plantation_screen') == 'beds':
+            await show_plantation_my_beds(update, context)
+        else:
+            await show_plantation_fertilizers_shop(update, context)
 
 async def start_fertilizer_custom_buy_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Wrapper для извлечения fertilizer_id из callback_data."""
@@ -3441,10 +7633,14 @@ async def handle_fertilizer_custom_qty_input(update: Update, context: ContextTyp
         else:
             name = html.escape(getattr(fert, 'name', 'Удобрение'))
             await msg.reply_html(f"✅ <b>Куплено!</b>\n\n{name} x {quantity}\n💰 Баланс: {res.get('coins_left')} септимов")
-        
-        # Показываем магазин
-        keyboard = [[InlineKeyboardButton("🧪 Вернуться в магазин", callback_data='plantation_fertilizers_shop')]]
-        await msg.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        # Предлагаем вернуться в нужный раздел после покупки
+        if context.user_data.get('last_plantation_screen') == 'beds':
+            keyboard = [[InlineKeyboardButton("🌾 Мои грядки", callback_data='plantation_my_beds')]]
+            await msg.reply_text("Куда вернуться?", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            keyboard = [[InlineKeyboardButton("🧪 Вернуться в магазин", callback_data='plantation_fertilizers_shop')]]
+            await msg.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
     
     return ConversationHandler.END
 
@@ -3453,7 +7649,10 @@ async def cancel_fertilizer_custom_buy(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     if query:
         await query.answer()
-        await show_plantation_fertilizers_shop(update, context)
+        if context.user_data.get('last_plantation_screen') == 'beds':
+            await show_plantation_my_beds(update, context)
+        else:
+            await show_plantation_fertilizers_shop(update, context)
     return ConversationHandler.END
 
 async def show_plantation_fertilizers_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3963,7 +8162,7 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
             except Exception:
                 try:
                     await context.bot.send_message(chat_id=user.id, text=text, parse_mode='HTML')
-                except Exception:
+                except  Exception:
                     pass
 
         # Короткое сводное уведомление
@@ -4035,12 +8234,42 @@ async def show_cities_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    text = "<b>🏙️ Города</b>\nВыберите город:"
+    text = (
+        "<b>🏙️ КАРТА ГОРОДОВ 🏙️</b>\n\n"
+        "🌍 <i>Откройте для себя четыре уникальных города, каждый со своими возможностями!</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🏰 <b>ХАЙТАУН</b>\n"
+        "   <i>Торговый центр мира</i>\n"
+        "   ┣ 🏬 Магазин редкостей\n"
+        "   ┣ ♻️ Приёмник ресурсов\n"
+        "   ┣ 🌱 Плантация грибов\n"
+        "   ┗ 🎰 Роскошное казино\n\n"
+        "🧵 <b>ГОРОД ШЁЛКА</b>\n"
+        "   <i>Империя шёлковых мануфактур</i>\n"
+        "   ┣ 🌳 Шёлковые плантации\n"
+        "   ┣ 📊 Динамичный рынок\n"
+        "   ┗ 💼 Торговля тканями\n\n"
+        "🌆 <b>РОСТОВ</b>\n"
+        "   <i>Город будущего и элиты</i>\n"
+        "   ┣ 💎 Магазин для избранных\n"
+        "   ┗ 💱 Валютный обменник\n\n"
+        "⚡ <b>ЛИНИИ ЭЛЕКТРОПЕРЕДАЧ</b>\n"
+        "   <i>Промышленные пустоши и странные феномены</i>\n"
+        "   ┣ 🌀 Сематори\n"
+        "   ┣ 🔥 Красные ядра земли\n"
+        "   ┣ 🧪 Поле стекловаты\n"
+        "   ┗ 🍊 Хурма?\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💰 <b>Ваш баланс:</b> {coins:,} 💎\n"
+        "<i>Выберите город для посещения:</i>"
+    ).format(coins=player.coins)
+    
     keyboard = [
         [InlineKeyboardButton("🏰 Город ХайТаун", callback_data='city_hightown')],
         [InlineKeyboardButton("🧵 Город Шёлка", callback_data='city_silk')],
         [InlineKeyboardButton("🌆 Город Ростов", callback_data='city_rostov')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("⚡ Линии Электропередач", callback_data='city_powerlines')],
+        [InlineKeyboardButton("🔙 В главное меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4067,14 +8296,31 @@ async def show_city_hightown(update: Update, context: ContextTypes.DEFAULT_TYPE)
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    text = "<b>🏰 Город ХайТаун</b>\nВыберите раздел:"
+    text = (
+        "🏰 <b>ДОБРО ПОЖАЛОВАТЬ В ХАЙТАУН</b> 🏰\n\n"
+        "🌟 <i>Старейший торговый город, где процветает коммерция и азарт!</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📍 <b>ДОСТУПНЫЕ ЛОКАЦИИ:</b>\n\n"
+        "🏬 <b>Магазин</b>\n"
+        "   └ <i>Приобретайте редкие предметы и улучшения</i>\n\n"
+        "♻️ <b>Приёмник</b>\n"
+        "   └ <i>Сдавайте ресурсы за септимы</i>\n\n"
+        "🌱 <b>Плантация</b>\n"
+        "   └ <i>Выращивайте грибы и зарабатывайте</i>\n\n"
+        "🎰 <b>Казино</b>\n"
+        "   └ <i>Испытайте удачу и выиграйте джекпот!</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💰 <b>Ваш баланс:</b> {coins:,} 💎\n"
+        "<i>Куда направиться?</i>"
+    ).format(coins=player.coins)
+    
     keyboard = [
         [InlineKeyboardButton("🏬 Магазин", callback_data='market_shop')],
         [InlineKeyboardButton("♻️ Приёмник", callback_data='market_receiver')],
         [InlineKeyboardButton("🌱 Плантация", callback_data='market_plantation')],
         [InlineKeyboardButton("🎰 Казино", callback_data='city_casino')],
         [InlineKeyboardButton("🔙 К городам", callback_data='cities_menu')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4101,13 +8347,30 @@ async def show_city_rostov(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    text = "<b>🌆 Город Ростов</b>\nВыберите раздел:"
+    text = (
+        "🌆 <b>ДОБРО ПОЖАЛОВАТЬ В РОСТОВ</b> 🌆\n\n"
+        "✨ <i>Футуристический город элиты, где роскошь встречается с инновациями!</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📍 <b>ЭКСКЛЮЗИВНЫЕ ЛОКАЦИИ:</b>\n\n"
+        "💎 <b>Магазин Элиты</b>\n"
+        "   └ <i>Уникальные товары премиум-класса</i>\n"
+        "   └ 🚧 <b>В разработке...</b>\n\n"
+        "🧬 <b>Хаб</b>\n"
+        "   └ <i>Центр работы с селюками</i>\n\n"
+        "💱 <b>Обменник</b>\n"
+        "   └ <i>Обмен валют и ресурсов по лучшим курсам</i>\n"
+        "   └ 🚧 <b>В разработке...</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💰 <b>Ваш баланс:</b> {coins:,} 💎\n"
+        "⏳ <i>Город скоро откроет свои двери для вас!</i>"
+    ).format(coins=player.coins)
+    
     keyboard = [
-        [InlineKeyboardButton("🎯 Клуб 42", callback_data='rostov_club42')],
-        [InlineKeyboardButton("💎 Магазин элиты", callback_data='rostov_elite_shop')],
-        [InlineKeyboardButton("💱 Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("💎 Магазин элиты 🚧", callback_data='rostov_elite_shop')],
+        [InlineKeyboardButton("🧬 Хаб", callback_data='rostov_hub')],
+        [InlineKeyboardButton("💱 Обменник 🚧", callback_data='rostov_exchange')],
         [InlineKeyboardButton("🔙 К городам", callback_data='cities_menu')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4125,8 +8388,7 @@ async def show_city_rostov(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
-async def show_rostov_club42(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Заглушка для Клуба 42."""
+async def show_city_powerlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -4134,10 +8396,64 @@ async def show_rostov_club42(update: Update, context: ContextTypes.DEFAULT_TYPE)
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    text = "<b>🎯 Клуб 42</b>\n\n🚧 <i>В разработке</i>"
+    text = (
+        "⚡ <b>ДОБРО ПОЖАЛОВАТЬ В ЛИНИИ ЭЛЕКТРОПЕРЕДАЧ</b> ⚡\n\n"
+        "🌪️ <i>Промышленные пустоши и странные феномены</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📍 <b>ДОСТУПНЫЕ ЛОКАЦИИ:</b>\n\n"
+        "🌀 <b>Сематори</b>\n"
+        "   └ <i>Таинственные вихри и аномалии</i>\n\n"
+        "🔥 <b>Красные ядра земли</b>\n"
+        "   └ <i>Живое тепло под ногами</i>\n\n"
+        "🧪 <b>Поле стекловаты</b>\n"
+        "   └ <i>Хрупкая тишина и резкие грани</i>\n\n"
+        "🍊 <b>Хурма?</b>\n"
+        "   └ <i>Неожиданные плоды среди линий</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💰 <b>Ваш баланс:</b> {coins:,} 💎\n"
+        "<i>Куда направиться?</i>"
+    ).format(coins=player.coins)
+
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_rostov')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("🌀 Сематори", callback_data='power_sematori')],
+        [InlineKeyboardButton("🔥 Красные ядра земли", callback_data='power_red_cores')],
+        [InlineKeyboardButton("🧪 Поле стекловаты", callback_data='power_glasswool_field')],
+        [InlineKeyboardButton("🍊 Хурма?", callback_data='power_persimmon')],
+        [InlineKeyboardButton("🔙 К городам", callback_data='cities_menu')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_power_sematori(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🌀 <b>СЕМАТОРИ</b> 🌀\n\n"
+        "🌪️ <i>Место, где ветер шепчет формулы</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появятся события и активити.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4146,6 +8462,264 @@ async def show_rostov_club42(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except BadRequest:
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
+
+async def show_power_red_cores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🔥 <b>КРАСНЫЕ ЯДРА ЗЕМЛИ</b> 🔥\n\n"
+        "🌋 <i>Пульсирующее сердце пустошей</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Следите за обновлениями — скоро здесь будет активность.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_power_glasswool_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🧪 <b>ПОЛЕ СТЕКЛОВАТЫ</b> 🧪\n\n"
+        "🫧 <i>Хрупкая тишина и острые грани</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро тут появятся эксперименты и испытания.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_power_persimmon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🍊 <b>ХУРМА?</b> 🍊\n\n"
+        "🍃 <i>Неожиданная сладость среди проводов</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Совсем скоро здесь появится контент.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_sept_to_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "💱 <b>ОБМЕН СЕПТИМОВ НА ВАЛЮТУ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появится обмен септимов на особые валюты.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_sept_to_resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "📦 <b>ОБМЕН СЕПТИМОВ НА РЕСУРСЫ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появится обмен септимов на ресурсы.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_sept_to_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🧩 <b>ОБМЕН СЕПТИМОВ НА ЧАСТИ БОЕВЫХ КАРТ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появится обмен септимов на части боевых карт.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_convert_resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🔄 <b>КОНВЕРТАЦИЯ РЕСУРСОВ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появится конвертация ресурсов.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_resource_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "📊 <b>КУРСЫ ПО РЕСУРСАМ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появятся курсы конвертации ресурсов.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_daily_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🔥 <b>ПРЕДЛОЖЕНИЯ ДНЯ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появятся специальные предложения дня.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🎁 <b>ВАШИ БОНУСЫ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появятся персональные бонусы Обменника.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_exchange_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🧾 <b>МОЯ ИСТОРИЯ ОПЕРАЦИЙ</b>\n\n"
+        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появится история операций Обменника.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Обменник", callback_data='rostov_exchange')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 async def show_rostov_elite_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Заглушка для Магазина элиты."""
@@ -4156,10 +8730,542 @@ async def show_rostov_elite_shop(update: Update, context: ContextTypes.DEFAULT_T
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    text = "<b>💎 Магазин элиты</b>\n\n🚧 <i>В разработке</i>"
+    text = (
+        "💎 <b>МАГАЗИН ЭЛИТЫ</b> 💎\n\n"
+        "👑 <i>Роскошь для истинных ценителей</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚧 <b>МАГАЗИН В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "🔮 <b>Будет доступно:</b>\n\n"
+        "✨ Легендарные предметы\n"
+        "🎨 Уникальные кастомизации\n"
+        "⚡ Мощные усиления\n"
+        "🔰 Эксклюзивные титулы\n"
+        "🌟 Редкие коллекционные вещи\n"
+        "💫 Специальные эффекты\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⏳ <i>Скоро откроется!\nПриготовьте свои септимы.</i>"
+    )
+    
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_rostov')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("💠 Элитные предметы", callback_data='rostov_elite_items')],
+        [InlineKeyboardButton("⚡ Усилители", callback_data='rostov_elite_boosters')],
+        [InlineKeyboardButton("🎨 Темы и эмодзи", callback_data='rostov_elite_themes')],
+        [InlineKeyboardButton("🔰 Титулы", callback_data='rostov_elite_titles')],
+        [InlineKeyboardButton("🌟 Коллекционки", callback_data='rostov_elite_collectibles')],
+        [InlineKeyboardButton("🎫 Боевой Пропуск", callback_data='rostov_elite_battlepass')],
+        [InlineKeyboardButton("🃏 Карточки", callback_data='rostov_elite_cards')],
+        [InlineKeyboardButton("🔙 Вернуться в Ростов", callback_data='city_rostov')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    _ = player.language
+
+    text = (
+        "🧬 <b>ХАБ РОСТОВА</b> 🧬\n\n"
+        "📡 <i>Центр управления селюками и сделками</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📍 <b>ДОСТУПНЫЕ РАЗДЕЛЫ:</b>\n\n"
+        "👥 <b>Ваши селюки</b>\n"
+        "   └ <i>Просмотр принадлежащих вам селюков</i>\n\n"
+        "📦 <b>Селюки на продажу</b>\n"
+        "   └ <i>Список доступных селюков на рынке</i>\n\n"
+        "💸 <b>Продажа селюка</b>\n"
+        "   └ <i>Выставление ваших селюков на продажу</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💰 <b>Ваш баланс:</b> {coins:,} 💎\n"
+        "<i>Выберите раздел:</i>"
+    ).format(coins=player.coins)
+
+    keyboard = [
+        [InlineKeyboardButton("👥 Ваши селюки", callback_data='rostov_hub_my_selyuki')],
+        [InlineKeyboardButton("📦 Селюки на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+        [InlineKeyboardButton("💸 Продажа селюка", callback_data='rostov_hub_sell_selyuk')],
+        [InlineKeyboardButton("🔙 Вернуться в Ростов", callback_data='city_rostov')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_hub_my_selyuki(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    selyuki = db.get_player_selyuki(user.id)
+
+    if not selyuki:
+        text = (
+            "👥 <b>ВАШИ СЕЛЮКИ</b>\n\n"
+            "У тебя пока нет селюков.\n\n"
+            "Загляни в раздел \"Селюки на продажу\", чтобы купить первого помощника."
+        )
+        keyboard = [
+            [InlineKeyboardButton("📦 Селюки на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+            [InlineKeyboardButton("🔙 Вернуться в Хаб", callback_data='rostov_hub')],
+            [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+        ]
+    else:
+        lines = ["👥 <b>ВАШИ СЕЛЮКИ</b>"]
+        keyboard = []
+
+        for s in selyuki:
+            stype = str(getattr(s, 'type', '') or '')
+            if stype == 'farmer':
+                lvl = int(getattr(s, 'level', 1) or 1)
+                bal = int(getattr(s, 'balance_septims', 0) or 0)
+                enabled = bool(getattr(s, 'is_enabled', False))
+                status = "✅ Вкл" if enabled else "🚫 Выкл"
+                lines.append(f"\n👨‍🌾 <b>Селюк фермер</b> — ур. {lvl}, баланс: {bal} 💎, статус: {status}")
+                keyboard.append([InlineKeyboardButton("👨‍🌾 Управление фермером", callback_data='selyuk_farmer_manage')])
+
+        lines.append("\nВыбери селюка для управления.")
+        text = "\n".join(lines)
+        keyboard.append([InlineKeyboardButton("🔙 Вернуться в Хаб", callback_data='rostov_hub')])
+        keyboard.append([InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_hub_selyuki_on_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "📦 <b>СЕЛЮКИ НА ПРОДАЖУ</b>\n\n"
+        "🧬 <i>Выберите тип селюка, которого хотите приобрести</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👨‍🌾 <b>Селюк фермер</b> — заботится о ваших ресурсах\n"
+        "🧵 <b>Селюк шёлковод</b> — мастер шёлковых плантаций\n"
+        "🧮 <b>Селюк махинаций</b> — отвечает за хитрые схемы\n"
+        "🛒 <b>Селюк покупатель</b> — ищет выгодные сделки\n"
+        "👑 <b>Босс селюков</b> — управляет всей их командой\n\n"
+        "🚧 <b>Функционал рынка в разработке</b> 🚧\n\n"
+        "⏳ <i>Сейчас доступен выбор типа, позже появятся подробные офферы.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("👨‍🌾 Селюк фермер", callback_data='selyuk_type_farmer')],
+        [InlineKeyboardButton("🧵 Селюк шёлковод", callback_data='selyuk_type_silkmaker')],
+        [InlineKeyboardButton("🧮 Селюк махинаций", callback_data='selyuk_type_trickster')],
+        [InlineKeyboardButton("🛒 Селюк покупатель", callback_data='selyuk_type_buyer')],
+        [InlineKeyboardButton("👑 Босс селюков", callback_data='selyuk_type_boss')],
+        [InlineKeyboardButton("🔙 Вернуться в Хаб", callback_data='rostov_hub')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_type_farmer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    farmer = db.get_selyuk_by_type(user.id, 'farmer')
+
+    if farmer:
+        lvl = int(getattr(farmer, 'level', 1) or 1)
+        bal = int(getattr(farmer, 'balance_septims', 0) or 0)
+        enabled = bool(getattr(farmer, 'is_enabled', False))
+        status = "✅ Вкл" if enabled else "🚫 Выкл"
+        text = (
+            "👨‍🌾 <b>СЕЛЮК ФЕРМЕР</b>\n\n"
+            "У тебя уже есть селюк фермер.\n\n"
+            f"Уровень: {lvl}\n"
+            f"Баланс селюка: {bal} 💎\n"
+            f"Статус: {status}\n\n"
+            "Фермер автоматически поливает обычные плантации энергетиков, "
+            "если включены напоминания о поливе и на его балансе есть ≥ 50 септимов."
+        )
+        keyboard = [
+            [InlineKeyboardButton("👨‍🌾 Управление фермером", callback_data='selyuk_farmer_manage')],
+            [InlineKeyboardButton("🔙 Назад к селюкам на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+            [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+        ]
+    else:
+        text = (
+            "👨‍🌾 <b>СЕЛЮК ФЕРМЕР</b>\n\n"
+            "🌾 Трудолюбивый помощник для обычных плантаций энергетиков.\n\n"
+            "• Автоматически поливает грядки, как только они готовы к поливу.\n"
+            "• За каждый полив списывает 50 септимов с <b>баланса селюка</b>.\n"
+            "• Работает только при включённых напоминаниях о поливе.\n\n"
+            "<b>Стоимость покупки:</b> 50 000 💎\n"
+            "Начальный баланс селюка: 0 💎 (пополняется отдельно)."
+        )
+        keyboard = [
+            [InlineKeyboardButton("💰 Купить за 50 000", callback_data='selyuk_buy_farmer')],
+            [InlineKeyboardButton("🔙 Назад к селюкам на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+            [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+        ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_farmer_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    farmer = db.get_selyuk_by_type(user.id, 'farmer')
+
+    if not farmer:
+        text = (
+            "👨‍🌾 <b>СЕЛЮК ФЕРМЕР</b>\n\n"
+            "У тебя ещё нет селюка фермера.\n\n"
+            "Купи его в разделе \"Селюки на продажу\"."
+        )
+        keyboard = [
+            [InlineKeyboardButton("📦 Селюки на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+            [InlineKeyboardButton("🔙 Вернуться в Хаб", callback_data='rostov_hub')],
+        ]
+    else:
+        lvl = int(getattr(farmer, 'level', 1) or 1)
+        bal = int(getattr(farmer, 'balance_septims', 0) or 0)
+        enabled = bool(getattr(farmer, 'is_enabled', False))
+        status = "✅ Включен" if enabled else "🚫 Выключен"
+        coins = int(getattr(player, 'coins', 0) or 0)
+
+        text = (
+            "👨‍🌾 <b>СЕЛЮК ФЕРМЕР</b>\n\n"
+            f"Уровень: {lvl}\n"
+            f"Баланс селюка: {bal} 💎\n"
+            f"Статус: {status}\n\n"
+            f"Баланс игрока: {coins} 💎\n\n"
+            "Фермер автоматически поливает обычные плантации, когда:\n"
+            "• грядка готова к поливу;\n"
+            "• включены напоминания о поливе;\n"
+            "• на балансе селюка есть ≥ 50 септимов."
+        )
+
+        toggle_text = "🚫 Выключить" if enabled else "✅ Включить"
+        keyboard = [
+            [InlineKeyboardButton(toggle_text, callback_data='selyuk_farmer_toggle')],
+            [
+                InlineKeyboardButton("💰 +1 000 на баланс", callback_data='selyuk_farmer_topup_1000'),
+                InlineKeyboardButton("💰 +10 000", callback_data='selyuk_farmer_topup_10000'),
+            ],
+            [InlineKeyboardButton("ℹ️ Как работает", callback_data='selyuk_farmer_howto')],
+            [InlineKeyboardButton("⬆️ Улучшить селюка", callback_data='selyuk_farmer_upgrade')],
+            [InlineKeyboardButton("💸 Продать селюка", callback_data='selyuk_farmer_sell')],
+            [InlineKeyboardButton("🔙 К Вашим селюкам", callback_data='rostov_hub_my_selyuki')],
+        ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def handle_selyuk_buy_farmer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    res = db.buy_farmer_selyuk(user.id, price=50000)
+
+    if not res.get('ok'):
+        reason = res.get('reason')
+        if reason == 'already_have_farmer':
+            await query.answer("У тебя уже есть селюк фермер.", show_alert=True)
+        elif reason == 'not_enough_coins':
+            need = int(res.get('need') or 50000)
+            have = int(res.get('have') or getattr(player, 'coins', 0) or 0)
+            await query.answer(f"Недостаточно септимов для покупки. Нужно {need}, у тебя {have}.", show_alert=True)
+        else:
+            await query.answer("Не удалось купить селюка фермера.", show_alert=True)
+        await show_selyuk_type_farmer(update, context)
+        return
+
+    await query.answer("Селюк фермер куплен!", show_alert=True)
+    await show_selyuk_farmer_manage(update, context)
+
+
+async def handle_selyuk_farmer_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    farmer = db.get_selyuk_by_type(user.id, 'farmer')
+    if not farmer:
+        await query.answer("Селюк фермер не найден.", show_alert=True)
+        await show_rostov_hub_my_selyuki(update, context)
+        return
+
+    new_state = not bool(getattr(farmer, 'is_enabled', False))
+    dbs = db.SessionLocal()
+    try:
+        row = (
+            dbs.query(db.Selyuk)
+            .filter(db.Selyuk.owner_id == int(user.id), db.Selyuk.type == 'farmer')
+            .with_for_update(read=False)
+            .first()
+        )
+        if row:
+            row.is_enabled = new_state
+            try:
+                row.updated_at = int(time.time())
+            except Exception:
+                pass
+            dbs.commit()
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+    finally:
+        dbs.close()
+
+    await show_selyuk_farmer_manage(update, context)
+
+
+async def handle_selyuk_farmer_topup(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    res = db.topup_selyuk_balance_from_player(user.id, 'farmer', amount)
+
+    if not res.get('ok'):
+        reason = res.get('reason')
+        if reason == 'not_enough_coins':
+            need = int(res.get('need') or amount)
+            have = int(res.get('have') or 0)
+            await query.answer(f"Недостаточно септимов. Нужно {need}, у тебя {have}.", show_alert=True)
+        elif reason == 'no_selyuk':
+            await query.answer("Селюк фермер не найден.", show_alert=True)
+        else:
+            await query.answer("Не удалось пополнить баланс селюка.", show_alert=True)
+    else:
+        await query.answer("Баланс селюка пополнен.", show_alert=False)
+
+    await show_selyuk_farmer_manage(update, context)
+
+
+async def show_selyuk_farmer_howto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "ℹ️ <b>КАК РАБОТАЕТ СЕЛЮК ФЕРМЕР</b>\n\n"
+        "• Работает только с обычными плантациями энергетиков.\n"
+        "• Когда грядка готова к поливу, фермер пытается полить её автоматически.\n"
+        "• За каждый полив списывается 50 септимов с баланса селюка.\n"
+        "• Для работы фермера должны быть включены напоминания о поливе.\n"
+        "• Если на балансе селюка меньше 50 септимов, он не поливает грядку."
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
+        "Система прокачки уровней селюка будет добавлена позже."
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_farmer_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "💸 <b>ПРОДАЖА СЕЛЮКА ФЕРМЕРА</b>\n\n"
+        "Механика продажи селюков пока в разработке."
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_type_silkmaker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🧵 <b>СЕЛЮК ШЁЛКОВОД</b>\n\n"
+        "🌳 <i>Специалист по шёлковым плантациям и добыче редкого ресурса.</i>\n\n"
+        "🚧 <b>РАЗДЕЛ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро здесь появится его эффективность и цена.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к селюкам на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_type_trickster(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🧮 <b>СЕЛЮК МАХИНАЦИЙ</b>\n\n"
+        "📊 <i>Отвечает за хитрые схемы и рискованные операции.</i>\n\n"
+        "🚧 <b>РАЗДЕЛ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Позже тут появятся бонусы и особенности махинаций.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к селюкам на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_type_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "🛒 <b>СЕЛЮК ПОКУПАТЕЛЬ</b>\n\n"
+        "💰 <i>Ищет выгодные предложения и помогает с покупками.</i>\n\n"
+        "🚧 <b>РАЗДЕЛ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Здесь позже появятся его преимущества и стоимость.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к селюкам на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_selyuk_type_boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "👑 <b>БОСС СЕЛЮКОВ</b>\n\n"
+        "🧬 <i>Главный среди селюков, усиливает работу всей команды.</i>\n\n"
+        "🚧 <b>РАЗДЕЛ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Позже здесь появятся его уникальные способности и цена.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Назад к селюкам на продажу", callback_data='rostov_hub_selyuki_on_sale')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_rostov_hub_sell_selyuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    text = (
+        "💸 <b>ПРОДАЖА СЕЛЮКА</b>\n\n"
+        "🚧 <b>РАЗДЕЛ В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "⏳ <i>Скоро вы сможете выставлять селюков на продажу.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Вернуться в Хаб", callback_data='rostov_hub')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4178,10 +9284,33 @@ async def show_rostov_exchange(update: Update, context: ContextTypes.DEFAULT_TYP
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     _ = player.language
 
-    text = "<b>💱 Обменник</b>\n\n🚧 <i>В разработке</i>"
+    text = (
+        "💱 <b>ВАЛЮТНЫЙ ОБМЕННИК</b> 💱\n\n"
+        "📈 <i>Лучшие курсы обмена в регионе</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🚧 <b>ОБМЕННИК В РАЗРАБОТКЕ</b> 🚧\n\n"
+        "🔮 <b>Планируемые функции:</b>\n\n"
+        "💰 Обмен септимов на особые валюты\n"
+        "🔄 Конвертация ресурсов\n"
+        "📊 Динамические курсы обмена\n"
+        "💎 Выгодные предложения дня\n"
+        "🎁 Бонусы за крупные обмены\n"
+        "📈 История операций\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⏳ <i>Готовимся к открытию!\nСкоро начнём работу.</i>"
+    )
+    
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_rostov')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("💱 Обмен Септимов на валюту 🚧", callback_data='rostov_exchange_sept_to_currency')],
+        [InlineKeyboardButton("📦 Обмен Септимов на ресурсы 🚧", callback_data='rostov_exchange_sept_to_resources')],
+        [InlineKeyboardButton("🧩 Обмен Септимов на части боевых карт 🚧", callback_data='rostov_exchange_sept_to_cards')],
+        [InlineKeyboardButton("🔄 Конвертация ресурсов 🚧", callback_data='rostov_exchange_convert_resources')],
+        [InlineKeyboardButton("📊 Курсы по ресурсам 🚧", callback_data='rostov_exchange_resource_rates')],
+        [InlineKeyboardButton("🔥 Предложения дня 🚧", callback_data='rostov_exchange_daily_deals')],
+        [InlineKeyboardButton("🎁 Ваши бонусы 🚧", callback_data='rostov_exchange_bonuses')],
+        [InlineKeyboardButton("🧾 Моя история операций 🚧", callback_data='rostov_exchange_history')],
+        [InlineKeyboardButton("🔙 Вернуться в Ростов", callback_data='city_rostov')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4315,6 +9444,16 @@ async def handle_shop_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, of
             dn = res.get('drink_name')
             rr = res.get('rarity')
             coins = res.get('coins_left')
+            price = SHOP_PRICES.get(rr, 0)
+            # Логируем покупку
+            db.log_action(
+                user_id=user.id,
+                username=user.username or user.first_name,
+                action_type='purchase',
+                action_details=f'Магазин: {dn} ({rr}), оффер #{offer_index}',
+                amount=-price,
+                success=True
+            )
             await query.answer(f"Куплено: {dn} ({rr}). Баланс: {coins}", show_alert=True)
  
 async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5098,6 +10237,8 @@ async def show_bonus_steam_game(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
+    if await abort_if_banned(update, context):
+        return
     user = update.effective_user
     # Регистрируем группу, если команда в группе
     try:
@@ -5110,12 +10251,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает все нажатия на inline-кнопки."""
+    if await abort_if_banned(update, context):
+        return
     # Регистрируем группу, если нажатие было в группе
     try:
         await register_group_if_needed(update)
     except Exception:
         pass
     query = update.callback_query
+    if not query:
+        return
+    
     data = query.data
     
     # Чтобы не падало, если кнопка без данных
@@ -5127,6 +10273,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_menu(update, context)
     elif data == 'creator_panel':
         await show_creator_panel(update, context)
+    elif data == 'creator_wipe':
+        await creator_wipe_start(update, context)
+    elif data == 'creator_wipe_confirm':
+        await creator_wipe_confirm(update, context)
     elif data == 'creator_reset_bonus':
         await creator_reset_bonus_start(update, context)
     elif data == 'creator_give_coins':
@@ -5143,6 +10293,256 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await creator_admin_demote_start(update, context)
     elif data == 'creator_admin_remove':
         await creator_admin_remove_start(update, context)
+    elif data == 'admin_bot_stats':
+        await show_bot_stats(update, context)
+    elif data == 'admin_players_menu':
+        await show_admin_players_menu(update, context)
+    elif data == 'admin_player_search':
+        await admin_player_search_start(update, context)
+    elif data == 'admin_players_list' or data.startswith('admin_players_list:'):
+        await admin_players_list(update, context)
+    elif data == 'admin_players_top':
+        await admin_players_top(update, context)
+    elif data.startswith('admin_player_details:'):
+        await show_player_details(update, context)
+    elif data.startswith('admin_player_balance:'):
+        await admin_player_balance_start(update, context)
+    elif data.startswith('admin_player_vip:'):
+        await admin_player_vip_menu(update, context)
+    elif data.startswith('admin_player_vip_give:'):
+        # Переадресуем на стандартный обработчик VIP с указанием player_id
+        parts = data.split(':')
+        if len(parts) > 1:
+            context.user_data['admin_vip_player_id'] = int(parts[1])
+        await admin_vip_give_start(update, context)
+    elif data.startswith('admin_player_vip_plus_give:'):
+        parts = data.split(':')
+        if len(parts) > 1:
+            context.user_data['admin_vip_plus_player_id'] = int(parts[1])
+        await admin_vip_plus_give_start(update, context)
+    elif data.startswith('admin_player_vip_remove:'):
+        parts = data.split(':')
+        if len(parts) > 1:
+            player_id = int(parts[1])
+            dbs = SessionLocal()
+            try:
+                player = dbs.query(Player).filter(Player.user_id == player_id).first()
+                if player:
+                    db.update_player(player_id, vip_until=0)
+                    await query.answer("✅ VIP отозван!", show_alert=False)
+                    await show_player_details(update, context, player_id)
+                else:
+                    await query.answer("❌ Игрок не найден", show_alert=True)
+            finally:
+                dbs.close()
+    elif data.startswith('admin_player_vip_plus_remove:'):
+        parts = data.split(':')
+        if len(parts) > 1:
+            player_id = int(parts[1])
+            dbs = SessionLocal()
+            try:
+                player = dbs.query(Player).filter(Player.user_id == player_id).first()
+                if player:
+                    db.update_player(player_id, vip_plus_until=0)
+                    await query.answer("✅ VIP+ отозван!", show_alert=False)
+                    await show_player_details(update, context, player_id)
+                else:
+                    await query.answer("❌ Игрок не найден", show_alert=True)
+            finally:
+                dbs.close()
+    elif data.startswith('admin_player_logs:'):
+        await admin_player_logs_show(update, context)
+    elif data.startswith('admin_player_reset_bonus:'):
+        await admin_player_reset_bonus_execute(update, context)
+    elif data == 'admin_vip_menu':
+        await show_admin_vip_menu(update, context)
+    elif data == 'admin_stock_menu':
+        logger.info(f"[BUTTON_HANDLER] Обработка кнопки admin_stock_menu от пользователя {query.from_user.id}")
+        await show_admin_stock_menu(update, context)
+    elif data == 'admin_broadcast_menu':
+        await show_admin_broadcast_menu(update, context)
+    elif data == 'admin_broadcast_start':
+        await admin_broadcast_start(update, context)
+    elif data == 'admin_vip_give':
+        await admin_vip_give_start(update, context)
+    elif data == 'admin_vip_plus_give':
+        await admin_vip_plus_give_start(update, context)
+    elif data == 'admin_vip_remove':
+        await admin_vip_remove_start(update, context)
+    elif data == 'admin_vip_plus_remove':
+        await admin_vip_plus_remove_start(update, context)
+    elif data == 'admin_vip_list':
+        await admin_vip_list_show(update, context)
+    
+    # Новые разделы админ панели
+    elif data == 'admin_analytics':
+        await show_admin_analytics(update, context)
+    elif data == 'admin_analytics_export':
+        await export_admin_analytics(update, context)
+    elif data == 'admin_drinks_menu':
+        await show_admin_drinks_menu(update, context)
+    elif data == 'admin_promo_menu':
+        await show_admin_promo_menu(update, context)
+    elif data == 'admin_settings_menu':
+        await show_admin_settings_menu(update, context)
+    elif data == 'admin_settings_cooldowns':
+        await show_admin_settings_cooldowns(update, context)
+    elif data == 'admin_settings_set_search_cd':
+        await admin_settings_set_search_cd_start(update, context)
+    elif data == 'admin_settings_set_bonus_cd':
+        await admin_settings_set_bonus_cd_start(update, context)
+    elif data == 'admin_moderation_menu':
+        await show_admin_moderation_menu(update, context)
+    elif data == 'admin_mod_ban':
+        await admin_mod_ban_start(update, context)
+    elif data == 'admin_mod_unban':
+        await admin_mod_unban_start(update, context)
+    elif data == 'admin_mod_banlist':
+        await admin_mod_banlist_show(update, context)
+    elif data == 'admin_mod_check':
+        await admin_mod_check_start(update, context)
+    elif data == 'admin_mod_history':
+        await admin_mod_history_show(update, context)
+    elif data == 'admin_mod_warnings':
+        await admin_mod_warnings_menu(update, context)
+    elif data == 'admin_warn_add':
+        await admin_warn_add_start(update, context)
+    elif data == 'admin_warn_list':
+        await admin_warn_list_start(update, context)
+    elif data == 'admin_warn_clear':
+        await admin_warn_clear_start(update, context)
+    elif data == 'admin_logs_menu':
+        try:
+            await show_admin_logs_menu(update, context)
+        except Exception as e:
+            logger.error(f"Ошибка при открытии меню логов: {e}", exc_info=True)
+            await query.answer("❌ Ошибка при открытии меню логов", show_alert=True)
+    elif data == 'admin_economy_menu':
+        await show_admin_economy_menu(update, context)
+    elif data == 'admin_events_menu':
+        await show_admin_events_menu(update, context)
+    
+    # Управление энергетиками
+    elif data == 'admin_drink_add':
+        await admin_drink_add_start(update, context)
+    elif data == 'admin_drink_edit':
+        await admin_drink_edit_start(update, context)
+    elif data == 'admin_drink_rename':
+        await admin_drink_rename_start(update, context)
+    elif data == 'admin_drink_redesc':
+        await admin_drink_redesc_start(update, context)
+    elif data == 'admin_drink_update_photo':
+        await admin_drink_update_photo_start(update, context)
+    elif data == 'admin_drink_delete':
+        await admin_drink_delete_start(update, context)
+    elif data == 'admin_drink_list':
+        await admin_drink_list_show_ids(update, context)
+    elif data.startswith('admin_drink_list_p'):
+        await admin_drink_list_show(update, context)
+    elif data == 'admin_drink_search':
+        await admin_drink_search_start(update, context)
+    elif data == 'drink_confirm_rename' or data == 'drink_cancel_rename':
+        user = query.from_user
+        if not has_creator_panel_access(user.id, user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        did = context.user_data.get('edit_drink_id')
+        new_name = context.user_data.get('pending_rename')
+        if data == 'drink_confirm_rename' and did and new_name:
+            ok = db.admin_update_drink(int(did), name=new_name)
+            text = "✅ Название обновлено" if ok else "❌ Ошибка при обновлении"
+        else:
+            text = "Отменено"
+        try:
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+        except BadRequest:
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+        context.user_data.pop('pending_rename', None)
+        context.user_data.pop('edit_drink_id', None)
+        context.user_data.pop('awaiting_admin_action', None)
+    elif data == 'drink_confirm_redesc' or data == 'drink_cancel_redesc':
+        user = query.from_user
+        if not has_creator_panel_access(user.id, user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        did = context.user_data.get('edit_drink_id')
+        new_desc = context.user_data.get('pending_redesc')
+        if data == 'drink_confirm_redesc' and did and new_desc is not None:
+            ok = db.admin_update_drink(int(did), description=new_desc)
+            text = "✅ Описание обновлено" if ok else "❌ Ошибка при обновлении"
+        else:
+            text = "Отменено"
+        try:
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+        except BadRequest:
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+        context.user_data.pop('pending_redesc', None)
+        context.user_data.pop('edit_drink_id', None)
+        context.user_data.pop('awaiting_admin_action', None)
+    elif data == 'drink_confirm_photo' or data == 'drink_cancel_photo':
+        user = query.from_user
+        if not has_creator_panel_access(user.id, user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        did = context.user_data.get('edit_drink_id')
+        image_name = context.user_data.get('pending_photo')
+        if data == 'drink_confirm_photo' and did and image_name:
+            ok = db.admin_update_drink_image(int(did), image_name)
+            text = "✅ Фото обновлено" if ok else "❌ Ошибка при обновлении фото"
+        else:
+            if image_name:
+                try:
+                    fp = os.path.join(ENERGY_IMAGES_DIR, image_name)
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception:
+                    pass
+            text = "Отменено"
+        try:
+            if getattr(query.message, 'photo', None):
+                await query.message.edit_caption(caption=text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+            else:
+                await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+        except BadRequest:
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')]]))
+        context.user_data.pop('pending_photo', None)
+        context.user_data.pop('edit_drink_id', None)
+        context.user_data.pop('awaiting_admin_action', None)
+    
+    # Логи системы
+    elif data == 'admin_logs_recent':
+        await show_admin_logs_recent(update, context)
+    elif data == 'admin_logs_transactions':
+        await show_admin_logs_transactions(update, context)
+    elif data == 'admin_logs_casino':
+        await show_admin_logs_casino(update, context)
+    elif data == 'admin_logs_purchases':
+        await show_admin_logs_purchases(update, context)
+    elif data == 'admin_logs_player':
+        await show_admin_logs_player_start(update, context)
+    elif data == 'admin_logs_errors':
+        await show_admin_logs_errors(update, context)
+    
+    # Заглушки для остальных подразделов (временно возвращают в меню)
+    elif data in [
+                  'admin_settings_limits', 'admin_settings_casino', 'admin_settings_shop', 'admin_settings_notifications',
+                  'admin_settings_localization',
+                  'admin_econ_shop_prices', 'admin_econ_casino_bets', 'admin_econ_rewards',
+                  'admin_econ_inflation', 'admin_econ_vip_prices', 'admin_econ_exchange', 'admin_event_create',
+                  'admin_event_list_active', 'admin_event_list_all', 'admin_event_edit', 'admin_event_end',
+                  'admin_event_stats']:
+        await query.answer("⚙️ Функция в разработке!", show_alert=True)
+    elif data == 'admin_promo_create':
+        await admin_promo_create_start(update, context)
+    elif data == 'admin_promo_list_active':
+        await admin_promo_list_active_show(update, context)
+    elif data == 'admin_promo_list_all':
+        await admin_promo_list_all_show(update, context)
+    elif data == 'admin_promo_deactivate':
+        await admin_promo_deactivate_start(update, context)
+    elif data == 'admin_promo_stats':
+        await admin_promo_stats_show(update, context)
+    
     elif data == 'find_energy':
         await find_energy(update, context)
     elif data == 'claim_bonus':
@@ -5184,12 +10584,82 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await silk_ui.show_city_silk(update, context)
     elif data == 'city_rostov':
         await show_city_rostov(update, context)
-    elif data == 'rostov_club42':
-        await show_rostov_club42(update, context)
+    elif data == 'city_powerlines':
+        await show_city_powerlines(update, context)
+    elif data == 'rostov_hub':
+        await show_rostov_hub(update, context)
+    elif data == 'power_sematori':
+        await show_power_sematori(update, context)
+    elif data == 'power_red_cores':
+        await show_power_red_cores(update, context)
+    elif data == 'power_glasswool_field':
+        await show_power_glasswool_field(update, context)
+    elif data == 'power_persimmon':
+        await show_power_persimmon(update, context)
+    elif data == 'rostov_hub_my_selyuki':
+        await show_rostov_hub_my_selyuki(update, context)
+    elif data == 'rostov_hub_selyuki_on_sale':
+        await show_rostov_hub_selyuki_on_sale(update, context)
+    elif data == 'rostov_hub_sell_selyuk':
+        await show_rostov_hub_sell_selyuk(update, context)
+    elif data == 'selyuk_type_farmer':
+        await show_selyuk_type_farmer(update, context)
+    elif data == 'selyuk_type_silkmaker':
+        await show_selyuk_type_silkmaker(update, context)
+    elif data == 'selyuk_type_trickster':
+        await show_selyuk_type_trickster(update, context)
+    elif data == 'selyuk_type_buyer':
+        await show_selyuk_type_buyer(update, context)
+    elif data == 'selyuk_type_boss':
+        await show_selyuk_type_boss(update, context)
+    elif data == 'selyuk_buy_farmer':
+        await handle_selyuk_buy_farmer(update, context)
+    elif data == 'selyuk_farmer_manage':
+        await show_selyuk_farmer_manage(update, context)
+    elif data == 'selyuk_farmer_toggle':
+        await handle_selyuk_farmer_toggle(update, context)
+    elif data == 'selyuk_farmer_howto':
+        await show_selyuk_farmer_howto(update, context)
+    elif data == 'selyuk_farmer_upgrade':
+        await show_selyuk_farmer_upgrade(update, context)
+    elif data == 'selyuk_farmer_sell':
+        await show_selyuk_farmer_sell(update, context)
+    elif data.startswith('selyuk_farmer_topup_'):
+        try:
+            amt = int(data.split('_')[-1])
+            await handle_selyuk_farmer_topup(update, context, amt)
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'rostov_elite_shop':
         await show_rostov_elite_shop(update, context)
+    elif data in [
+        'rostov_elite_items',
+        'rostov_elite_boosters',
+        'rostov_elite_themes',
+        'rostov_elite_titles',
+        'rostov_elite_collectibles',
+        'rostov_elite_battlepass',
+        'rostov_elite_cards',
+    ]:
+        await query.answer("⚙️ Раздел Магазина элиты в разработке!", show_alert=True)
     elif data == 'rostov_exchange':
         await show_rostov_exchange(update, context)
+    elif data == 'rostov_exchange_sept_to_currency':
+        await show_rostov_exchange_sept_to_currency(update, context)
+    elif data == 'rostov_exchange_sept_to_resources':
+        await show_rostov_exchange_sept_to_resources(update, context)
+    elif data == 'rostov_exchange_sept_to_cards':
+        await show_rostov_exchange_sept_to_cards(update, context)
+    elif data == 'rostov_exchange_convert_resources':
+        await show_rostov_exchange_convert_resources(update, context)
+    elif data == 'rostov_exchange_resource_rates':
+        await show_rostov_exchange_resource_rates(update, context)
+    elif data == 'rostov_exchange_daily_deals':
+        await show_rostov_exchange_daily_deals(update, context)
+    elif data == 'rostov_exchange_bonuses':
+        await show_rostov_exchange_bonuses(update, context)
+    elif data == 'rostov_exchange_history':
+        await show_rostov_exchange_history(update, context)
     elif data == 'silk_plantations':
         await silk_ui.show_silk_plantations(update, context)
     elif data == 'silk_market':
@@ -5269,14 +10739,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_plantation_water_all(update, context)
     elif data == 'plantation_leaderboard':
         await show_plantation_leaderboard(update, context)
-    elif data.startswith('casino_bet_'):
-        try:
-            amount = int(data.split('_')[-1])
-            await handle_casino_bet(update, context, amount)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'casino_rules':
         await show_casino_rules(update, context)
+    elif data == 'casino_achievements':
+        await show_casino_achievements_page(update, context)
+    elif data.startswith('casino_game_'):
+        # casino_game_{game_type}
+        try:
+            game_type = data.replace('casino_game_', '')
+            await show_casino_game(update, context, game_type)
+        except Exception as e:
+            logger.error(f"Error in casino_game: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('casino_choice_'):
+        # casino_choice_{game_type}_{choice}
+        try:
+            parts = data.replace('casino_choice_', '').split('_', 1)
+            game_type = parts[0]
+            choice = parts[1]
+            # Показываем экран выбора ставки
+            player = db.get_or_create_player(update.callback_query.from_user.id, 
+                                            update.callback_query.from_user.username or update.callback_query.from_user.first_name)
+            coins = int(getattr(player, 'coins', 0) or 0)
+            game_info = CASINO_GAMES.get(game_type, CASINO_GAMES['coin_flip'])
+            await show_bet_selection_screen(update, context, game_type, game_info, coins, choice)
+        except Exception as e:
+            logger.error(f"Error in casino_choice: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('casino_bet_'):
+        # casino_bet_{game_type}_{choice}_{amount}
+        try:
+            parts = data.replace('casino_bet_', '').rsplit('_', 1)
+            amount = int(parts[1])
+            # Разделяем game_type и choice
+            game_and_choice = parts[0].rsplit('_', 1)
+            if len(game_and_choice) == 2:
+                game_type = game_and_choice[0]
+                choice = game_and_choice[1]
+                # Если choice='none', значит это слоты
+                if choice == 'none':
+                    choice = None
+            else:
+                # Для слотов нет choice
+                game_type = parts[0]
+                choice = None
+            await play_casino_game(update, context, game_type, choice, amount)
+        except Exception as e:
+            logger.error(f"Error in casino_bet: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('casino_play_'):
+        # casino_play_{game_type}_{amount} - старый формат для слотов
+        try:
+            parts = data.replace('casino_play_', '').rsplit('_', 1)
+            game_type = parts[0]
+            amount = int(parts[1])
+            await play_casino_game(update, context, game_type, None, amount)
+        except Exception as e:
+            logger.error(f"Error in casino_play: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('plantation_buy_'):
         # plantation_buy_{seed_id}_{qty}
         try:
@@ -5446,6 +10966,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_plantation_reminder(update, context)
     elif data == 'settings_auto':
         await toggle_auto_search(update, context)
+    elif data == 'settings_autosell':
+        await show_autosell_menu(update, context)
+    elif data.startswith('autosell_toggle_'):
+        rarity = data.removeprefix('autosell_toggle_')
+        await toggle_autosell_rarity(update, context, rarity)
     elif data == 'settings_reset':
         await reset_prompt(update, context)
     elif data == 'lang_ru':
@@ -6532,6 +12057,80 @@ async def finalize_addition(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Администраторы не настроены. Обратитесь к владельцу бота.")
     return ConversationHandler.END
 
+
+async def addp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс добавления плантационного энергетика (только для админов)."""
+    user = update.effective_user
+    if not db.is_admin(user.id) and (user.username not in ADMIN_USERNAMES):
+        await update.message.reply_text("Нет прав: команда доступна только администраторам.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("Введите название плантационного энергетика:")
+    context.user_data.clear()
+    return ADDP_NAME
+
+
+async def addp_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['name'] = update.message.text.strip()
+    await update.message.reply_text("Введите описание плантационного энергетика:")
+    return ADDP_DESCRIPTION
+
+
+async def addp_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['description'] = update.message.text.strip()
+    await update.message.reply_text("Пришлите фото плантационного энергетика или отправьте /skip, чтобы пропустить:")
+    return ADDP_PHOTO
+
+
+async def addp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.photo:
+        photo_file = update.message.photo[-1]
+        context.user_data['file_id'] = photo_file.file_id
+    else:
+        context.user_data['file_id'] = None
+    return await finalize_addp(update, context)
+
+
+async def skip_addp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['file_id'] = None
+    return await finalize_addp(update, context)
+
+
+async def finalize_addp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Финальный этап: добавление плантационного энергетика (P-серия)."""
+    user = update.effective_user
+    if not db.is_admin(user.id) and (user.username not in ADMIN_USERNAMES):
+        await update.message.reply_text("Нет прав: команда доступна только администраторам.")
+        return ConversationHandler.END
+
+    data = context.user_data
+    image_path = None
+    if data.get('file_id'):
+        try:
+            file = await context.bot.get_file(data['file_id'])
+            os.makedirs(ENERGY_IMAGES_DIR, exist_ok=True)
+            image_path = f"{int(time.time())}_{random.randint(1000,9999)}.jpg"
+            await file.download_to_drive(os.path.join(ENERGY_IMAGES_DIR, image_path))
+        except Exception:
+            image_path = None
+
+    drink = db.add_energy_drink(
+        name=data.get('name', '').strip(),
+        description=data.get('description', '').strip(),
+        image_path=image_path,
+        is_special=False,
+        is_plantation=True,
+    )
+
+    p_index = getattr(drink, 'plantation_index', None)
+    if p_index:
+        await update.message.reply_text(f"Плантационный энергетик успешно добавлен! Его P-ID: P{p_index}")
+    else:
+        await update.message.reply_text("Плантационный энергетик успешно добавлен!")
+
+    return ConversationHandler.END
+
+
 async def send_proposal_to_admin(context: ContextTypes.DEFAULT_TYPE, request_id: int, admin_chat_id: int):
     proposal = db.get_pending_by_id(request_id)
     if not proposal or proposal.status != 'pending':
@@ -6746,6 +12345,40 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chunk:
         await update.message.reply_text(chunk.rstrip())
 
+
+async def pid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pid — показать соответствие P-ID -> название плантационного энергетика (только админы, только ЛС)."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not db.is_admin(user.id) and (user.username not in ADMIN_USERNAMES):
+        await update.message.reply_text("Нет прав")
+        return
+    if chat.type != 'private':
+        await update.message.reply_text("Эта команда доступна только в личных сообщениях боту.")
+        return
+
+    drinks = db.get_plantation_drinks()
+    if not drinks:
+        await update.message.reply_text("В базе данных нет плантационных энергетиков.")
+        return
+
+    drinks_sorted = sorted(drinks, key=lambda d: (getattr(d, 'plantation_index', 0) or 0, d.id))
+    lines = []
+    for d in drinks_sorted:
+        p_index = getattr(d, 'plantation_index', None)
+        p_id = f"P{p_index}" if p_index else f"P? (id {d.id})"
+        lines.append(f"{p_id}: {d.name}")
+
+    header = f"Всего плантационных энергетиков: {len(lines)}\n"
+    chunk = header
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            await update.message.reply_text(chunk.rstrip())
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await update.message.reply_text(chunk.rstrip())
+
 async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/addcoins — только для Создателя. Начисляет монеты пользователю по ID или username.
     Использование:
@@ -6820,6 +12453,20 @@ async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if new_balance is None:
         await update.message.reply_text("Не удалось обновить баланс. Попробуйте позже.")
         return
+
+    # Логируем транзакцию
+    try:
+        target_player = db.get_or_create_player(target_id, target_username or str(target_id))
+        db.log_action(
+            user_id=target_id,
+            username=getattr(target_player, 'username', None) or target_username or str(target_id),
+            action_type='transaction',
+            action_details=f'Команда /addcoins: выдано админом @{user.username or user.first_name}',
+            amount=amount,
+            success=True
+        )
+    except Exception:
+        pass
 
     # Аудит-лог (не критично при ошибке)
     try:
@@ -6910,6 +12557,21 @@ async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не удалось обновить баланс. Попробуйте позже.")
         return
 
+    # Логируем транзакцию
+    try:
+        target_player = db.get_or_create_player(target_id, target_username or str(target_id))
+        removed_amount = result.get('removed_amount', amount)
+        db.log_action(
+            user_id=target_id,
+            username=getattr(target_player, 'username', None) or target_username or str(target_id),
+            action_type='transaction',
+            action_details=f'Команда /delmoney: убрано админом @{user.username or user.first_name}',
+            amount=-removed_amount,
+            success=True
+        )
+    except Exception:
+        pass
+
     # Аудит-лог (не критично при ошибке)
     try:
         db.insert_moderation_log(user.id, 'remove_coins', target_id=target_id, details=f"amount={amount}")
@@ -6949,6 +12611,13 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminder_state = t(lang, 'on') if player.remind else t(lang, 'off')
     plantation_reminder_state = t(lang, 'on') if getattr(player, 'remind_plantation', False) else t(lang, 'off')
     auto_state = t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else t(lang, 'off')
+    # Считаем автопродажу включённой, если хотя бы одна редкость включена
+    try:
+        autosell_settings = db.get_autosell_settings(user_id)
+        autosell_enabled = any(bool(v) for v in autosell_settings.values())
+    except Exception:
+        autosell_enabled = False
+    autosell_state = t(lang, 'on') if autosell_enabled else t(lang, 'off')
 
     # Доп. информация: когда сбросится автопоиск VIP и сколько попыток осталось сегодня (показывать всегда)
     reset_info = ""
@@ -6970,11 +12639,12 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reset_info = ("⏳ До сброса автопоиска: —\n" if lang == 'ru' else "⏳ Auto-search reset: —\n")
 
     text = (
-        f"<b>{t(lang, 'settings_title')}</b>\n\n"
-        f"{t(lang, 'current_language')}: {lang_readable}\n"
-        f"{t(lang, 'auto_reminder')}: {reminder_state}\n"
-        f"{t(lang, 'plantation_reminder')}: {plantation_reminder_state}\n"
-        f"{t(lang, 'auto_search')}: {auto_state}\n"
+        f"<b>{t(lang, 'settings_title')}</b>\n\n"\
+        f"{t(lang, 'current_language')}: {lang_readable}\n"\
+        f"{t(lang, 'auto_reminder')}: {reminder_state}\n"\
+        f"{t(lang, 'plantation_reminder')}: {plantation_reminder_state}\n"\
+        f"{t(lang, 'auto_search')}: {auto_state}\n"\
+        f"{t(lang, 'autosell')}: {autosell_state}\n"\
     )
 
     if reset_info:
@@ -6985,10 +12655,17 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(t(lang, 'btn_toggle_rem'), callback_data='settings_reminder')],
         [InlineKeyboardButton(t(lang, 'btn_toggle_plantation_rem'), callback_data='settings_plantation_reminder')],
         [InlineKeyboardButton(t(lang, 'btn_toggle_auto'), callback_data='settings_auto')],
+        [InlineKeyboardButton(t(lang, 'autosell'), callback_data='settings_autosell')],
         [InlineKeyboardButton(t(lang, 'btn_reset'), callback_data='settings_reset')],
         [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='menu')]
     ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest as e:
+        if 'not modified' in str(e).lower():
+            await query.answer()
+        else:
+            raise
 
 async def settings_lang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -7057,8 +12734,8 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             jobs = context.application.job_queue.get_jobs_by_name(f"auto_search_{user_id}")
             for j in jobs:
                 j.schedule_removal()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[AUTO] Не удалось удалить предыдущие задачи автопоиска для {user_id}: {e}")
         try:
             context.application.job_queue.run_once(
                 auto_search_job,
@@ -7066,8 +12743,9 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=user_id,
                 name=f"auto_search_{user_id}",
             )
-        except Exception:
-            pass
+            logger.debug(f"[AUTO] Автопоиск включён и запланирована задача для {user_id}")
+        except Exception as e:
+            logger.error(f"[AUTO] Критическая ошибка: не удалось запланировать автопоиск для {user_id}: {e}")
         try:
             current_limit = db.get_auto_search_daily_limit(user_id)
             await context.bot.send_message(chat_id=user_id, text=t(lang, 'auto_enabled').format(limit=current_limit))
@@ -7087,6 +12765,49 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             pass
     await show_settings(update, context)
+
+
+async def show_autosell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = player.language
+
+    settings = db.get_autosell_settings(user_id)
+
+    lines = [t(lang, 'autosell_title'), '', t(lang, 'autosell_desc'), '']
+
+    rarities_order = ['Basic', 'Medium', 'Elite', 'Absolute', 'Majestic', 'Special']
+    for r in rarities_order:
+        emoji = COLOR_EMOJIS.get(r, '⚪')
+        state = t(lang, 'on') if settings.get(r, False) else t(lang, 'off')
+        lines.append(f"{emoji} {r}: {state}")
+
+    text = "\n".join(lines)
+
+    keyboard_rows = []
+    for r in rarities_order:
+        emoji = COLOR_EMOJIS.get(r, '⚪')
+        state = t(lang, 'on') if settings.get(r, False) else t(lang, 'off')
+        btn_text = f"{emoji} {r}: {state}"
+        callback = f"autosell_toggle_{r}"
+        keyboard_rows.append([InlineKeyboardButton(btn_text, callback_data=callback)])
+
+    keyboard_rows.append([InlineKeyboardButton(t(lang, 'btn_back'), callback_data='settings')])
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode='HTML')
+
+
+async def toggle_autosell_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE, rarity: str):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    current = db.is_autosell_enabled(user_id, rarity)
+    db.set_autosell_enabled(user_id, rarity, not current)
+    await show_autosell_menu(update, context)
 
 async def reset_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -7264,6 +12985,53 @@ async def toggle_group_auto_delete(update: Update, context: ContextTypes.DEFAULT
         await query.answer('Ошибка при обновлении настроек', show_alert=True)
 
 
+async def _format_display_name(context: ContextTypes.DEFAULT_TYPE, update: Update, user_id: int, username: str | None) -> str:
+    uname = (str(username).lstrip('@')) if username else ''
+    if uname and 3 <= len(uname) <= 32 and all(ch.isalnum() or ch == '_' for ch in uname) and not uname.isdigit() and uname != str(user_id):
+        safe_un = uname.replace('<', '&lt;').replace('>', '&gt;')
+        return f"@{safe_un}"
+    try:
+        chat = await context.bot.get_chat(user_id)
+        first_name = getattr(chat, 'first_name', None) or ''
+        last_name = getattr(chat, 'last_name', None) or ''
+        name = (first_name + (' ' if first_name and last_name else '') + last_name).strip()
+        if not name:
+            un2 = getattr(chat, 'username', None)
+            if un2:
+                u2 = str(un2).lstrip('@')
+                if 3 <= len(u2) <= 32 and all(ch.isalnum() or ch == '_' for ch in u2):
+                    safe_un = u2.replace('<', '&lt;').replace('>', '&gt;')
+                    return f"@{safe_un}"
+        if name:
+            safe_name = name.replace('<', '&lt;').replace('>', '&gt;')
+            return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+    except Exception:
+        pass
+    try:
+        chat_obj = update.effective_chat
+        chat_id = getattr(chat_obj, 'id', None)
+        chat_type = getattr(chat_obj, 'type', None)
+        if chat_id and chat_type in ('group', 'supergroup'):
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            u = getattr(member, 'user', None)
+            if u:
+                first_name = getattr(u, 'first_name', None) or ''
+                last_name = getattr(u, 'last_name', None) or ''
+                name = (first_name + (' ' if first_name and last_name else '') + last_name).strip()
+                if name:
+                    safe_name = name.replace('<', '&lt;').replace('>', '&gt;')
+                    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+                un3 = getattr(u, 'username', None)
+                if un3:
+                    u3 = str(un3).lstrip('@')
+                    if 3 <= len(u3) <= 32 and all(ch.isalnum() or ch == '_' for ch in u3):
+                        safe_un = u3.replace('<', '&lt;').replace('>', '&gt;')
+                        return f"@{safe_un}"
+    except Exception:
+        pass
+    return f'<a href="tg://user?id={user_id}">Игрок</a>'
+
+
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает таблицу лидеров."""
     leaderboard_data = db.get_leaderboard()
@@ -7280,8 +13048,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, (user_id, username, total_drinks, vip_until, vip_plus_until) in enumerate(leaderboard_data):
         place = i + 1
         medal = medals.get(i, f" {place}.")
-        # Экранируем имя пользователя для HTML
-        safe_username = username.replace('<', '&lt;').replace('>', '&gt;')
+        display_name = await _format_display_name(context, update, user_id, username)
         
         # Проверяем VIP статус с приоритетом VIP+
         current_time = int(time.time())
@@ -7295,7 +13062,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             vip_badge = ""
             
-        text += f"{medal} {safe_username}{vip_badge} - <b>{total_drinks} шт.</b>\n"
+        text += f"{medal} {display_name}{vip_badge} - <b>{total_drinks} шт.</b>\n"
 
     await update.message.reply_html(text)
 
@@ -7320,8 +13087,7 @@ async def show_money_leaderboard(update: Update, context: ContextTypes.DEFAULT_T
         user_id = player_data['user_id']
         
         medal = medals.get(position, f" {position}.")
-        # Экранируем имя пользователя для HTML
-        safe_username = username.replace('<', '&lt;').replace('>', '&gt;')
+        display_name = await _format_display_name(context, update, user_id, username)
         
         # Проверяем VIP статус
         vip_until = db.get_vip_until(user_id)
@@ -7337,7 +13103,7 @@ async def show_money_leaderboard(update: Update, context: ContextTypes.DEFAULT_T
         else:
             vip_badge = ""
         
-        text += f"{medal} {safe_username}{vip_badge} - <b>{coins:,} септимов</b>\n"
+        text += f"{medal} {display_name}{vip_badge} - <b>{coins:,} септимов</b>\n"
 
     await update.message.reply_html(text)
 
@@ -7346,8 +13112,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет справочное сообщение."""
     user = update.effective_user
     # Динамические кулдауны
-    search_minutes = SEARCH_COOLDOWN // 60
-    bonus_hours = DAILY_BONUS_COOLDOWN // 3600
+    search_minutes = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN) // 60
+    bonus_hours = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN) // 3600
     text = (
         f"👋 Привет, {user.mention_html()}!\n\n"
         "Я бот для коллекционирования энергетиков. Вот что доступно:\n\n"
@@ -7371,6 +13137,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• В группах можно дарить напитки друзьям: /gift @username (бот пришлёт выбор в личку)."
     )
     await update.message.reply_html(text, disable_web_page_preview=True)
+
+
+async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat or getattr(chat, 'type', None) != 'private':
+        await update.message.reply_text("Активация промокодов доступна только в личных сообщениях бота.")
+        return
+    context.user_data['awaiting_promo_code'] = True
+    await update.message.reply_text("Введите промокод:")
 
 async def myboosts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/myboosts — показать историю бустов пользователя."""
@@ -7422,6 +13197,8 @@ async def myboosts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает текстовые сообщения для поиска энергетика."""
+    if await abort_if_banned(update, context):
+        return
     msg = update.effective_message
     if not msg or not getattr(msg, 'text', None):
         return
@@ -7432,6 +13209,59 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await creator_handle_input(update, context)
         return
     
+    # Проверяем, ждём ли мы ввод для новых админ функций (энергетики, логи, управление игроками)
+    if context.user_data.get('awaiting_admin_action') or context.user_data.get('admin_player_action'):
+        await admin_handle_input(update, context)
+        return
+    
+    if context.user_data.get('awaiting_promo_code'):
+        context.user_data.pop('awaiting_promo_code', None)
+        chat = update.effective_chat
+        if not chat or getattr(chat, 'type', None) != 'private':
+            await msg.reply_text("Активация промокодов доступна только в личных сообщениях бота.")
+            return
+        code = incoming.strip()
+        if not code:
+            await msg.reply_text("Пустой код. Отправьте промокод ещё раз.")
+            return
+        res = db.redeem_promo(update.effective_user.id, code)
+        if not res or not res.get('ok'):
+            reason = (res or {}).get('reason')
+            if reason == 'expired':
+                await msg.reply_text("Срок действия промокода истёк.")
+            elif reason == 'max_uses_reached':
+                await msg.reply_text("Достигнут общий лимит активаций этого промокода.")
+            elif reason == 'per_user_limit_reached':
+                await msg.reply_text("Вы уже использовали этот промокод максимальное число раз.")
+            elif reason == 'invalid_drink':
+                await msg.reply_text("Некорректный приз в промокоде.")
+            elif reason == 'unsupported_kind':
+                await msg.reply_text("Неподдерживаемый тип промокода.")
+            else:
+                await msg.reply_text("Промокод не найден или не активен.")
+            return
+        kind = res.get('kind')
+        if kind == 'coins':
+            await msg.reply_html(f"✅ Начислено: <b>+{res.get('coins_added', 0)}</b> септимов. Теперь у вас: <b>{res.get('coins_total', 0)}</b>.")
+            return
+        if kind == 'vip':
+            until = res.get('vip_until')
+            until_str = safe_format_timestamp(until) if until else '—'
+            await msg.reply_html(f"✅ VIP продлён до: <b>{until_str}</b>.")
+            return
+        if kind == 'vip_plus':
+            until = res.get('vip_plus_until')
+            until_str = safe_format_timestamp(until) if until else '—'
+            await msg.reply_html(f"✅ VIP+ продлён до: <b>{until_str}</b>.")
+            return
+        if kind == 'drink':
+            dn = res.get('drink_name', 'Энергетик')
+            rarity = res.get('rarity', 'Basic')
+            await msg.reply_html(f"✅ Получен энергетик: <b>{dn}</b> [{rarity}].")
+            return
+        await msg.reply_text("Промокод активирован.")
+        return
+
     # Проверяем, ждём ли мы ввод для поиска подарка
     user_id = update.effective_user.id
     state = GIFT_SELECTION_STATE.get(user_id)
@@ -7477,7 +13307,14 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         # Показываем результаты поиска
         await show_inventory_search_results(update, context, search_query, page=1)
         return
-    
+
+    chat = update.effective_chat
+    if chat and getattr(chat, 'type', None) == 'private':
+        norm_simple = "".join(ch for ch in incoming.lower() if ch.isalnum() or ch.isspace()).strip()
+        if norm_simple == 'меню':
+            await start_command(update, context)
+            return
+
     normalized = "".join(ch for ch in incoming.lower() if ch.isalnum() or ch.isspace()).strip()
     # Поддержка вариантов ввода и пунктуации
     casino_triggers = {"найти казино", "найди казино", "casino"}
@@ -7500,13 +13337,13 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         now_ts = time.time()
         vip_plus_active = db.is_vip_plus(user.id)
         vip_active = db.is_vip(user.id)
-        
+        base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
         if vip_plus_active:
-            eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+            eff_search_cd = base_search_cd / 4
         elif vip_active:
-            eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+            eff_search_cd = base_search_cd / 2
         else:
-            eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
+            eff_search_cd = base_search_cd
         if now_ts - player.last_search < eff_search_cd:
             time_left = eff_search_cd - (now_ts - player.last_search)
             await msg.reply_text(f"Ещё не время! Подожди немного (⏳ {int(time_left // 60)}:{int(time_left % 60):02d}).")
@@ -7544,8 +13381,63 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
 
 
+async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not getattr(msg, 'photo', None):
+        return
+    # Обработка фото для обновления изображения энергетика в админ-панели
+    user = update.effective_user
+    action = context.user_data.get('awaiting_admin_action')
+    if action == 'drink_update_photo_wait_file' and has_creator_panel_access(user.id, user.username):
+        # Удаляем ранее загруженное ожидание (если было)
+        try:
+            old_name = context.user_data.get('pending_photo')
+            if old_name:
+                fp = os.path.join(ENERGY_IMAGES_DIR, old_name)
+                if os.path.exists(fp):
+                    os.remove(fp)
+        except Exception:
+            pass
+        # Скачиваем новое фото и сохраняем
+        photo_file = msg.photo[-1]
+        try:
+            file = await context.bot.get_file(photo_file.file_id)
+            os.makedirs(ENERGY_IMAGES_DIR, exist_ok=True)
+            image_name = f"{int(time.time())}_{random.randint(1000,9999)}.jpg"
+            await file.download_to_drive(os.path.join(ENERGY_IMAGES_DIR, image_name))
+            context.user_data['pending_photo'] = image_name
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Подтвердить", callback_data='drink_confirm_photo')],
+                [InlineKeyboardButton("❌ Отмена", callback_data='drink_cancel_photo')]
+            ])
+            # Отправляем предпросмотр
+            try:
+                with open(os.path.join(ENERGY_IMAGES_DIR, image_name), 'rb') as photo:
+                    await msg.reply_photo(photo=photo, caption="Предпросмотр нового фото. Подтвердить?", reply_markup=kb)
+            except Exception:
+                await msg.reply_text("Фото загружено. Подтвердить обновление?", reply_markup=kb)
+        except Exception:
+            await msg.reply_text("❌ Не удалось загрузить фото. Попробуйте ещё раз или отправьте другое изображение.")
+        return
+
+async def audio_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not getattr(msg, 'audio', None):
+        return
+    user = update.effective_user
+    action = context.user_data.get('awaiting_admin_action')
+    # Поддержка рассылки аудио из админ-панели
+    if action == 'broadcast' and has_creator_panel_access(user.id, user.username):
+        caption = (msg.caption or '').strip()
+        try:
+            await handle_admin_broadcast_audio(update, context, caption)
+        finally:
+            context.user_data.pop('awaiting_admin_action', None)
+
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /find для поиска энергетика (особенно полезна в группах)."""
+    if await abort_if_banned(update, context):
+        return
     msg = update.effective_message
     if not msg:
         return
@@ -7627,13 +13519,16 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Энергетик с таким ID не найден.")
         return
 
+    name = drink.get('name') if isinstance(drink, dict) else getattr(drink, 'name', '')
+    descr = drink.get('description') if isinstance(drink, dict) else getattr(drink, 'description', '')
     caption = (
-        f"<b>{drink.name}</b>\n\n"
-        f"<i>{drink.description}</i>"
+        f"<b>{name}</b>\n\n"
+        f"<i>{descr}</i>"
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]])
 
-    image_full_path = os.path.join(ENERGY_IMAGES_DIR, drink.image_path) if drink.image_path else None
+    image_path = drink.get('image_path') if isinstance(drink, dict) else getattr(drink, 'image_path', None)
+    image_full_path = os.path.join(ENERGY_IMAGES_DIR, image_path) if image_path else None
     if image_full_path and os.path.exists(image_full_path):
         try:
             with open(image_full_path, 'rb') as photo:
@@ -7812,6 +13707,8 @@ async def giftstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/gift @username — инициирует дарение энергетика. Работает только в группах."""
+    if await abort_if_banned(update, context):
+        return
     try:
         logger.info(
             "[GIFT] invoked: chat_id=%s type=%s user_id=%s args=%s",
@@ -8214,6 +14111,12 @@ def main():
     except Exception as e:
         logger.warning(f"[PLANTATION] Failed to update fertilizers duration: {e}")
     log_existing_drinks()
+    try:
+        removed = db.unban_protected_users()
+        if removed:
+            logger.info(f"[BOOT] Removed bans from protected users: {removed}")
+    except Exception as e:
+        logger.warning(f"[BOOT] Failed to unban protected users: {e}")
     
     # application = ApplicationBuilder().token(TOKEN).build()
     application = ApplicationBuilder().token(config.TOKEN).build()
@@ -8222,10 +14125,13 @@ def main():
     # Диагностический логгер команд в группах (не блокирует выполнение)
     # Переносим в более позднюю группу, чтобы не влиять на срабатывание CommandHandler("gift", ...)
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, debug_log_commands), group=2)
+    
+    # Предыдущий глобальный pre-handler бана удалён, чтобы не блокировать /команды.
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
     application.add_handler(CommandHandler("moneyleaderboard", show_money_leaderboard))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("promo", promo_command))
     application.add_handler(CommandHandler("myboosts", myboosts_command))
     application.add_handler(CommandHandler("fullhelp", fullhelp_command))
     application.add_handler(CommandHandler("admin", admin_command))
@@ -8237,6 +14143,7 @@ def main():
     application.add_handler(CommandHandler("inceditdrink", inceditdrink_command))
     application.add_handler(CommandHandler("incdelrequest", incdelrequest_command))
     application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("pid", pid_command))
     application.add_handler(CommandHandler("register", register_command))
     application.add_handler(CommandHandler("addcoins", addcoins_command))
     application.add_handler(CommandHandler("delmoney", delmoney_command))
@@ -8267,6 +14174,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_add)],
     )
     application.add_handler(add_conv_handler)
+
+    addp_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("addp", addp_start)],
+        states={
+            ADDP_NAME: [MessageHandler(filters.TEXT & (~filters.COMMAND), addp_name)],
+            ADDP_DESCRIPTION: [MessageHandler(filters.TEXT & (~filters.COMMAND), addp_description)],
+            ADDP_PHOTO: [MessageHandler(filters.PHOTO, addp_photo), CommandHandler("skip", skip_addp_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_add)],
+    )
+    application.add_handler(addp_conv_handler)
     
     # Conversation handler для пользовательских ставок в казино
     casino_custom_bet_handler = ConversationHandler(
@@ -8295,6 +14213,8 @@ def main():
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply, block=True), group=0)
     # Общий текстовый обработчик — после reply-хендлера
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=1)
+    application.add_handler(MessageHandler(filters.PHOTO, photo_message_handler), group=1)
+    application.add_handler(MessageHandler(filters.AUDIO, audio_message_handler), group=1)
     # Регистрируем /gift раньше, чтобы исключить перехват другими обработчиками
     application.add_handler(CommandHandler("gift", gift_command))
     application.add_handler(CommandHandler("giftstats", giftstats_command))
@@ -8333,6 +14253,16 @@ def main():
                 logger.info(f"[NOTIFY] Sent reminder to group {g.chat_id} ({getattr(g, 'title', None)})")
             except Exception as e:
                 logger.warning(f"[NOTIFY] Failed to send to group {getattr(g, 'chat_id', '?')}: {e}")
+                try:
+                    err_text = str(e)
+                    if "Chat not found" in err_text or "chat not found" in err_text:
+                        try:
+                            if db.disable_group_chat(g.chat_id):
+                                logger.info(f"[NOTIFY] Disabled group {g.chat_id} due to Chat not found")
+                        except Exception as db_err:
+                            logger.warning(f"[NOTIFY] Failed to disable group {g.chat_id} after Chat not found: {db_err}")
+                except Exception:
+                    pass
                 continue
 
     # Периодическая проверка истекающих бустов автопоиска
@@ -8497,12 +14427,13 @@ def main():
                     vip_plus_active = db.is_vip_plus(user_id)
                     vip_active = db.is_vip(user_id)
                     
+                    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
                     if vip_plus_active:
-                        eff_search_cd = SEARCH_COOLDOWN / 4  # x0.25 для VIP+
+                        eff_search_cd = base_search_cd / 4
                     elif vip_active:
-                        eff_search_cd = SEARCH_COOLDOWN / 2  # x0.5 для VIP
+                        eff_search_cd = base_search_cd / 2
                     else:
-                        eff_search_cd = SEARCH_COOLDOWN       # x1.0 для обычных
+                        eff_search_cd = base_search_cd
                     last_search_ts = float(getattr(p, 'last_search', 0) or 0.0)
                     time_since_last = max(0.0, time.time() - last_search_ts)
                     delay = eff_search_cd - time_since_last

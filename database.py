@@ -1,18 +1,19 @@
 # file: database.py
 
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, BigInteger, Index
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, BigInteger, Index, and_, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, joinedload
 import re
 from sqlalchemy import text, func
 import time
 import random
-from constants import RARITIES, RECEIVER_PRICES, RECEIVER_COMMISSION, SHOP_PRICES
+from constants import RARITIES, RECEIVER_PRICES, RECEIVER_COMMISSION, SHOP_PRICES, ADMIN_USERNAMES
 
 # --- Настройка базы данных ---
 DATABASE_FILE = "bot_data.db"
 engine = create_engine(f"sqlite:///{DATABASE_FILE}", connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Важно: отключаем expire_on_commit, чтобы возвращаемые объекты не теряли значения полей после commit()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 Base = declarative_base()
 
 # --- Описание таблиц в базе данных ---
@@ -38,7 +39,29 @@ class Player(Base):
     # --- Автопоиск буст ---
     auto_search_boost_count = Column(Integer, default=0)  # дополнительные поиски за день
     auto_search_boost_until = Column(Integer, default=0)  # время истечения буста
+    # --- Статистика казино ---
+    casino_wins = Column(Integer, default=0)  # количество побед в казино
+    casino_losses = Column(Integer, default=0)  # количество поражений в казино
+    casino_achievements = Column(String, default='')  # разблокированные достижения (через запятую)
     inventory = relationship("InventoryItem", back_populates="owner", cascade="all, delete-orphan")
+
+
+class Selyuk(Base):
+    __tablename__ = 'selyuki'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    type = Column(String, index=True)
+    level = Column(Integer, default=1)
+    balance_septims = Column(Integer, default=0)
+    is_enabled = Column(Boolean, default=True, index=True)
+    created_at = Column(Integer, default=lambda: int(time.time()))
+    updated_at = Column(Integer, default=lambda: int(time.time()))
+
+    owner = relationship('Player')
+
+    __table_args__ = (
+        Index('idx_selyuk_owner_type', 'owner_id', 'type', unique=True),
+    )
 
 class EnergyDrink(Base):
     __tablename__ = 'energy_drinks'
@@ -47,6 +70,8 @@ class EnergyDrink(Base):
     description = Column(String)
     image_path = Column(String, nullable=True)
     is_special = Column(Boolean, default=False)
+    is_plantation = Column(Boolean, default=False)
+    plantation_index = Column(Integer, nullable=True)
 
 class InventoryItem(Base):
     __tablename__ = 'inventory_items'
@@ -62,6 +87,18 @@ class InventoryItem(Base):
         Index('idx_inventory_player', 'player_id'),
         Index('idx_inventory_drink', 'drink_id'),
         Index('idx_inventory_rarity', 'rarity'),
+    )
+
+
+class AutoSellSetting(Base):
+    __tablename__ = 'autosell_settings'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, index=True)
+    rarity = Column(String, index=True)
+    enabled = Column(Boolean, default=False)
+
+    __table_args__ = (
+        Index('idx_autosell_user_rarity', 'user_id', 'rarity', unique=True),
     )
 
 # --- Магазинные офферы (персистентны, обновляются раз в 4 часа) ---
@@ -142,6 +179,38 @@ class ModerationLog(Base):
     target_id = Column(BigInteger, nullable=True)
     details = Column(String, nullable=True)
 
+# --- Баны и предупреждения ---
+
+class UserBan(Base):
+    __tablename__ = 'user_bans'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, unique=True, index=True)
+    reason = Column(String, nullable=True)
+    banned_at = Column(Integer, default=lambda: int(time.time()), index=True)
+    banned_until = Column(Integer, nullable=True, index=True)
+    banned_by = Column(BigInteger, nullable=True)
+
+class UserWarning(Base):
+    __tablename__ = 'user_warnings'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, index=True)
+    reason = Column(String, nullable=True)
+    issued_at = Column(Integer, default=lambda: int(time.time()), index=True)
+    issued_by = Column(BigInteger, nullable=True)
+
+# --- Логи действий пользователей ---
+
+class ActionLog(Base):
+    __tablename__ = 'action_logs'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(Integer, default=lambda: int(time.time()), index=True)
+    user_id = Column(BigInteger, index=True)
+    username = Column(String, nullable=True)
+    action_type = Column(String, index=True)  # transaction, casino, purchase, search, admin_action, etc.
+    action_details = Column(String, nullable=True)  # JSON или текст с деталями
+    amount = Column(Integer, nullable=True)  # для транзакций
+    success = Column(Boolean, default=True)
+
 # --- Группы для рассылок ---
 
 class GroupChat(Base):
@@ -164,6 +233,33 @@ class ScheduledAutoDelete(Base):
     message_id = Column(BigInteger, nullable=False)
     delete_at = Column(Integer, index=True, nullable=False)  # Unix timestamp когда нужно удалить
     created_at = Column(Integer, default=lambda: int(time.time()))
+
+# --- Промокоды ---
+
+class Promo(Base):
+    __tablename__ = 'promos'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String, unique=True, index=True)
+    kind = Column(String, index=True)  # coins | vip | vip_plus | drink | custom
+    value = Column(Integer, default=0)  # сумма монет, дни VIP, id напитка и т.п. (для custom — соглашение на уровне приложения)
+    rarity = Column(String, nullable=True)
+    max_uses = Column(Integer, default=0)  # 0 = без лимита
+    per_user_limit = Column(Integer, default=1)  # 0 = без лимита на пользователя
+    expires_at = Column(Integer, nullable=True, index=True)  # None = без срока
+    active = Column(Boolean, default=True, index=True)
+    created_at = Column(Integer, default=lambda: int(time.time()), index=True)
+
+class PromoUsage(Base):
+    __tablename__ = 'promo_usages'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    promo_id = Column(Integer, ForeignKey('promos.id'), index=True)
+    user_id = Column(BigInteger, index=True)
+    used_at = Column(Integer, default=lambda: int(time.time()), index=True)
+
+class BotSetting(Base):
+    __tablename__ = 'bot_settings'
+    key = Column(String, primary_key=True)
+    value = Column(String)
 
 # --- Склад для TG Premium ---
 
@@ -481,21 +577,370 @@ def create_db_and_tables():
     Base.metadata.create_all(bind=engine)
     print("База данных и таблицы успешно созданы.")
 
+def _ensure_promos_has_rarity_column():
+    """Гарантирует наличие колонки rarity в таблице promos (SQLite)."""
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("PRAGMA table_info(promos)")).fetchall()
+            cols = [row[1] for row in res]
+            if 'rarity' not in cols:
+                conn.execute(text("ALTER TABLE promos ADD COLUMN rarity VARCHAR"))
+    except Exception:
+        pass
+
 def get_or_create_player(user_id, username):
     """Возвращает игрока по ID. Если его нет, создает нового."""
     db = SessionLocal()
     try:
         player = db.query(Player).filter(Player.user_id == user_id).first()
+        # Нормализуем username: только валидные @username (буквы/цифры/подчёркивания 3-32)
+        new_uname = None
+        try:
+            if username:
+                uname = str(username).lstrip('@')
+                if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
+                    new_uname = uname
+        except Exception:
+            new_uname = None
         if not player:
-            player = Player(user_id=user_id, username=username)
+            # Создаём игрока; заполняем username только если он валиден
+            player = Player(user_id=user_id, username=new_uname)
             db.add(player)
             db.commit()
             db.refresh(player)
-            print(f"Создан новый игрок: {username} ({user_id})")
+            print(f"Создан новый игрок: {new_uname or user_id} ({user_id})")
+        else:
+            # Автообновляем username, если пришёл валидный и отличается от сохранённого
+            if new_uname and new_uname != getattr(player, 'username', None):
+                try:
+                    player.username = new_uname
+                    db.commit()
+                except Exception:
+                    db.rollback()
         return player
     finally:
         db.close()
 
+def get_active_ban(user_id: int) -> dict | None:
+    db = SessionLocal()
+    try:
+        try:
+            if is_protected_user(int(user_id)):
+                try:
+                    recp = db.query(UserBan).filter(UserBan.user_id == int(user_id)).first()
+                    if recp:
+                        db.delete(recp)
+                        db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                return None
+        except Exception:
+            pass
+        now_ts = int(time.time())
+        rec = db.query(UserBan).filter(UserBan.user_id == int(user_id)).first()
+        if not rec:
+            return None
+        until = getattr(rec, 'banned_until', None)
+        if until is None or int(until) > now_ts:
+            return {
+                'user_id': int(rec.user_id),
+                'reason': rec.reason,
+                'banned_at': int(rec.banned_at or 0),
+                'banned_until': int(rec.banned_until or 0) if rec.banned_until else None,
+                'banned_by': int(rec.banned_by or 0) if rec.banned_by else None,
+            }
+        return None
+    finally:
+        db.close()
+
+def create_promo(code: str, kind: str, value: int, max_uses: int, per_user_limit: int, expires_at: int | None, active: bool = True, rarity: str | None = None) -> dict:
+    db = SessionLocal()
+    try:
+        _ensure_promos_has_rarity_column()
+        existing = db.query(Promo).filter(Promo.code == code).first()
+        if existing:
+            return {"ok": False, "reason": "exists"}
+        row = Promo(
+            code=code.strip(),
+            kind=kind.strip(),
+            value=int(value),
+            max_uses=int(max_uses or 0),
+            per_user_limit=int(per_user_limit or 0),
+            expires_at=int(expires_at) if expires_at else None,
+            active=bool(active),
+            rarity=(str(rarity).strip() if rarity else None),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"ok": True, "id": int(row.id)}
+    except Exception:
+        db.rollback()
+        return {"ok": False, "reason": "exception"}
+    finally:
+        db.close()
+
+def list_promos(active_only: bool = False) -> list[dict]:
+    db = SessionLocal()
+    try:
+        q = db.query(Promo).order_by(Promo.created_at.desc())
+        if active_only:
+            now_ts = int(time.time())
+            q = q.filter(Promo.active == True, ((Promo.expires_at == None) | (Promo.expires_at > now_ts)))
+        rows = q.all()
+        out = []
+        for r in rows:
+            used = db.query(func.count(PromoUsage.id)).filter(PromoUsage.promo_id == r.id).scalar() or 0
+            out.append({
+                'id': int(r.id),
+                'code': r.code,
+                'kind': r.kind,
+                'value': int(r.value or 0),
+                'rarity': r.rarity,
+                'max_uses': int(r.max_uses or 0),
+                'per_user_limit': int(r.per_user_limit or 0),
+                'expires_at': int(r.expires_at or 0) if r.expires_at else None,
+                'active': bool(r.active),
+                'used': int(used),
+            })
+        return out
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+def deactivate_promo_by_id(promo_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        row = db.query(Promo).filter(Promo.id == int(promo_id)).first()
+        if not row:
+            return False
+        row.active = False
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def deactivate_promo_by_code(code: str) -> bool:
+    db = SessionLocal()
+    try:
+        row = db.query(Promo).filter(Promo.code == code.strip()).first()
+        if not row:
+            return False
+        row.active = False
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def get_promo_usage_total() -> int:
+    db = SessionLocal()
+    try:
+        return int(db.query(func.count(PromoUsage.id)).scalar() or 0)
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+# Пользовательская активация промокодов
+
+def redeem_promo(user_id: int, code: str) -> dict:
+    db = SessionLocal()
+    try:
+        _ensure_promos_has_rarity_column()
+        code_s = (code or '').strip()
+        if not code_s:
+            return {"ok": False, "reason": "not_found_or_inactive"}
+
+        row = db.query(Promo).filter(func.lower(Promo.code) == code_s.lower()).first()
+        if not row or not bool(row.active):
+            return {"ok": False, "reason": "not_found_or_inactive"}
+
+        now_ts = int(time.time())
+        if getattr(row, 'expires_at', None):
+            try:
+                exp = int(row.expires_at)
+            except Exception:
+                exp = None
+            if exp and now_ts >= exp:
+                return {"ok": False, "reason": "expired"}
+
+        # Общий лимит
+        used_total = int(db.query(func.count(PromoUsage.id)).filter(PromoUsage.promo_id == row.id).scalar() or 0)
+        if int(row.max_uses or 0) > 0 and used_total >= int(row.max_uses):
+            return {"ok": False, "reason": "max_uses_reached"}
+
+        # Лимит на пользователя
+        used_by_user = int(
+            db.query(func.count(PromoUsage.id))
+            .filter(PromoUsage.promo_id == row.id, PromoUsage.user_id == int(user_id))
+            .scalar() or 0
+        )
+        if int(row.per_user_limit or 0) > 0 and used_by_user >= int(row.per_user_limit):
+            return {"ok": False, "reason": "per_user_limit_reached"}
+
+        # Гарантируем наличие игрока
+        player = db.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=str(user_id))
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        kind = str(row.kind or '').strip().lower()
+        value = int(row.value or 0)
+        result: dict = {"ok": True, "kind": kind, "value": value}
+
+        if kind == 'coins':
+            add = max(0, value)
+            current = int(player.coins or 0)
+            player.coins = current + add
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"coins_added": add, "coins_total": int(player.coins)})
+            try:
+                log_action(int(user_id), getattr(player, 'username', None), 'promo_redeem', f'coins:+{add}', success=True)
+            except Exception:
+                pass
+            return result
+
+        elif kind == 'vip':
+            # value — дни VIP
+            add_sec = max(0, int(value)) * 86400
+            now_ts = int(time.time())
+            base_ts = int(getattr(player, 'vip_until', 0) or 0)
+            start_ts = base_ts if base_ts > now_ts else now_ts
+            player.vip_until = start_ts + add_sec
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"vip_until": int(player.vip_until)})
+            try:
+                log_action(int(user_id), getattr(player, 'username', None), 'promo_redeem', f'vip:+{add_sec}s', success=True)
+            except Exception:
+                pass
+            return result
+
+        elif kind == 'vip_plus':
+            # value — дни VIP+
+            add_sec = max(0, int(value)) * 86400
+            now_ts = int(time.time())
+            base_ts = int(getattr(player, 'vip_plus_until', 0) or 0)
+            start_ts = base_ts if base_ts > now_ts else now_ts
+            player.vip_plus_until = start_ts + add_sec
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"vip_plus_until": int(player.vip_plus_until)})
+            try:
+                log_action(int(user_id), getattr(player, 'username', None), 'promo_redeem', f'vip_plus:+{add_sec}s', success=True)
+            except Exception:
+                pass
+            return result
+
+        elif kind == 'drink':
+            # value — drink_id, редкость из колонки rarity (или Basic по умолчанию)
+            drink = db.query(EnergyDrink).filter(EnergyDrink.id == int(value)).first()
+            if not drink:
+                return {"ok": False, "reason": "invalid_drink"}
+            rarity = str(getattr(row, 'rarity', '') or '').strip() or 'Basic'
+            # Добавляем в инвентарь в рамках одной сессии
+            item = db.query(InventoryItem).filter_by(player_id=int(user_id), drink_id=int(drink.id), rarity=rarity).first()
+            if item:
+                item.quantity = int(item.quantity or 0) + 1
+            else:
+                db.add(InventoryItem(player_id=int(user_id), drink_id=int(drink.id), rarity=rarity, quantity=1))
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"drink_name": getattr(drink, 'name', 'Энергетик'), "rarity": rarity})
+            try:
+                log_action(int(user_id), getattr(player, 'username', None), 'promo_redeem', f'drink:{getattr(drink, "name", "?")}/{rarity}', success=True)
+            except Exception:
+                pass
+            return result
+
+        else:
+            return {"ok": False, "reason": "unsupported_kind"}
+
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        db.close()
+
+def get_setting_str(key: str, default_value: str | None = None) -> str | None:
+    db = SessionLocal()
+    try:
+        row = db.query(BotSetting).filter(BotSetting.key == key).first()
+        if not row or row.value is None:
+            return default_value
+        return str(row.value)
+    finally:
+        db.close()
+
+def set_setting_str(key: str, value: str) -> bool:
+    db = SessionLocal()
+    try:
+        row = db.query(BotSetting).filter(BotSetting.key == key).first()
+        if not row:
+            row = BotSetting(key=key, value=str(value))
+            db.add(row)
+        else:
+            row.value = str(value)
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+def get_setting_int(key: str, default_value: int) -> int:
+    s = get_setting_str(key, None)
+    try:
+        return int(s) if s is not None else int(default_value)
+    except Exception:
+        return int(default_value)
+
+def set_setting_int(key: str, value: int) -> bool:
+    return set_setting_str(key, str(int(value)))
+
+def get_setting_float(key: str, default_value: float) -> float:
+    s = get_setting_str(key, None)
+    try:
+        return float(s) if s is not None else float(default_value)
+    except Exception:
+        return float(default_value)
+
+def set_setting_float(key: str, value: float) -> bool:
+    return set_setting_str(key, str(float(value)))
+
+def get_setting_bool(key: str, default_value: bool) -> bool:
+    s = get_setting_str(key, None)
+    if s is None:
+        return bool(default_value)
+    s_lower = s.strip().lower()
+    if s_lower in ("1", "true", "yes", "on", "y", "t"):
+        return True
+    if s_lower in ("0", "false", "no", "off", "n", "f"):
+        return False
+    return bool(default_value)
+
+def set_setting_bool(key: str, value: bool) -> bool:
+    return set_setting_str(key, "1" if value else "0")
 
 # --- Магазин: офферы и покупки ---
 
@@ -553,6 +998,113 @@ def get_or_refresh_shop_offers() -> tuple[list[ShopOffer], int]:
             .all()
         )
         return (list(rows), last_ts)
+    finally:
+        dbs.close()
+
+
+def get_autosell_settings(user_id: int) -> dict:
+    """Возвращает словарь настроек автопродажи по редкостям для указанного пользователя.
+
+    Формат: { 'Basic': bool, 'Medium': bool, ... }
+    Отсутствующие записи трактуются как выключенные (False).
+    """
+    dbs = SessionLocal()
+    try:
+        rows = (
+            dbs.query(AutoSellSetting)
+            .filter(AutoSellSetting.user_id == int(user_id))
+            .all()
+        )
+        settings: dict[str, bool] = {}
+        for row in rows:
+            try:
+                if row.rarity:
+                    settings[str(row.rarity)] = bool(row.enabled)
+            except Exception:
+                continue
+        return settings
+    finally:
+        dbs.close()
+
+
+def is_autosell_enabled(user_id: int, rarity: str) -> bool:
+    """Проверяет, включена ли автопродажа для указанной редкости у пользователя."""
+    if not rarity:
+        return False
+    dbs = SessionLocal()
+    try:
+        row = (
+            dbs.query(AutoSellSetting)
+            .filter(
+                AutoSellSetting.user_id == int(user_id),
+                AutoSellSetting.rarity == str(rarity),
+            )
+            .first()
+        )
+        if not row:
+            return False
+        return bool(row.enabled)
+    finally:
+        dbs.close()
+
+
+def set_autosell_enabled(user_id: int, rarity: str, enabled: bool) -> bool:
+    """Устанавливает режим автопродажи для указанной редкости пользователя.
+
+    Возвращает True при успешном сохранении.
+    """
+    if not rarity:
+        return False
+    dbs = SessionLocal()
+    try:
+        row = (
+            dbs.query(AutoSellSetting)
+            .filter(
+                AutoSellSetting.user_id == int(user_id),
+                AutoSellSetting.rarity == str(rarity),
+            )
+            .first()
+        )
+        if not row:
+            row = AutoSellSetting(
+                user_id=int(user_id),
+                rarity=str(rarity),
+                enabled=bool(enabled),
+            )
+            dbs.add(row)
+        else:
+            row.enabled = bool(enabled)
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        dbs.close()
+
+
+def has_inventory_item(user_id: int, drink_id: int, rarity: str) -> bool:
+    """Проверяет, есть ли у пользователя в инвентаре хотя бы 1 энергетик указанного drink_id и редкости."""
+    if not drink_id or not rarity:
+        return False
+    dbs = SessionLocal()
+    try:
+        item = (
+            dbs.query(InventoryItem)
+            .filter(
+                InventoryItem.player_id == int(user_id),
+                InventoryItem.drink_id == int(drink_id),
+                InventoryItem.rarity == str(rarity),
+                InventoryItem.quantity > 0,
+            )
+            .first()
+        )
+        return item is not None
+    except Exception:
+        return False
     finally:
         dbs.close()
 
@@ -1685,11 +2237,9 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
             "items_added": items_added,
             "rarity_counts": rarity_counts,
             "effects": {
-                "water_count": int(wc),
-                "fertilizer_active": bool(fert_applied),
-                "fertilizer_names": fertilizer_names,  # Теперь список названий
-                "status_effect": (se or None),
-                "yield_multiplier": float(yield_mult),
+                "fertilizers": fertilizer_names,
+                "status_effect": se,
+                "water_count": wc,
             },
         }
     except Exception:
@@ -1700,6 +2250,195 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
         return {"ok": False, "reason": "exception"}
     finally:
         dbs.close()
+
+
+def get_player_selyuki(user_id: int) -> list[Selyuk]:
+    dbs = SessionLocal()
+    try:
+        return list(
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id))
+            .order_by(Selyuk.id.asc())
+            .all()
+        )
+    finally:
+        dbs.close()
+
+
+def get_selyuk_by_type(user_id: int, selyuk_type: str) -> Selyuk | None:
+    dbs = SessionLocal()
+    try:
+        return (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == str(selyuk_type))
+            .first()
+        )
+    finally:
+        dbs.close()
+
+
+def buy_farmer_selyuk(user_id: int, price: int = 50000) -> dict:
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+
+        existing = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == 'farmer')
+            .with_for_update(read=False)
+            .first()
+        )
+        if existing:
+            return {"ok": False, "reason": "already_have_farmer"}
+
+        coins = int(getattr(player, 'coins', 0) or 0)
+        price_i = int(price or 0)
+        if coins < price_i:
+            return {"ok": False, "reason": "not_enough_coins", "need": price_i, "have": coins}
+
+        player.coins = coins - price_i
+        now_ts = int(time.time())
+        farmer = Selyuk(
+            owner_id=int(user_id),
+            type='farmer',
+            level=1,
+            balance_septims=0,
+            is_enabled=True,
+            created_at=now_ts,
+            updated_at=now_ts,
+        )
+        dbs.add(farmer)
+        dbs.commit()
+        dbs.refresh(farmer)
+        return {"ok": True, "selyuk_id": int(farmer.id), "coins_left": int(player.coins or 0)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def topup_selyuk_balance_from_player(user_id: int, selyuk_type: str, amount: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        amt = int(amount or 0)
+        if amt <= 0:
+            return {"ok": False, "reason": "invalid_amount"}
+
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+
+        selyuk = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == str(selyuk_type))
+            .with_for_update(read=False)
+            .first()
+        )
+        if not selyuk:
+            return {"ok": False, "reason": "no_selyuk"}
+
+        coins = int(getattr(player, 'coins', 0) or 0)
+        if coins < amt:
+            return {"ok": False, "reason": "not_enough_coins", "need": amt, "have": coins}
+
+        player.coins = coins - amt
+        selyuk.balance_septims = int(getattr(selyuk, 'balance_septims', 0) or 0) + amt
+        try:
+            selyuk.updated_at = int(time.time())
+        except Exception:
+            pass
+        dbs.commit()
+        return {
+            "ok": True,
+            "new_balance": int(selyuk.balance_septims or 0),
+            "coins_left": int(player.coins or 0),
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def try_farmer_autowater(user_id: int, bed_index: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+
+        if not bool(getattr(player, 'remind_plantation', False)):
+            return {"ok": False, "reason": "remind_disabled"}
+
+        selyuk = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == 'farmer')
+            .with_for_update(read=False)
+            .first()
+        )
+        if not selyuk:
+            return {"ok": False, "reason": "no_farmer"}
+        if not bool(getattr(selyuk, 'is_enabled', False)):
+            return {"ok": False, "reason": "disabled"}
+
+        balance = int(getattr(selyuk, 'balance_septims', 0) or 0)
+        if balance < 50:
+            return {"ok": False, "reason": "no_funds", "need": 50, "have": balance}
+
+        bed = (
+            dbs.query(PlantationBed)
+            .options(joinedload(PlantationBed.seed_type))
+            .filter(PlantationBed.owner_id == int(user_id), PlantationBed.bed_index == int(bed_index))
+            .with_for_update(read=False)
+            .first()
+        )
+        if not bed:
+            return {"ok": False, "reason": "no_such_bed"}
+        if bed.state != 'growing' or not bed.seed_type:
+            _update_bed_ready_if_due(dbs, bed)
+            return {"ok": False, "reason": "not_growing", "bed_state": bed.state}
+
+        now_ts = int(time.time())
+        last = int(bed.last_watered_at or 0)
+        interval = int(bed.seed_type.water_interval_sec or 0)
+        if last and interval and (now_ts - last) < interval:
+            return {
+                "ok": False,
+                "reason": "too_early_to_water",
+                "next_water_in": interval - (now_ts - last),
+                "bed_state": bed.state,
+            }
+
+        bed.last_watered_at = now_ts
+        bed.water_count = int(bed.water_count or 0) + 1
+        _update_bed_ready_if_due(dbs, bed)
+
+        selyuk.balance_septims = balance - 50
+        try:
+            selyuk.updated_at = now_ts
+        except Exception:
+            pass
+
+        dbs.commit()
+        return {"ok": True, "bed_state": bed.state, "water_interval_sec": interval}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
 
 def get_players_with_auto_search_enabled() -> list[Player]:
     """
@@ -2227,6 +2966,20 @@ def get_all_drinks():
     finally:
         db.close()
 
+
+def get_plantation_drinks() -> list[EnergyDrink]:
+    """Возвращает список всех плантационных энергетиков (is_plantation = True)."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(EnergyDrink)
+            .filter(EnergyDrink.is_plantation == True)  # noqa: E712
+            .order_by(EnergyDrink.id.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
 def get_drink_by_id(drink_id: int) -> EnergyDrink | None:
     """Возвращает энергетик по его ID или None, если не найден."""
     db = SessionLocal()
@@ -2329,6 +3082,9 @@ def get_weighted_drinks_list():
         weighted_list = []
         
         for drink in all_drinks:
+            # Плантационные энергетики не участвуют в обычном поиске
+            if getattr(drink, 'is_plantation', False):
+                continue
             temp = get_drink_temperature(drink.id)
             
             # Определяем вес
@@ -2403,11 +3159,35 @@ def get_inventory_item(item_id):
     finally:
         db.close()
 
-def add_energy_drink(name: str, description: str, image_path: str | None = None, is_special: bool = False):
-    """Создаёт новый энергетик в базе и возвращает объект."""
+def add_energy_drink(name: str, description: str, image_path: str | None = None, is_special: bool = False, is_plantation: bool = False):
+    """Создаёт новый энергетик в базе и возвращает объект.
+
+    Если is_plantation=True, энергетик помечается как плантационный и получает
+    последовательный plantation_index (P1, P2, ...).
+    """
     db = SessionLocal()
     try:
-        drink = EnergyDrink(name=name, description=description, image_path=image_path, is_special=is_special)
+        drink = EnergyDrink(
+            name=name,
+            description=description,
+            image_path=image_path,
+            is_special=is_special,
+        )
+        # Безопасно проставляем флаг плантационного энергетика, если колонка присутствует
+        try:
+            drink.is_plantation = bool(is_plantation)
+        except Exception:
+            pass
+
+        # Для плантационных энергетиков выдаём следующий plantation_index
+        if getattr(drink, 'is_plantation', False):
+            try:
+                max_idx = db.query(func.max(EnergyDrink.plantation_index)).scalar() or 0
+                drink.plantation_index = int(max_idx) + 1
+            except Exception:
+                # При ошибке просто оставляем plantation_index пустым
+                pass
+
         db.add(drink)
         db.commit()
         db.refresh(drink)
@@ -2419,6 +3199,7 @@ def get_leaderboard(limit: int = 10):
     """Возвращает топ игроков по количеству энергетиков в инвентаре."""
     db = SessionLocal()
     try:
+        now_ts = int(time.time())
         leaderboard_data = (
             db.query(
                 Player.user_id,
@@ -2428,6 +3209,14 @@ def get_leaderboard(limit: int = 10):
                 Player.vip_plus_until,
             )
             .join(InventoryItem, Player.user_id == InventoryItem.player_id)
+            .outerjoin(
+                UserBan,
+                and_(
+                    UserBan.user_id == Player.user_id,
+                    or_(UserBan.banned_until == None, UserBan.banned_until > now_ts)
+                )
+            )
+            .filter(UserBan.user_id == None)
             .group_by(Player.user_id)
             .order_by(func.sum(InventoryItem.quantity).desc())
             .limit(limit)
@@ -2644,6 +3433,14 @@ def ensure_schema():
         if 'auto_search_boost_until' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN auto_search_boost_until INTEGER DEFAULT 0")
 
+        # Обновления для energy_drinks (плантационные энергетики)
+        res_drinks = conn.exec_driver_sql("PRAGMA table_info(energy_drinks)")
+        cols_drinks = [row[1] for row in res_drinks]
+        if 'is_plantation' not in cols_drinks:
+            conn.exec_driver_sql("ALTER TABLE energy_drinks ADD COLUMN is_plantation INTEGER DEFAULT 0")
+        if 'plantation_index' not in cols_drinks:
+            conn.exec_driver_sql("ALTER TABLE energy_drinks ADD COLUMN plantation_index INTEGER")
+
         # Обновления для admin_users
         res_adm = conn.exec_driver_sql("PRAGMA table_info(admin_users)")
         cols_adm = [row[1] for row in res_adm]
@@ -2839,6 +3636,35 @@ def get_admin_level(user_id: int) -> int:
         return int(lvl) if isinstance(lvl, int) and 1 <= lvl <= 3 else 1
     finally:
         db.close()
+
+def is_creator(user_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        p = db.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not p:
+            return False
+        uname = getattr(p, 'username', None)
+        try:
+            if uname:
+                return uname in ADMIN_USERNAMES
+        except Exception:
+            return False
+        return False
+    finally:
+        db.close()
+
+def is_protected_user(user_id: int) -> bool:
+    try:
+        if is_admin(int(user_id)):
+            return True
+    except Exception:
+        pass
+    try:
+        if is_creator(int(user_id)):
+            return True
+    except Exception:
+        pass
+    return False
 
 # --- VIP helpers ---
 
@@ -3183,6 +4009,18 @@ def update_group_last_notified(chat_id: int):
         if not grp:
             return False
         grp.last_notified = int(time.time())
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+def disable_group_chat(chat_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        grp = db.query(GroupChat).filter(GroupChat.chat_id == chat_id).first()
+        if not grp:
+            return False
+        grp.is_enabled = False
         db.commit()
         return True
     finally:
@@ -3835,9 +4673,18 @@ def get_money_leaderboard(limit: int = 10) -> list[dict]:
     """
     dbs = SessionLocal()
     try:
+        now_ts = int(time.time())
         players = (
             dbs.query(Player)
             .filter(Player.coins > 0)
+            .outerjoin(
+                UserBan,
+                and_(
+                    UserBan.user_id == Player.user_id,
+                    or_(UserBan.banned_until == None, UserBan.banned_until > now_ts)
+                )
+            )
+            .filter(UserBan.user_id == None)
             .order_by(Player.coins.desc())
             .limit(limit)
             .all()
@@ -4184,5 +5031,1004 @@ def get_gift_stats(user_id: int) -> dict:
             'sent': sent,
             'received': received
         }
+    finally:
+        db.close()
+
+
+def update_player_stats(user_id: int, **kwargs):
+    """Обновляет статистику игрока (для казино и других систем)."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        if not player:
+            return False
+        
+        # Обновляем только переданные поля
+        for key, value in kwargs.items():
+            if hasattr(player, key):
+                setattr(player, key, value)
+        
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error updating player stats: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+# --- Функции статистики для админ панели ---
+
+def get_total_users_count() -> int:
+    """Возвращает общее количество пользователей."""
+    db = SessionLocal()
+    try:
+        return db.query(Player).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def get_active_vip_count() -> int:
+    """Возвращает количество пользователей с активным VIP."""
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        return db.query(Player).filter(Player.vip_until > current_time).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def get_active_vip_plus_count() -> int:
+    """Возвращает количество пользователей с активным VIP+."""
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        return db.query(Player).filter(Player.vip_plus_until > current_time).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def count_all_drinks() -> int:
+    """Возвращает общее количество уникальных напитков в базе данных."""
+    db = SessionLocal()
+    try:
+        return db.query(EnergyDrink).count()
+    except Exception as e:
+        print(f"[DB] Error counting drinks: {e}")
+        return 0
+    finally:
+        db.close()
+
+
+def get_total_drinks_count() -> int:
+    """Возвращает общее количество напитков в базе."""
+    return count_all_drinks()
+
+
+def get_total_inventory_items() -> int:
+    """Возвращает общее количество предметов в инвентарях всех игроков."""
+    db = SessionLocal()
+    try:
+        return db.query(func.sum(InventoryItem.quantity)).scalar() or 0
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def get_active_users_today() -> int:
+    """Возвращает количество активных пользователей за последние 24 часа."""
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        one_day_ago = current_time - 86400
+        return db.query(Player).filter(Player.last_search > one_day_ago).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def get_active_users_week() -> int:
+    """Возвращает количество активных пользователей за последнюю неделю."""
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        one_week_ago = current_time - 604800
+        return db.query(Player).filter(Player.last_search > one_week_ago).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def get_total_coins_in_system() -> int:
+    """Возвращает общее количество монет в системе."""
+    db = SessionLocal()
+    try:
+        return db.query(func.sum(Player.coins)).scalar() or 0
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
+def get_active_promo_count() -> int:
+    """Возвращает количество активных промокодов."""
+    db = SessionLocal()
+    try:
+        now_ts = int(time.time())
+        return db.query(Promo).filter(
+            Promo.active == True,
+            ((Promo.expires_at == None) | (Promo.expires_at > now_ts))
+        ).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+def get_group_settings(chat_id: int) -> dict:
+    """Возвращает настройки группы. Если записи нет — возвращает значения по умолчанию."""
+    db = SessionLocal()
+    try:
+        row = db.query(GroupChat).filter(GroupChat.chat_id == chat_id).first()
+        if not row:
+            return {
+                'notify_disabled': False,
+                'auto_delete_enabled': False,
+                'auto_delete_delay_minutes': 5,
+                'title': None,
+            }
+        return {
+            'notify_disabled': bool(row.notify_disabled),
+            'auto_delete_enabled': bool(row.auto_delete_enabled),
+            'auto_delete_delay_minutes': int(row.auto_delete_delay_minutes or 5),
+            'title': row.title,
+        }
+    finally:
+        db.close()
+
+def set_group_settings(chat_id: int, **kwargs) -> bool:
+    """Создаёт/обновляет запись настроек для группы."""
+    db = SessionLocal()
+    try:
+        row = db.query(GroupChat).filter(GroupChat.chat_id == chat_id).first()
+        if not row:
+            row = GroupChat(chat_id=chat_id)
+            db.add(row)
+        # Обновляем поддерживаемые поля
+        for key in ('title', 'notify_disabled', 'auto_delete_enabled', 'auto_delete_delay_minutes', 'is_enabled'):
+            if key in kwargs:
+                setattr(row, key, kwargs[key])
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def save_scheduled_auto_delete(chat_id: int, message_id: int, delete_at: int) -> int:
+    """Сохраняет задачу автоудаления и возвращает её ID."""
+    db = SessionLocal()
+    try:
+        rec = ScheduledAutoDelete(chat_id=chat_id, message_id=message_id, delete_at=delete_at)
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return int(rec.id)
+    except Exception:
+        db.rollback()
+        return 0
+    finally:
+        db.close()
+
+def delete_scheduled_auto_delete(scheduled_id: int) -> bool:
+    """Удаляет сохранённую задачу автоудаления по её ID."""
+    db = SessionLocal()
+    try:
+        db.query(ScheduledAutoDelete).filter(ScheduledAutoDelete.id == int(scheduled_id)).delete()
+        db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def get_banned_users_count() -> int:
+    """Возвращает количество забаненных пользователей."""
+    db = SessionLocal()
+    try:
+        now_ts = int(time.time())
+        return db.query(UserBan).filter((UserBan.banned_until == None) | (UserBan.banned_until > now_ts)).count()
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+def is_user_banned(user_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        try:
+            if is_protected_user(int(user_id)):
+                try:
+                    recp = db.query(UserBan).filter(UserBan.user_id == int(user_id)).first()
+                    if recp:
+                        db.delete(recp)
+                        db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                return False
+        except Exception:
+            pass
+        now_ts = int(time.time())
+        rec = db.query(UserBan).filter(UserBan.user_id == int(user_id)).first()
+        if not rec:
+            return False
+        until = getattr(rec, 'banned_until', None)
+        return True if (until is None or int(until) > now_ts) else False
+    finally:
+        db.close()
+
+def ban_user(user_id: int, banned_by: int | None = None, reason: str | None = None, duration_seconds: int | None = None) -> bool:
+    db = SessionLocal()
+    try:
+        if is_protected_user(int(user_id)):
+            return False
+        rec = db.query(UserBan).filter(UserBan.user_id == int(user_id)).first()
+        now_ts = int(time.time())
+        until = None
+        if duration_seconds and int(duration_seconds) > 0:
+            until = now_ts + int(duration_seconds)
+        if rec:
+            rec.reason = reason
+            rec.banned_at = now_ts
+            rec.banned_until = until
+            rec.banned_by = banned_by
+        else:
+            rec = UserBan(user_id=int(user_id), reason=reason, banned_at=now_ts, banned_until=until, banned_by=banned_by)
+            db.add(rec)
+        db.commit()
+        try:
+            insert_moderation_log(actor_id=int(banned_by or 0), action='ban_user', request_id=None, target_id=int(user_id), details=reason)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def unban_user(user_id: int, unbanned_by: int | None = None) -> bool:
+    db = SessionLocal()
+    try:
+        rec = db.query(UserBan).filter(UserBan.user_id == int(user_id)).first()
+        if not rec:
+            return False
+        db.delete(rec)
+        db.commit()
+        try:
+            insert_moderation_log(actor_id=int(unbanned_by or 0), action='unban_user', request_id=None, target_id=int(user_id), details=None)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def list_active_bans(limit: int = 50) -> list[dict]:
+    db = SessionLocal()
+    try:
+        now_ts = int(time.time())
+        rows = (
+            db.query(UserBan)
+            .filter((UserBan.banned_until == None) | (UserBan.banned_until > now_ts))
+            .order_by(UserBan.banned_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                'user_id': int(row.user_id),
+                'reason': row.reason,
+                'banned_at': int(row.banned_at or 0),
+                'banned_until': int(row.banned_until or 0) if row.banned_until else None,
+                'banned_by': int(row.banned_by or 0) if row.banned_by else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+def unban_protected_users() -> int:
+    dbs = SessionLocal()
+    try:
+        protected_ids = set()
+        for r in dbs.query(AdminUser).all():
+            try:
+                protected_ids.add(int(getattr(r, 'user_id', 0) or 0))
+            except Exception:
+                continue
+        try:
+            names = [u.lower() for u in ADMIN_USERNAMES] if ADMIN_USERNAMES else []
+        except Exception:
+            names = []
+        if names:
+            creators = dbs.query(Player).filter(func.lower(Player.username).in_(names)).all()
+            for p in creators:
+                try:
+                    protected_ids.add(int(getattr(p, 'user_id', 0) or 0))
+                except Exception:
+                    continue
+        removed = 0
+        for uid in protected_ids:
+            if not uid:
+                continue
+            rec = dbs.query(UserBan).filter(UserBan.user_id == int(uid)).first()
+            if rec:
+                dbs.delete(rec)
+                removed += 1
+        if removed:
+            dbs.commit()
+        return removed
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return 0
+    finally:
+        dbs.close()
+
+def add_warning(user_id: int, issued_by: int | None = None, reason: str | None = None) -> bool:
+    db = SessionLocal()
+    try:
+        row = UserWarning(user_id=int(user_id), reason=reason, issued_by=issued_by)
+        db.add(row)
+        db.commit()
+        try:
+            insert_moderation_log(actor_id=int(issued_by or 0), action='warn_user', request_id=None, target_id=int(user_id), details=reason)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+def get_warnings(user_id: int, limit: int = 20) -> list[dict]:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(UserWarning)
+            .filter(UserWarning.user_id == int(user_id))
+            .order_by(UserWarning.issued_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                'id': int(row.id),
+                'user_id': int(row.user_id),
+                'reason': row.reason,
+                'issued_at': int(row.issued_at or 0),
+                'issued_by': int(row.issued_by or 0) if row.issued_by else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+def clear_warnings(user_id: int) -> int:
+    db = SessionLocal()
+    try:
+        deleted = db.query(UserWarning).filter(UserWarning.user_id == int(user_id)).delete()
+        db.commit()
+        return int(deleted or 0)
+    except Exception:
+        db.rollback()
+        return 0
+    finally:
+        db.close()
+
+def get_player(user_id: int) -> Player | None:
+    db = SessionLocal()
+    try:
+        return db.query(Player).filter(Player.user_id == int(user_id)).first()
+    finally:
+        db.close()
+
+def get_moderation_logs(limit: int = 50) -> list[dict]:
+    db = SessionLocal()
+    try:
+        rows = db.query(ModerationLog).order_by(ModerationLog.ts.desc()).limit(limit).all()
+        return [
+            {
+                'id': int(r.id),
+                'ts': int(r.ts or 0),
+                'actor_id': int(r.actor_id or 0),
+                'action': r.action,
+                'request_id': int(r.request_id or 0) if r.request_id else None,
+                'target_id': int(r.target_id or 0) if r.target_id else None,
+                'details': r.details,
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+def get_moderation_logs_by_user(target_id: int, limit: int = 50) -> list[dict]:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ModerationLog)
+            .filter(ModerationLog.target_id == int(target_id))
+            .order_by(ModerationLog.ts.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                'id': int(r.id),
+                'ts': int(r.ts or 0),
+                'actor_id': int(r.actor_id or 0),
+                'action': r.action,
+                'request_id': int(r.request_id or 0) if r.request_id else None,
+                'target_id': int(r.target_id or 0) if r.target_id else None,
+                'details': r.details,
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+
+def get_active_events_count() -> int:
+    """Возвращает количество активных событий."""
+    # TODO: Реализовать после создания таблицы событий
+    return 0
+
+
+def get_bot_statistics() -> dict:
+    """Возвращает детальную статистику бота."""
+    db = SessionLocal()
+    try:
+        current_time = int(time.time())
+        one_day_ago = current_time - 86400
+        one_week_ago = current_time - 604800
+        
+        # Общая статистика
+        total_users = db.query(Player).count()
+        total_drinks = db.query(EnergyDrink).count()
+        total_inventory_items = db.query(func.sum(InventoryItem.quantity)).scalar() or 0
+        total_coins = db.query(func.sum(Player.coins)).scalar() or 0
+        
+        # VIP статистика
+        active_vip = db.query(Player).filter(Player.vip_until > current_time).count()
+        active_vip_plus = db.query(Player).filter(Player.vip_plus_until > current_time).count()
+        
+        # Активность
+        active_today = db.query(Player).filter(Player.last_search > one_day_ago).count()
+        active_week = db.query(Player).filter(Player.last_search > one_week_ago).count()
+        
+        # Покупки
+        total_purchases = db.query(PurchaseReceipt).count()
+        purchases_today = db.query(PurchaseReceipt).filter(PurchaseReceipt.purchased_at > one_day_ago).count()
+        
+        # Топ игроков по монетам
+        top_coins = db.query(Player).order_by(Player.coins.desc()).limit(10).all()
+        
+        # Топ игроков по количеству напитков
+        top_drinks = (
+            db.query(
+                Player.user_id,
+                Player.username,
+                func.sum(InventoryItem.quantity).label('total_drinks')
+            )
+            .join(InventoryItem, Player.user_id == InventoryItem.player_id)
+            .group_by(Player.user_id, Player.username)
+            .order_by(func.sum(InventoryItem.quantity).desc())
+            .limit(10)
+            .all()
+        )
+        
+        return {
+            'total_users': total_users,
+            'total_drinks': total_drinks,
+            'total_inventory_items': int(total_inventory_items),
+            'total_coins': int(total_coins),
+            'active_vip': active_vip,
+            'active_vip_plus': active_vip_plus,
+            'active_today': active_today,
+            'active_week': active_week,
+            'total_purchases': total_purchases,
+            'purchases_today': purchases_today,
+            'top_coins': [(p.user_id, p.username, p.coins) for p in top_coins],
+            'top_drinks': [(user_id, username, int(total)) for user_id, username, total in top_drinks]
+        }
+    except Exception as e:
+        print(f"[DB] Error getting bot statistics: {e}")
+        return {}
+    finally:
+        db.close()
+
+
+def get_all_users_for_broadcast(limit: int = None) -> list[int]:
+    """Возвращает список всех user_id для рассылки."""
+    db = SessionLocal()
+    try:
+        query = db.query(Player.user_id)
+        if limit:
+            query = query.limit(limit)
+        return [row.user_id for row in query.all()]
+    except Exception:
+        return []
+    finally:
+        db.close()
+
+
+def wipe_all_except_drinks() -> bool:
+    dbs = SessionLocal()
+    try:
+        dbs.query(InventoryItem).delete()
+        dbs.query(ShopOffer).delete()
+        dbs.query(PendingAddition).delete()
+        dbs.query(PendingDeletion).delete()
+        dbs.query(PendingEdit).delete()
+        dbs.query(ModerationLog).delete()
+        dbs.query(UserWarning).delete()
+        dbs.query(UserBan).delete()
+        dbs.query(ActionLog).delete()
+        dbs.query(PromoUsage).delete()
+        dbs.query(Promo).delete()
+        dbs.query(BotSetting).delete()
+        dbs.query(TgPremiumStock).delete()
+        dbs.query(PurchaseReceipt).delete()
+        dbs.query(BonusStock).delete()
+        dbs.query(BoostHistory).delete()
+        dbs.query(SilkInventory).delete()
+        dbs.query(SilkTransaction).delete()
+        dbs.query(SilkPlantation).delete()
+        dbs.query(BedFertilizer).delete()
+        dbs.query(PlantationBed).delete()
+        dbs.query(FertilizerInventory).delete()
+        dbs.query(SeedInventory).delete()
+        dbs.query(SeedType).delete()
+        dbs.query(Fertilizer).delete()
+        dbs.query(CommunityParticipant).delete()
+        dbs.query(CommunityContributionLog).delete()
+        dbs.query(CommunityProjectState).delete()
+        dbs.query(CommunityPlantation).delete()
+        dbs.query(DrinkDiscoveryStats).delete()
+        dbs.query(GiftHistory).delete()
+        dbs.query(GiftRestriction).delete()
+        dbs.query(ScheduledAutoDelete).delete()
+        dbs.query(GroupChat).delete()
+        dbs.query(AdminUser).delete()
+        dbs.query(Player).delete()
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        dbs.close()
+
+
+def set_vip_for_user(user_id: int, duration_seconds: int) -> bool:
+    """Устанавливает или продлевает VIP статус пользователю."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        if not player:
+            return False
+        
+        current_time = int(time.time())
+        current_vip = int(getattr(player, 'vip_until', 0) or 0)
+        
+        # Если VIP активен, продлеваем, иначе устанавливаем новый
+        if current_vip > current_time:
+            player.vip_until = current_vip + duration_seconds
+        else:
+            player.vip_until = current_time + duration_seconds
+        
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error setting VIP: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def set_vip_plus_for_user(user_id: int, duration_seconds: int) -> bool:
+    """Устанавливает или продлевает VIP+ статус пользователю."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        if not player:
+            return False
+        
+        current_time = int(time.time())
+        current_vip_plus = int(getattr(player, 'vip_plus_until', 0) or 0)
+        
+        # Если VIP+ активен, продлеваем, иначе устанавливаем новый
+        if current_vip_plus > current_time:
+            player.vip_plus_until = current_vip_plus + duration_seconds
+        else:
+            player.vip_plus_until = current_time + duration_seconds
+        
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error setting VIP+: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def remove_vip_from_user(user_id: int) -> bool:
+    """Удаляет VIP статус у пользователя."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        if not player:
+            return False
+        
+        player.vip_until = 0
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error removing VIP: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def remove_vip_plus_from_user(user_id: int) -> bool:
+    """Удаляет VIP+ статус у пользователя."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        if not player:
+            return False
+        
+        player.vip_plus_until = 0
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error removing VIP+: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def get_stock_info() -> dict:
+    """Возвращает информацию о складе всех бонусов."""
+    db = SessionLocal()
+    try:
+        stocks = db.query(BonusStock).all()
+        return {stock.kind: int(stock.stock or 0) for stock in stocks}
+    except Exception as e:
+        print(f"[DB] Error getting stock info: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+
+# --- Функции для работы с логами ---
+
+def log_action(user_id: int, username: str | None, action_type: str, action_details: str | None = None, amount: int | None = None, success: bool = True):
+    """Записывает действие в лог."""
+    db = SessionLocal()
+    try:
+        log_entry = ActionLog(
+            user_id=user_id,
+            username=username,
+            action_type=action_type,
+            action_details=action_details,
+            amount=amount,
+            success=success
+        )
+        db.add(log_entry)
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error logging action: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def get_recent_logs(limit: int = 50):
+    """Возвращает последние N записей логов."""
+    db = SessionLocal()
+    try:
+        logs = db.query(ActionLog).order_by(ActionLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                'id': log.id,
+                'timestamp': log.timestamp,
+                'user_id': log.user_id,
+                'username': log.username or 'Unknown',
+                'action_type': log.action_type,
+                'action_details': log.action_details,
+                'amount': log.amount,
+                'success': log.success
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        print(f"[DB] Error getting recent logs: {e}")
+        return []
+    finally:
+        db.close()
+
+
+def get_logs_by_type(action_type: str, limit: int = 50):
+    """Возвращает логи определенного типа."""
+    db = SessionLocal()
+    try:
+        logs = db.query(ActionLog).filter(ActionLog.action_type == action_type).order_by(ActionLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                'id': log.id,
+                'timestamp': log.timestamp,
+                'user_id': log.user_id,
+                'username': log.username or 'Unknown',
+                'action_type': log.action_type,
+                'action_details': log.action_details,
+                'amount': log.amount,
+                'success': log.success
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        print(f"[DB] Error getting logs by type: {e}")
+        return []
+    finally:
+        db.close()
+
+
+def get_user_logs(user_id: int, limit: int = 50):
+    """Возвращает логи конкретного пользователя."""
+    db = SessionLocal()
+    try:
+        logs = db.query(ActionLog).filter(ActionLog.user_id == user_id).order_by(ActionLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                'id': log.id,
+                'timestamp': log.timestamp,
+                'user_id': log.user_id,
+                'username': log.username or 'Unknown',
+                'action_type': log.action_type,
+                'action_details': log.action_details,
+                'amount': log.amount,
+                'success': log.success
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        print(f"[DB] Error getting user logs: {e}")
+        return []
+    finally:
+        db.close()
+
+
+def get_error_logs(limit: int = 50):
+    """Возвращает логи с ошибками."""
+    db = SessionLocal()
+    try:
+        logs = db.query(ActionLog).filter(ActionLog.success == False).order_by(ActionLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                'id': log.id,
+                'timestamp': log.timestamp,
+                'user_id': log.user_id,
+                'username': log.username or 'Unknown',
+                'action_type': log.action_type,
+                'action_details': log.action_details,
+                'amount': log.amount,
+                'success': log.success
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        print(f"[DB] Error getting error logs: {e}")
+        return []
+    finally:
+        db.close()
+
+
+# --- Функции для управления энергетиками ---
+
+def get_all_drinks_paginated(page: int = 1, page_size: int = 20):
+    """Возвращает список всех напитков с пагинацией."""
+    db = SessionLocal()
+    try:
+        offset = (page - 1) * page_size
+        drinks = db.query(EnergyDrink).order_by(EnergyDrink.name).offset(offset).limit(page_size).all()
+        total = db.query(EnergyDrink).count()
+        
+        return {
+            'drinks': [
+                {
+                    'id': drink.id,
+                    'name': drink.name,
+                    'description': drink.description,
+                    'is_special': drink.is_special,
+                    'has_image': bool(drink.image_path)
+                }
+                for drink in drinks
+            ],
+            'total': total,
+            'page': page,
+            'total_pages': (total + page_size - 1) // page_size
+        }
+    except Exception as e:
+        print(f"[DB] Error getting drinks: {e}")
+        return {'drinks': [], 'total': 0, 'page': 1, 'total_pages': 0}
+    finally:
+        db.close()
+
+
+def search_drinks_by_name(search_query: str):
+    """Ищет напитки по названию."""
+    db = SessionLocal()
+    try:
+        drinks = db.query(EnergyDrink).filter(EnergyDrink.name.ilike(f'%{search_query}%')).order_by(EnergyDrink.name).limit(50).all()
+        return [
+            {
+                'id': drink.id,
+                'name': drink.name,
+                'description': drink.description,
+                'is_special': drink.is_special,
+                'has_image': bool(drink.image_path)
+            }
+            for drink in drinks
+        ]
+    except Exception as e:
+        print(f"[DB] Error searching drinks: {e}")
+        return []
+    finally:
+        db.close()
+
+
+def get_drink_by_id(drink_id: int):
+    """Получает напиток по ID."""
+    db = SessionLocal()
+    try:
+        drink = db.query(EnergyDrink).filter(EnergyDrink.id == drink_id).first()
+        if drink:
+            return {
+                'id': drink.id,
+                'name': drink.name,
+                'description': drink.description,
+                'is_special': drink.is_special,
+                'image_path': drink.image_path,
+                'has_image': bool(drink.image_path)
+            }
+        return None
+    except Exception as e:
+        print(f"[DB] Error getting drink by id: {e}")
+        return None
+    finally:
+        db.close()
+
+
+def admin_add_drink(name: str, description: str, is_special: bool = False, image_path: str | None = None) -> bool:
+    """Админ добавляет напиток напрямую."""
+    db = SessionLocal()
+    try:
+        # Проверяем, не существует ли уже
+        existing = db.query(EnergyDrink).filter(EnergyDrink.name == name).first()
+        if existing:
+            return False
+        
+        drink = EnergyDrink(name=name, description=description, is_special=is_special, image_path=image_path)
+        db.add(drink)
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error adding drink: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def admin_update_drink(drink_id: int, name: str | None = None, description: str | None = None, is_special: bool | None = None) -> bool:
+    """Админ обновляет информацию о напитке."""
+    db = SessionLocal()
+    try:
+        drink = db.query(EnergyDrink).filter(EnergyDrink.id == drink_id).first()
+        if not drink:
+            return False
+        
+        if name is not None:
+            drink.name = name
+        if description is not None:
+            drink.description = description
+        if is_special is not None:
+            drink.is_special = is_special
+        
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error updating drink: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def admin_update_drink_image(drink_id: int, image_path: str) -> bool:
+    db = SessionLocal()
+    try:
+        drink = db.query(EnergyDrink).filter(EnergyDrink.id == drink_id).first()
+        if not drink:
+            return False
+        drink.image_path = image_path
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error updating drink image: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def admin_delete_drink(drink_id: int) -> bool:
+    """Админ удаляет напиток."""
+    db = SessionLocal()
+    try:
+        drink = db.query(EnergyDrink).filter(EnergyDrink.id == drink_id).first()
+        if not drink:
+            return False
+        
+        # Удаляем все записи из инвентаря с этим напитком
+        db.query(InventoryItem).filter(InventoryItem.drink_id == drink_id).delete()
+        
+        # Удаляем напиток
+        db.delete(drink)
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error deleting drink: {e}")
+        db.rollback()
+        return False
     finally:
         db.close()

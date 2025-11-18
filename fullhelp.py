@@ -23,8 +23,8 @@ async def fullhelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет прав")
         return
 
-    search_minutes = SEARCH_COOLDOWN // 60
-    bonus_hours = DAILY_BONUS_COOLDOWN // 3600
+    search_minutes = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN) // 60
+    bonus_hours = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN) // 3600
 
     # Разбиваем на секции, чтобы не превышать лимиты длины сообщения
     sections: list[str] = []

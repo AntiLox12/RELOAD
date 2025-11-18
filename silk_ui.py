@@ -40,14 +40,24 @@ async def show_city_silk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # VIP статус
     vip_status = "🔥 V.I.P активен" if db.is_vip(user.id) else ""
-    vip_line = f"\n{vip_status}" if vip_status else ""
+    vip_line = f"   {vip_status}\n" if vip_status else ""
     
     text = (
-        f"{SILK_EMOJIS['city']} **ГОРОД ШЁЛКА** {SILK_EMOJIS['city']}\n\n"
-        f"{SILK_EMOJIS['plantation']} Ваши плантации: {active_plantations} активных\n"
-        f"{SILK_EMOJIS['inventory']} Шёлковый инвентарь: {total_silk} единиц\n"
-        f"{SILK_EMOJIS['coins']} Доступно септимов: {player.coins:,}\n"
+        f"🧵 <b>ДОБРО ПОЖАЛОВАТЬ В ГОРОД ШЁЛКА</b> 🧵\n\n"
+        f"🏛️ <i>Центр шёлкового производства и торговли тканями!</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 <b>ВАША СТАТИСТИКА:</b>\n\n"
+        f"{SILK_EMOJIS['plantation']} Активных плантаций: <b>{active_plantations}</b>\n"
+        f"{SILK_EMOJIS['inventory']} Шёлка в инвентаре: <b>{total_silk}</b> единиц\n"
+        f"{SILK_EMOJIS['coins']} Доступно септимов: <b>{player.coins:,}</b> 💎\n"
         f"{vip_line}"
+        f"\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📍 <b>ДОСТУПНЫЕ ЛОКАЦИИ:</b>\n\n"
+        f"🌳 <b>Плантации</b> - создавайте и управляйте\n"
+        f"📊 <b>Рынок</b> - продавайте по лучшим ценам\n"
+        f"💼 <b>Инвентарь</b> - просматривайте запасы\n"
+        f"📈 <b>Статистика</b> - отслеживайте прогресс\n\n"
+        f"<i>Выберите раздел:</i>"
     )
     
     keyboard = [
@@ -56,7 +66,7 @@ async def show_city_silk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"{SILK_EMOJIS['inventory']} Инвентарь шёлка", callback_data='silk_inventory')],
         [InlineKeyboardButton(f"{SILK_EMOJIS['stats']} Статистика", callback_data='silk_stats')],
         [InlineKeyboardButton("🔙 К городам", callback_data='cities_menu')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
