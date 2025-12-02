@@ -47,6 +47,9 @@ VIP_PLUS_TEXTS = {
     'vip_auto_header': {'ru': '\n<b>🤖 Автопоиск</b>', 'en': '\n<b>🤖 Auto-search</b>'},
     'vip_auto_state': {'ru': 'Состояние: {state}', 'en': 'State: {state}'},
     'vip_auto_today': {'ru': 'Сегодня: {count}/{limit}', 'en': 'Today: {count}/{limit}'},
+    'silent_mode_on': {'ru': 'Тихий режим: Вкл 🔕', 'en': 'Silent Mode: On 🔕'},
+    'silent_mode_off': {'ru': 'Тихий режим: Выкл 🔔', 'en': 'Silent Mode: Off 🔔'},
+    'btn_silent_toggle': {'ru': '🔕/🔔 Тихий режим', 'en': '🔕/🔔 Silent Mode'},
 }
 
 def vip_plus_t(lang: str, key: str) -> str:
@@ -72,6 +75,11 @@ async def show_vip_plus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text += "\n" + vip_plus_t(lang, 'vip_auto_state').format(state=auto_state)
         text += "\n" + vip_plus_t(lang, 'vip_auto_today').format(count=auto_count, limit=auto_limit)
         
+        # Статус тихого режима
+        is_silent = getattr(player, 'auto_search_silent', False)
+        silent_text = vip_plus_t(lang, 'silent_mode_on') if is_silent else vip_plus_t(lang, 'silent_mode_off')
+        text += f"\n{silent_text}"
+        
         # Показываем статус VIP+
         if db.is_vip_plus(user.id):
             vip_plus_until = db.get_vip_plus_until(user.id)
@@ -86,6 +94,7 @@ async def show_vip_plus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton(vip_plus_t(lang, 'vip_plus_1d'), callback_data='vip_plus_1d')],
         [InlineKeyboardButton(vip_plus_t(lang, 'vip_plus_7d'), callback_data='vip_plus_7d')],
         [InlineKeyboardButton(vip_plus_t(lang, 'vip_plus_30d'), callback_data='vip_plus_30d')],
+        [InlineKeyboardButton(vip_plus_t(lang, 'btn_silent_toggle'), callback_data='toggle_silent_mode')],
         [InlineKeyboardButton(vip_plus_t(lang, 'btn_back'), callback_data='extra_bonuses')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
@@ -389,3 +398,18 @@ async def buy_vip_plus(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
         except BadRequest:
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+async def toggle_auto_search_silent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключает тихий режим автопоиска."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    
+    # Переключаем
+    current = getattr(player, 'auto_search_silent', False)
+    db.update_player(user.id, auto_search_silent=not current)
+    
+    # Обновляем меню
+    await show_vip_plus_menu(update, context)

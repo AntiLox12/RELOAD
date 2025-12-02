@@ -5,6 +5,7 @@ import logging
 import random
 import time
 import asyncio
+import json
 import secrets
 import html
 import re
@@ -50,6 +51,7 @@ from vip_plus_handlers import (
     show_vip_plus_30d,
     buy_vip_plus,
     confirm_vip_plus_purchase,
+    toggle_auto_search_silent,
 )
 from constants import (
     SEARCH_COOLDOWN,
@@ -2529,6 +2531,7 @@ async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard = [
             [InlineKeyboardButton("💰 Изменить баланс", callback_data=f'admin_player_balance:{player_id}')],
             [InlineKeyboardButton("💎 Управление VIP", callback_data=f'admin_player_vip:{player_id}')],
+            [InlineKeyboardButton("👥 Селюки игрока", callback_data=f'admin_player_selyuki:{player_id}')],
             [InlineKeyboardButton("📝 Логи игрока", callback_data=f'admin_player_logs:{player_id}')],
             [InlineKeyboardButton("🔄 Сбросить бонус", callback_data=f'admin_player_reset_bonus:{player_id}')],
             [InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')],
@@ -2716,6 +2719,81 @@ async def admin_player_logs_show(update: Update, context: ContextTypes.DEFAULT_T
                 text += f"└ {timestamp_str}\n\n"
         else:
             text += "<i>Логов для этого игрока пока нет</i>"
+    finally:
+        dbs.close()
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f'admin_player_details:{player_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_player_selyuki_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает селюков конкретного игрока."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    # Получаем player_id из callback_data
+    player_id = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if not player:
+            username_display = f"ID: {player_id}"
+        else:
+            username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        
+        # Получаем селюков игрока
+        selyuki = db.get_player_selyuki(player_id)
+        
+        text = f"👥 <b>СЕЛЮКИ ИГРОКА {username_display}</b>\n\n"
+        
+        if not selyuki:
+            text += "<i>У игрока пока нет селюков.</i>"
+        else:
+            for s in selyuki:
+                stype = str(getattr(s, 'type', '') or '')
+                lvl = int(getattr(s, 'level', 1) or 1)
+                bal = int(getattr(s, 'balance_septims', 0) or 0)
+                enabled = bool(getattr(s, 'is_enabled', False))
+                status = "✅ Вкл" if enabled else "🚫 Выкл"
+                
+                if stype == 'farmer':
+                    text += f"👨‍🌾 <b>Селюк фермер</b>\n"
+                elif stype == 'silkmaker':
+                    text += f"🧵 <b>Селюк шёлковод</b>\n"
+                elif stype == 'trickster':
+                    text += f"🧮 <b>Селюк махинаций</b>\n"
+                elif stype == 'buyer':
+                    text += f"🛒 <b>Селюк покупатель</b>\n"
+                elif stype == 'boss':
+                    text += f"👑 <b>Босс селюков</b>\n"
+                else:
+                    text += f"❓ <b>Неизвестный тип</b> ({stype})\n"
+                
+                text += f"   • Уровень: {lvl}\n"
+                text += f"   • Баланс: {bal:,} 💎\n"
+                text += f"   • Статус: {status}\n\n"
     finally:
         dbs.close()
     
@@ -4396,18 +4474,35 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
         auto_res = db.try_farmer_autowater(user_id, bed_index)
 
-        keyboard = [[InlineKeyboardButton("🌱 Перейти к плантациям", callback_data='market_plantation')]]
+        keyboard = [
+            [InlineKeyboardButton("🌱 Перейти к плантациям", callback_data='market_plantation')],
+            [InlineKeyboardButton("💤 Отложить 10м", callback_data=f'snooze_remind_{bed_index}')]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         if auto_res.get('ok'):
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"👨‍🌾 Селюк фермер полил грядку {bed_index} (−50 септимов с его баланса).",
+                text=f"👨‍🌾 Селюк фермер полил грядку {bed_index} (−{auto_res.get('cost', 50)} септимов с его баланса).",
                 reply_markup=reply_markup
+            )
+            # Планируем следующий полив
+            water_interval = auto_res.get('water_interval_sec', 1800)
+            context.job_queue.run_once(
+                plantation_water_reminder_job,
+                when=water_interval,
+                chat_id=user_id,
+                data={'bed_index': bed_index},
+                name=f"plantation_water_reminder_{user_id}_{bed_index}"
             )
             return
 
         reason = auto_res.get('reason') if isinstance(auto_res, dict) else None
+        
+        # Если грядка пустая или удалена - прекращаем напоминания
+        if reason in ('no_seed', 'no_bed'):
+            return
+
         if reason == 'remind_disabled':
             text = (
                 f"💧 Грядка {bed_index} готова к поливу!\n\n"
@@ -4419,6 +4514,14 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 f"💧 Грядка {bed_index} готова к поливу!\n\n"
                 "👨‍🌾 Селюку фермеру не хватает септимов на балансе, полей грядку вручную или пополни баланс селюка."
             )
+        elif reason == 'not_growing':
+             # Если уже не growing, значит, возможно, уже выросло или удалено
+             return
+        elif reason == 'selyuk_disabled':
+            text = (
+                f"💧 Грядка {bed_index} готова к поливу!\n\n"
+                "👨‍🌾 Селюк фермер сейчас выключен. Полейте грядку вручную или включите фермера."
+            )
         else:
             text = f"💧 Грядка {bed_index} готова к поливу!"
 
@@ -4429,6 +4532,171 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as ex:
         logger.warning(f"Не удалось отправить напоминание о поливе (job): {ex}")
+
+
+async def global_farmer_harvest_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue: глобальный автоматический сбор урожая для всех пользователей с фермером 2 уровня."""
+    try:
+        user_ids = db.get_users_with_level2_farmers()
+        for user_id in user_ids:
+            try:
+                res = db.try_farmer_auto_harvest(user_id)
+                if res.get('ok') and res.get('harvested'):
+                    items = res['harvested']
+                    
+                    text = "👨‍🌾 <b>Селюк фермер собрал урожай!</b>\n\n"
+                    for item in items:
+                        bed_idx = item.get('bed_index')
+                        amount = item.get('items_added')
+                        drink_name = item.get('drink_name', "Неизвестный")
+                        text += f"• Грядка {bed_idx}: {amount} шт. ({drink_name})\n"
+                    
+                    text += "\nУрожай добавлен в инвентарь."
+                    
+                    try:
+                        await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Ошибка автосбора для user {user_id}: {e}")
+
+            # После сбора урожая пытаемся посадить новые семена (для 3 уровня)
+            try:
+                plant_res = db.try_farmer_auto_plant(user_id)
+                if plant_res.get('ok') and plant_res.get('planted'):
+                    planted = plant_res['planted']
+                    plant_text = "🌱 <b>Селюк фермер посадил новые семена!</b>\n\n"
+                    for p in planted:
+                        plant_text += f"• Грядка {p['bed_index']}: {p['seed_name']}\n"
+                    
+                    try:
+                        await context.bot.send_message(chat_id=user_id, text=plant_text, parse_mode='HTML')
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Ошибка автопосадки для user {user_id}: {e}")
+    except Exception as ex:
+        logger.warning(f"Ошибка в global_farmer_harvest_job: {ex}")
+
+async def plantation_harvest_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue: автоматический сбор урожая (для селюка 2 уровня)."""
+    try:
+        if not hasattr(context, 'job') or not context.job:
+            return
+        user_id = context.job.chat_id
+        
+        # Пытаемся собрать урожай
+        res = db.try_farmer_auto_harvest(user_id)
+        if res.get('ok') and res.get('harvested'):
+            items = res['harvested']
+            count = len(items)
+            
+            # Формируем сообщение
+            text = f"👨‍🌾 <b>Селюк фермер (Ур. 2) собрал урожай!</b>\n\n"
+            for item in items:
+                bed_idx = item['bed_index']
+                drink_id = item['drink_id']
+                amount = item['yield']
+                # Получаем название напитка (нужен доп. запрос или кэш, но для скорости просто ID или generic)
+                # Лучше получить название из БД
+                drink_name = "Энергетик"
+                try:
+                    d_obj = db.get_drink_by_id(drink_id)
+                    if d_obj:
+                        drink_name = d_obj.name
+                except:
+                    pass
+                    
+                text += f"• Грядка {bed_idx}: {amount} шт. ({drink_name})\n"
+            
+            text += "\nУрожай добавлен в инвентарь."
+            
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+            except Exception:
+                pass
+                
+    except Exception as ex:
+        logger.warning(f"Ошибка в plantation_harvest_job: {ex}")
+
+async def snooze_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Отложить' (Snooze)."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data  # ожидаем 'snooze_remind_<bed_index>'
+    try:
+        bed_index = int(data.split('_')[-1])
+    except (ValueError, IndexError):
+        return
+
+    user_id = query.from_user.id
+    
+    # Планируем новое напоминание через 10 минут (600 сек)
+    delay_sec = 600
+    
+    try:
+        # Удаляем старые (на всякий случай)
+        current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user_id}_{bed_index}")
+        for job in current_jobs:
+            job.schedule_removal()
+            
+        context.application.job_queue.run_once(
+            plantation_water_reminder_job,
+            when=delay_sec,
+            chat_id=user_id,
+            data={'bed_index': bed_index},
+            name=f"plantation_water_reminder_{user_id}_{bed_index}",
+        )
+        
+        await query.edit_message_text(
+            text=f"💤 Напоминание отложено на 10 минут.",
+            reply_markup=None
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при откладывании напоминания: {e}")
+        await query.answer("Ошибка", show_alert=True)
+
+
+async def _send_auto_search_summary(user_id: int, player: Player, context: ContextTypes.DEFAULT_TYPE, reason: str = 'limit'):
+    """Отправляет сводный отчет по автопоиску (для тихого режима)."""
+    try:
+        stats_json = getattr(player, 'auto_search_session_stats', '{}') or '{}'
+        try:
+            stats = json.loads(stats_json)
+        except:
+            stats = {}
+        
+        total_found = stats.get('total_found', 0)
+        if total_found == 0:
+            return
+
+        total_coins = stats.get('total_coins', 0)
+        rarities = stats.get('rarities', {})
+        
+        text = f"📊 <b>Отчет автопоиска</b>\n\n"
+        text += f"🔎 Найдено: {total_found}\n"
+        text += f"💰 Монеты: {total_coins}\n\n"
+        
+        for r, c in rarities.items():
+            emoji = COLOR_EMOJIS.get(r, '⚫')
+            text += f"{emoji} {r}: {c}\n"
+            
+        if reason == 'limit':
+            text += "\n🏁 <i>Дневной лимит исчерпан.</i>"
+        elif reason == 'vip_expired':
+            text += "\n⚠️ <i>VIP статус истёк.</i>"
+        elif reason == 'disabled':
+            text += "\n🛑 <i>Автопоиск остановлен.</i>"
+            
+        await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+        
+        # Сбрасываем статистику
+        db.update_player(user_id, auto_search_session_stats='{}')
+        
+    except Exception as e:
+        logger.error(f"[AUTO] Failed to send summary for {user_id}: {e}")
+
 
 async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: периодически выполняет автопоиск для VIP-пользователей.
@@ -4448,10 +4716,17 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
 
         # Если пользователь успел выключить автопоиск — выходим (не переназначаем)
         if not getattr(player, 'auto_search_enabled', False):
+            # Если был тихий режим и есть статистика — отправим отчет
+            if getattr(player, 'auto_search_silent', False):
+                await _send_auto_search_summary(user_id, player, context, reason='disabled')
             return
 
         # Проверка VIP
         if not db.is_vip(user_id):
+            # Если был тихий режим — отчет
+            if getattr(player, 'auto_search_silent', False):
+                await _send_auto_search_summary(user_id, player, context, reason='vip_expired')
+                
             db.update_player(user_id, auto_search_enabled=False)
             lang = player.language
             try:
@@ -4472,6 +4747,10 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
         # Лимит в сутки (с учётом возможного буста)
         daily_limit = db.get_auto_search_daily_limit(user_id)
         if count >= daily_limit:
+            # Если был тихий режим — отчет
+            if getattr(player, 'auto_search_silent', False):
+                await _send_auto_search_summary(user_id, player, context, reason='limit')
+                
             db.update_player(user_id, auto_search_enabled=False)
             lang = player.language
             try:
@@ -4531,31 +4810,67 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # Отправим пользователю уведомление с найденным предметом
-            try:
-                img_path = result.get("image_path")
-                if img_path and os.path.exists(img_path):
-                    with open(img_path, 'rb') as photo:
-                        await context.bot.send_photo(
+            # Проверяем режим (тихий или обычный)
+            is_silent = getattr(player, 'auto_search_silent', False)
+            logger.info(f"[AUTO] User {user_id} silent mode: {is_silent}")
+            
+            if is_silent:
+                # Накапливаем статистику
+                try:
+                    stats_json = getattr(player, 'auto_search_session_stats', '{}') or '{}'
+                    try:
+                        stats = json.loads(stats_json)
+                    except:
+                        stats = {}
+                    
+                    # Обновляем данные
+                    stats['total_found'] = stats.get('total_found', 0) + 1
+                    
+                    # Извлекаем награду из лога или результата (в result нет точной суммы, но мы можем примерно восстановить или передать из _perform_energy_search)
+                    # В _perform_energy_search мы не возвращаем точную сумму монет, добавим это.
+                    # Пока возьмем из caption парсингом или просто добавим в result
+                    earned_coins = result.get('earned_coins', 0) # Нужно добавить в _perform_energy_search
+                    stats['total_coins'] = stats.get('total_coins', 0) + earned_coins
+                    
+                    rarity = result.get('rarity', 'Common') # Нужно добавить в _perform_energy_search
+                    if 'rarities' not in stats:
+                        stats['rarities'] = {}
+                    stats['rarities'][rarity] = stats['rarities'].get(rarity, 0) + 1
+                    
+                    db.update_player(user_id, auto_search_session_stats=json.dumps(stats))
+                    logger.debug(f"[AUTO] Silent search stats updated for {user_id}")
+                except Exception as e:
+                    logger.error(f"[AUTO] Failed to update silent stats: {e}")
+            else:
+                # Отправим пользователю уведомление с найденным предметом (как раньше)
+                try:
+                    img_path = result.get("image_path")
+                    if img_path and os.path.exists(img_path):
+                        with open(img_path, 'rb') as photo:
+                            await context.bot.send_photo(
+                                chat_id=user_id,
+                                photo=photo,
+                                caption=result.get("caption"),
+                                reply_markup=result.get("reply_markup"),
+                                parse_mode='HTML'
+                            )
+                    else:
+                        await context.bot.send_message(
                             chat_id=user_id,
-                            photo=photo,
-                            caption=result.get("caption"),
+                            text=result.get("caption"),
                             reply_markup=result.get("reply_markup"),
                             parse_mode='HTML'
                         )
-                else:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=result.get("caption"),
-                        reply_markup=result.get("reply_markup"),
-                        parse_mode='HTML'
-                    )
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
             # Если достигнут лимит — отключаем и уведомляем
             daily_limit = db.get_auto_search_daily_limit(user_id)
             if count >= daily_limit:
+                # Если был тихий режим — отчет
+                if is_silent:
+                    await _send_auto_search_summary(user_id, player, context, reason='limit')
+                    
                 db.update_player(user_id, auto_search_enabled=False)
                 lang = player.language
                 try:
@@ -4831,7 +5146,9 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         "status": "ok",
         "caption": caption,
         "image_path": image_full_path,
-        "reply_markup": InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]])
+        "reply_markup": InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]),
+        "earned_coins": septims_reward + autosell_payout,
+        "rarity": rarity
     }
 
 
@@ -4919,6 +5236,7 @@ async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         ('vip_3d', '👑 VIP на 3 дня'),
         ('vip_plus_7d', '💎 VIP+ на 7 дней'),
         ('vip_plus_30d', '🎊 VIP+ на 30 дней'),
+        ('selyuk_fragment', '🧩 Фрагмент Селюка'),
     ]
     
     # Находим индекс выбранной награды
@@ -5124,6 +5442,19 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
         )
         reward_log = "VIP+ 30 days (JACKPOT!)"
+
+    elif selected_reward == 'selyuk_fragment':
+        # Награда 6: Фрагмент Селюка
+        amount = reward_info.get('amount', 1)
+        new_fragments = db.increment_selyuk_fragments(user.id, amount)
+        db.update_player(user.id, last_bonus_claim=current_time)
+        
+        caption = (
+            f"🎉 <b>Редкая находка!</b>\n\n"
+            f"🧩 Вы нашли <b>Фрагмент Селюка</b> ({amount} шт.)!\n\n"
+            f"Всего фрагментов: <b>{new_fragments}</b>"
+        )
+        reward_log = f"Selyuk Fragment +{amount} -> {new_fragments}"
     
     # Логируем результат
     logger.info(
@@ -5522,9 +5853,12 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Прогресс коллекции (процент от всех напитков)
     try:
-        total_unique_drinks = db.count_all_drinks()
-        if total_unique_drinks > 0:
-            collection_percent = (unique_drinks / total_unique_drinks) * 100
+        total_points = db.get_total_collection_points()
+        if total_points > 0:
+            # unique_drinks - это количество записей в inventory_items, 
+            # что соответствует уникальным парам (напиток, редкость).
+            # Это именно то, что нам нужно для числителя.
+            collection_percent = (unique_drinks / total_points) * 100
             progress_bar = create_progress_bar(collection_percent, length=10)
             stats_text += f"• Прогресс коллекции: {progress_bar} {collection_percent:.1f}%\n"
     except:
@@ -6142,6 +6476,10 @@ async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
          InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
         [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🏀 Баскетбол", callback_data='casino_game_basketball'),
+         InlineKeyboardButton("⚽ Футбол", callback_data='casino_game_football')],
+        [InlineKeyboardButton("🎳 Боулинг", callback_data='casino_game_bowling'),
+         InlineKeyboardButton("🎯 Дартс", callback_data='casino_game_darts')],
         [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
          InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
@@ -6331,7 +6669,7 @@ async def show_bet_selection_screen(update, context, game_type: str, game_info: 
         f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
         f"{choice_text}"
         f"🎯 Шанс выигрыша: {int(game_info['win_prob'] * 100)}%\n"
-        f"💰 Множитель: до x{game_info['multiplier'] if game_type != 'slots' else '20'}\n\n"
+        f"💰 Множитель: до x{game_info['multiplier'] if game_type != 'slots' else '10'}\n\n"
         f"💵 Ваш баланс: <b>{coins}</b> септимов\n\n"
         "Выберите ставку:"
     )
@@ -6364,8 +6702,157 @@ async def show_bet_selection_screen(update, context, game_type: str, game_info: 
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
+async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, bet_amount: int, player_choice: str = None):
+    """Играет в игру с нативной анимацией Telegram (dice)."""
+    query = update.callback_query
+    user = query.from_user
+    chat_id = user.id
+    
+    # Проверяем баланс
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    current_coins = int(getattr(player, 'coins', 0) or 0)
+    
+    if current_coins < bet_amount:
+        await query.answer("Недостаточно средств!", show_alert=True)
+        return
+
+    # Списываем ставку
+    db.increment_coins(user.id, -bet_amount)
+    
+    # Отправляем анимацию
+    emoji = CASINO_GAMES[game_type]['emoji']
+    try:
+        # Удаляем сообщение с меню, чтобы не мешало (опционально, но лучше оставить для контекста)
+        # await query.message.delete()
+        pass
+    except Exception:
+        pass
+
+    # Отправляем дайс
+    dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=emoji)
+    value = dice_msg.dice.value
+    
+    # Планируем удаление дайса через 8 секунд
+    async def delete_dice_later(msg, delay):
+        await asyncio.sleep(delay)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+            
+    asyncio.create_task(delete_dice_later(dice_msg, 8))
+    
+    # Ждем анимацию
+    await asyncio.sleep(4)
+    
+    win = False
+    multiplier = 0.0
+    result_text = ""
+    
+    # Логика для разных игр
+    if game_type == 'dice':
+        # Кости: угадать число (1-6)
+        target = int(player_choice)
+        win = (value == target)
+        multiplier = CASINO_GAMES['dice']['multiplier']
+        result_text = f"🎲 Выпало: <b>{value}</b> (Ваш выбор: {target})"
+        
+    elif game_type == 'slots':
+        # Слоты: 1-64
+        # 64: 777 (x10)
+        # 43: Виноград (x5)
+        # 22: Лимон (x3)
+        # 1: BAR (x2)
+        if value == 64:
+            win = True
+            multiplier = 10.0
+            result_text = "🎰 <b>ДЖЕКПОТ! (777)</b>"
+        elif value == 43:
+            win = True
+            multiplier = 5.0
+            result_text = "🍇 <b>Виноград!</b>"
+        elif value == 22:
+            win = True
+            multiplier = 3.0
+            result_text = "🍋 <b>Лимон!</b>"
+        elif value == 1:
+            win = True
+            multiplier = 2.0
+            result_text = "🍫 <b>BAR!</b>"
+        else:
+            win = False
+            result_text = "🎰 Попробуйте ещё раз!"
+            
+    elif game_type == 'basketball':
+        # Баскетбол: 4, 5 - попадание
+        if value in [4, 5]:
+            win = True
+            multiplier = CASINO_GAMES['basketball']['multiplier']
+            result_text = "🏀 <b>Попадание!</b>"
+        else:
+            win = False
+            result_text = "🏀 Промах..."
+            
+    elif game_type == 'football':
+        # Футбол: 3, 4, 5 - гол
+        if value in [3, 4, 5]:
+            win = True
+            multiplier = CASINO_GAMES['football']['multiplier']
+            result_text = "⚽ <b>ГОООЛ!</b>"
+        else:
+            win = False
+            result_text = "⚽ Мимо ворот..."
+            
+    elif game_type == 'bowling':
+        # Боулинг: 6 - страйк
+        if value == 6:
+            win = True
+            multiplier = CASINO_GAMES['bowling']['multiplier']
+            result_text = "🎳 <b>СТРАЙК!</b>"
+        else:
+            win = False
+            result_text = f"🎳 Сбито кеглей: {value}"
+            
+    elif game_type == 'darts':
+        # Дартс: 6 - яблочко
+        if value == 6:
+            win = True
+            multiplier = CASINO_GAMES['darts']['multiplier']
+            result_text = "🎯 <b>В ЯБЛОЧКО!</b>"
+        else:
+            win = False
+            result_text = "🎯 Мимо центра..."
+
+    # Обработка результата
+    winnings = 0
+    if win:
+        winnings = int(bet_amount * multiplier)
+        db.increment_coins(user.id, winnings)
+        # Обновляем статистику
+        p = db.get_player(user.id)
+        db.update_player_stats(user.id, casino_wins=(p.casino_wins or 0) + 1)
+    else:
+        p = db.get_player(user.id)
+        db.update_player_stats(user.id, casino_losses=(p.casino_losses or 0) + 1)
+
+    # Проверка достижений
+    player = db.get_or_create_player(user.id, user.username)
+    achievement_bonus = check_casino_achievements(user.id, player)
+    
+    # Показываем результат
+    game_info = CASINO_GAMES[game_type]
+    
+    await show_game_result(query, user, game_info, bet_amount, win, winnings, 
+                          player.coins, result_text, achievement_bonus, context)
+
+
 async def play_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, player_choice: str, bet_amount: int):
     """Играет в выбранную игру казино с выбором игрока."""
+    # Перенаправляем на нативные игры
+    if game_type in ['dice', 'slots', 'basketball', 'football', 'bowling', 'darts']:
+        await play_casino_game_native(update, context, game_type, bet_amount, player_choice)
+        return
+
     query = update.callback_query
     user = query.from_user
     
@@ -6790,6 +7277,10 @@ async def open_casino_from_text(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
          InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
         [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🏀 Баскетбол", callback_data='casino_game_basketball'),
+         InlineKeyboardButton("⚽ Футбол", callback_data='casino_game_football')],
+        [InlineKeyboardButton("🎳 Боулинг", callback_data='casino_game_bowling'),
+         InlineKeyboardButton("🎯 Дартс", callback_data='casino_game_darts')],
         [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
          InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
@@ -6919,6 +7410,10 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
              InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
             [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+            [InlineKeyboardButton("🏀 Баскетбол", callback_data='casino_game_basketball'),
+             InlineKeyboardButton("⚽ Футбол", callback_data='casino_game_football')],
+            [InlineKeyboardButton("🎳 Боулинг", callback_data='casino_game_bowling'),
+             InlineKeyboardButton("🎯 Дартс", callback_data='casino_game_darts')],
             [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
              InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
             [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
@@ -6964,6 +7459,10 @@ async def show_casino_after_custom_bet(msg, user, context):
         [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
          InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
         [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🏀 Баскетбол", callback_data='casino_game_basketball'),
+         InlineKeyboardButton("⚽ Футбол", callback_data='casino_game_football')],
+        [InlineKeyboardButton("🎳 Боулинг", callback_data='casino_game_bowling'),
+         InlineKeyboardButton("🎯 Дартс", callback_data='casino_game_darts')],
         [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
          InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
@@ -7880,20 +8379,23 @@ async def handle_plantation_plant(update: Update, context: ContextTypes.DEFAULT_
             else:
                 await query.answer('Ошибка при посадке', show_alert=True)
         else:
-            await query.answer('Посажено!', show_alert=False)
-            
-            # Планируем первое напоминание о поливе, если включено
-            player = db.get_or_create_player(user.id, user.username or user.first_name)
-            if getattr(player, 'remind_plantation', False) and context.application and context.application.job_queue:
-                water_interval = int(res.get('water_interval_sec', 0))
-                if water_interval > 0:
-                    try:
-                        # Удаляем старые напоминания для этой грядки
+            # --- FIX: Immediate free watering for everyone ---
+            try:
+                # Сразу поливаем бесплатно (как будто только что посадили во влажную почву)
+                water_res = db.water_bed(user.id, bed_index)
+                if water_res.get('ok'):
+                    await query.answer('Посажено и полито!', show_alert=False)
+                    
+                    # Если полили, нужно перепланировать напоминание, так как таймер сбросился
+                    # Новое время полива = water_interval
+                    player = db.get_or_create_player(user.id, user.username or user.first_name)
+                    if getattr(player, 'remind_plantation', False) and context.application and context.application.job_queue:
+                        water_interval = int(water_res.get('water_interval_sec', 1800))
+                        # Удаляем только что созданное напоминание (которое было на water_interval от посадки)
                         current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user.id}_{bed_index}")
                         for job in current_jobs:
                             job.schedule_removal()
                         
-                        # Планируем напоминание на время, когда можно будет полить
                         context.application.job_queue.run_once(
                             plantation_water_reminder_job,
                             when=water_interval,
@@ -7901,8 +8403,68 @@ async def handle_plantation_plant(update: Update, context: ContextTypes.DEFAULT_
                             data={'bed_index': bed_index},
                             name=f"plantation_water_reminder_{user.id}_{bed_index}",
                         )
-                    except Exception as ex:
-                        logger.warning(f"Не удалось запланировать напоминание о поливе при посадке: {ex}")
+                else:
+                    # Если не удалось полить (странно), просто пишем "Посажено"
+                    await query.answer('Посажено!', show_alert=False)
+            except Exception as ex:
+                logger.warning(f"Ошибка при мгновенном поливе: {ex}")
+                await query.answer('Посажено!', show_alert=False)
+
+            # --- OLD FARMER LOGIC (Disabled) ---
+            # try:
+            #     # Сразу после посадки last_watered_at=0, так что фермер должен полить
+            #     auto_res = db.try_farmer_autowater(user.id, bed_index)
+            #     if auto_res.get('ok'):
+            #         cost = auto_res.get('cost', 50)
+            #         try:
+            #             await context.bot.send_message(
+            #                 chat_id=user.id,
+            #                 text=f"👨‍🌾 <b>Селюк фермер сразу полил новую посадку!</b> (−{cost} септимов)",
+            #                 parse_mode='HTML'
+            #             )
+            #             # Если полил, нужно перепланировать напоминание, так как таймер сбросился
+            #             # Новое время полива = water_interval
+            #             if getattr(player, 'remind_plantation', False) and context.application and context.application.job_queue:
+            #                 water_interval = int(auto_res.get('water_interval_sec', 1800))
+            #                 # Удаляем только что созданное напоминание (которое было на water_interval от посадки)
+            #                 # В принципе, оно было на то же время, но лучше обновить для точности
+            #                 current_jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user.id}_{bed_index}")
+            #                 for job in current_jobs:
+            #                     job.schedule_removal()
+            #                 
+            #                 context.application.job_queue.run_once(
+            #                     plantation_water_reminder_job,
+            #                     when=water_interval,
+            #                     chat_id=user.id,
+            #                     data={'bed_index': bed_index},
+            #                     name=f"plantation_water_reminder_{user.id}_{bed_index}",
+            #                 )
+            #         except Exception:
+            #             pass
+            #     else:
+            #         # Если не удалось полить, сообщаем причину (если фермер есть)
+            #         reason = auto_res.get('reason')
+            #         if reason == 'remind_disabled':
+            #             await context.bot.send_message(
+            #                 chat_id=user.id,
+            #                 text="👨‍🌾 Селюк фермер не смог полить: <b>включите напоминания о поливе</b> в настройках!",
+            #                 parse_mode='HTML'
+            #             )
+            #         elif reason == 'no_funds':
+            #             await context.bot.send_message(
+            #                 chat_id=user.id,
+            #                 text="👨‍🌾 Селюк фермер не смог полить: <b>недостаточно средств</b> на балансе селюка!",
+            #                 parse_mode='HTML'
+            #             )
+            #         elif reason == 'selyuk_disabled':
+            #             await context.bot.send_message(
+            #                 chat_id=user.id,
+            #                 text="👨‍🌾 Селюк фермер не смог полить: <b>фермер выключен</b>!",
+            #                 parse_mode='HTML'
+            #             )
+            # except Exception as ex:
+            #     logger.warning(f"Ошибка при мгновенном поливе фермером: {ex}")
+
         await show_plantation_my_beds(update, context)
 
 
@@ -8133,7 +8695,7 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
 
             wc = int(eff.get('water_count') or 0)
             fert_active = bool(eff.get('fertilizer_active'))
-            fert_name = eff.get('fertilizer_name') or ''
+            fert_names = eff.get('fertilizer_names') or []
             status_raw = (eff.get('status_effect') or '').lower()
             yield_mult = float(eff.get('yield_multiplier') or 1.0)
             status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
@@ -8141,11 +8703,13 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
             lines.append("")
             lines.append("<i>Эффекты</i>:")
             lines.append(f"• Поливов: {wc}")
-            if fert_active:
-                if fert_name:
-                    lines.append(f"• Удобрение: активно ({html.escape(str(fert_name))})")
+            if fert_active and fert_names:
+                if len(fert_names) == 1:
+                    lines.append(f"• Удобрение: {html.escape(fert_names[0])}")
                 else:
-                    lines.append("• Удобрение: активно")
+                    lines.append(f"• Удобрений активно: {len(fert_names)}")
+                    for fname in fert_names:
+                        lines.append(f"  - {html.escape(fname)}")
             else:
                 lines.append("• Удобрение: нет")
             lines.append(f"• Негативный статус: {status_h}")
@@ -8913,7 +9477,9 @@ async def show_selyuk_type_farmer(update: Update, context: ContextTypes.DEFAULT_
             f"Баланс селюка: {bal} 💎\n"
             f"Статус: {status}\n\n"
             "Фермер автоматически поливает обычные плантации энергетиков, "
-            "если включены напоминания о поливе и на его балансе есть ≥ 50 септимов."
+            "если включены напоминания о поливе.\n"
+            f"Стоимость полива: {'45' if lvl >= 2 else '50'} септимов.\n"
+            f"{'✅ Автосбор урожая доступен!' if lvl >= 2 else '❌ Автосбор урожая доступен с 2 уровня.'}"
         )
         keyboard = [
             [InlineKeyboardButton("👨‍🌾 Управление фермером", callback_data='selyuk_farmer_manage')],
@@ -9119,20 +9685,83 @@ async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAU
     await query.answer()
 
     user = query.from_user
-    text = (
-        "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
-        "Система прокачки уровней селюка будет добавлена позже."
-    )
+    farmer = db.get_selyuk_by_type(user.id, 'farmer')
+    if not farmer:
+        await show_selyuk_farmer_manage(update, context)
+        return
 
-    keyboard = [
-        [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
-    ]
+    lvl = int(getattr(farmer, 'level', 1) or 1)
+    
+    if lvl >= 3:
+        text = (
+            "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
+            "Ваш селюк уже достиг максимального 3 уровня!\n\n"
+            "✅ Стоимость полива снижена до 45 септимов.\n"
+            "✅ Автоматический сбор урожая включен.\n"
+            "✅ Автоматическая посадка семян включена."
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')]]
+    elif lvl == 2:
+        text = (
+            "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
+            "Текущий уровень: 2\n"
+            "Следующий уровень: 3\n\n"
+            "<b>Бонусы 3 уровня:</b>\n"
+            "🌱 <b>Автопосадка:</b> селюк сам посадит семена, если грядка пуста!\n"
+            "(Берет первые попавшиеся семена из инвентаря)\n\n"
+            "<b>Стоимость улучшения:</b>\n"
+            "💰 150 000 септимов\n"
+            "🧩 15 Фрагментов Селюка"
+        )
+        keyboard = [
+            [InlineKeyboardButton("💰 Улучшить (150к + 15 фрагм.)", callback_data='selyuk_farmer_upgrade_action')],
+            [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
+        ]
+    else:
+        text = (
+            "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
+            "Текущий уровень: 1\n"
+            "Следующий уровень: 2\n\n"
+            "<b>Бонусы 2 уровня:</b>\n"
+            "📉 Снижение стоимости полива: 50 -> 45 септимов\n"
+            "🚜 <b>Автосбор урожая:</b> селюк сам соберет созревшие энергетики!\n\n"
+            "<b>Стоимость улучшения:</b> 200 000 септимов"
+        )
+        keyboard = [
+            [InlineKeyboardButton("💰 Улучшить за 200 000", callback_data='selyuk_farmer_upgrade_action')],
+            [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
+        ]
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest:
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+async def handle_selyuk_farmer_upgrade_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    res = db.upgrade_selyuk_farmer(user.id)
+    
+    if not res.get('ok'):
+        reason = res.get('reason')
+        if reason == 'not_enough_coins':
+            await query.answer("Недостаточно монет для улучшения!", show_alert=True)
+        elif reason == 'not_enough_fragments':
+            await query.answer("Недостаточно Фрагментов Селюка!", show_alert=True)
+        elif reason == 'max_level':
+            await query.answer("Селюк уже максимального уровня!", show_alert=True)
+        else:
+            await query.answer("Ошибка при улучшении.", show_alert=True)
+        await show_selyuk_farmer_upgrade(update, context)
+        return
+        
+    new_lvl = res.get('new_level', 2)
+    await query.answer(f"Селюк успешно улучшен до {new_lvl} уровня!", show_alert=True)
+    await show_selyuk_farmer_upgrade(update, context)
 
 
 async def show_selyuk_farmer_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9405,7 +10034,10 @@ async def show_market_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for off in offers[start:end]:
         rarity = str(off.rarity)
         price = int(SHOP_PRICES.get(rarity, 0))
-        kb.append([InlineKeyboardButton(f"Купить {off.offer_index} ({price}🪙)", callback_data=f"shop_buy_{off.offer_index}_p{page}")])
+        if rarity == 'Majestic':
+             kb.append([InlineKeyboardButton(f"🚫 {off.offer_index} (Majestic)", callback_data='noop')])
+        else:
+             kb.append([InlineKeyboardButton(f"Купить {off.offer_index} ({price}🪙)", callback_data=f"shop_buy_{off.offer_index}_p{page}")])
     # Навигация
     kb.append([InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')])
     kb.append([InlineKeyboardButton("🔙 В меню", callback_data='menu')])
@@ -9431,6 +10063,13 @@ async def handle_shop_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, of
     user = query.from_user
     lock = _get_lock(f"user:{user.id}:shop_buy")
     async with lock:
+        # Проверка на Majestic перед покупкой
+        offers, _ = db.get_or_refresh_shop_offers()
+        target_offer = next((o for o in offers if o.offer_index == offer_index), None)
+        if target_offer and str(target_offer.rarity) == 'Majestic':
+             await query.answer("Покупка Majestic запрещена в этом магазине!", show_alert=True)
+             return
+
         res = db.purchase_shop_offer(user.id, int(offer_index))
         if not res.get('ok'):
             reason = res.get('reason')
@@ -12698,6 +13337,49 @@ async def toggle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("Изменено" , show_alert=True)
     await show_settings(update, context)
 
+    await show_settings(update, context)
+
+async def restore_plantation_reminders(application):
+    """Восстанавливает напоминания о поливе после рестарта."""
+    try:
+        active_beds = db.get_all_active_beds_for_reminders()
+        count = 0
+        now_ts = int(time.time())
+        
+        for bed in active_beds:
+            user_id = bed['user_id']
+            bed_index = bed['bed_index']
+            next_water_ts = bed['next_water_ts']
+            
+            # Вычисляем задержку
+            delay = next_water_ts - now_ts
+            # Если время уже прошло, ставим небольшую задержку, чтобы сработало сразу
+            if delay < 0:
+                delay = 1
+            
+            try:
+                # Удаляем старые на всякий случай
+                jobs = application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user_id}_{bed_index}")
+                for j in jobs:
+                    j.schedule_removal()
+                
+                application.job_queue.run_once(
+                    plantation_water_reminder_job,
+                    when=delay,
+                    chat_id=user_id,
+                    data={'bed_index': bed_index},
+                    name=f"plantation_water_reminder_{user_id}_{bed_index}",
+                )
+                count += 1
+            except Exception as e:
+                logger.warning(f"[PLANTATION] Failed to restore reminder for user {user_id} bed {bed_index}: {e}")
+                
+        if count > 0:
+            logger.info(f"[PLANTATION] Restored {count} watering reminders")
+            
+    except Exception as e:
+        logger.error(f"[PLANTATION] Error restoring reminders: {e}")
+
 async def toggle_plantation_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -12705,6 +13387,48 @@ async def toggle_plantation_reminder(update: Update, context: ContextTypes.DEFAU
     player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
     new_state = not getattr(player, 'remind_plantation', False)
     db.update_player(player.user_id, remind_plantation=new_state)
+    
+    # Smart Toggle Logic
+    user_id = player.user_id
+    if new_state:
+        # Включили: нужно найти все растущие грядки и запланировать напоминания
+        try:
+            # Получаем активные грядки и фильтруем по текущему пользователю
+            active_beds = db.get_all_active_beds_for_reminders()
+            my_beds = [b for b in active_beds if b['user_id'] == user_id]
+            
+            now_ts = int(time.time())
+            for bed in my_beds:
+                bed_index = bed['bed_index']
+                next_water_ts = bed['next_water_ts']
+                delay = max(1, next_water_ts - now_ts)
+                
+                context.application.job_queue.run_once(
+                    plantation_water_reminder_job,
+                    when=delay,
+                    chat_id=user_id,
+                    data={'bed_index': bed_index},
+                    name=f"plantation_water_reminder_{user_id}_{bed_index}",
+                )
+            logger.info(f"[PLANTATION] Enabled reminders for user {user_id}, scheduled {len(my_beds)} jobs")
+            
+        except Exception as e:
+            logger.error(f"[PLANTATION] Error scheduling reminders on toggle: {e}")
+            
+    else:
+        # Выключили: найти и удалить все задачи напоминаний для этого юзера
+        try:
+            # Мы не знаем индексы грядок наверняка без запроса, но можем попробовать удалить по маске имени?
+            # job_queue не поддерживает удаление по маске.
+            # Придется перебрать возможные индексы (например 1..10)
+            for i in range(1, 20):
+                jobs = context.application.job_queue.get_jobs_by_name(f"plantation_water_reminder_{user_id}_{i}")
+                for j in jobs:
+                    j.schedule_removal()
+            logger.info(f"[PLANTATION] Disabled reminders for user {user_id}, cancelled jobs")
+        except Exception as e:
+            logger.error(f"[PLANTATION] Error cancelling reminders on toggle: {e}")
+
     await query.answer("Изменено" , show_alert=True)
     await show_settings(update, context)
 
@@ -12753,6 +13477,11 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
     else:
         # Выключаем
+        
+        # Если был включен тихий режим, отправим сводку перед выключением
+        if getattr(player, 'auto_search_silent', False):
+            await _send_auto_search_summary(user_id, player, context, reason='disabled')
+
         db.update_player(user_id, auto_search_enabled=False)
         try:
             jobs = context.application.job_queue.get_jobs_by_name(f"auto_search_{user_id}")
@@ -12760,10 +13489,8 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 j.schedule_removal()
         except Exception:
             pass
-        try:
-            await context.bot.send_message(chat_id=user_id, text=t(lang, 'auto_disabled'))
-        except Exception:
-            pass
+        await query.answer(t(lang, 'auto_disabled'), show_alert=True)
+    
     await show_settings(update, context)
 
 
@@ -14208,6 +14935,12 @@ def main():
     )
     application.add_handler(fertilizer_custom_buy_handler)
     
+    application.add_handler(CallbackQueryHandler(toggle_plantation_reminder, pattern='^toggle_plantation_rem$'))
+    application.add_handler(CallbackQueryHandler(snooze_reminder_handler, pattern='^snooze_remind_'))
+    application.add_handler(CallbackQueryHandler(toggle_auto_search_silent, pattern='^toggle_silent_mode$'))
+    
+    application.add_handler(CallbackQueryHandler(handle_selyuk_farmer_upgrade_action, pattern='^selyuk_farmer_upgrade_action$'))
+    application.add_handler(CallbackQueryHandler(admin_player_selyuki_show, pattern='^admin_player_selyuki:'))
     application.add_handler(CallbackQueryHandler(button_handler))
     # ВАЖНО: перехватываем ответы на ForceReply с причиной отклонения до общего текстового обработчика
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply, block=True), group=0)
@@ -14402,6 +15135,11 @@ def main():
         silk_monitor_delay = 45  # начинаем через 45 секунд после старта
         application.job_queue.run_repeating(silk_harvest_reminder_job, interval=silk_monitor_interval, first=silk_monitor_delay)
 
+        # Мониторинг автосбора урожая фермерами (каждые 10 минут)
+        farmer_harvest_interval = 10 * 60  # 10 минут
+        farmer_harvest_delay = 60  # начинаем через 1 минуту после старта
+        application.job_queue.run_repeating(global_farmer_harvest_job, interval=farmer_harvest_interval, first=farmer_harvest_delay)
+
         # --- Восстановление задач автопоиска VIP после рестарта ---
         try:
             players = db.get_players_with_auto_search_enabled()
@@ -14461,6 +15199,12 @@ def main():
             await restore_scheduled_auto_deletes(context.application)
         
         application.job_queue.run_once(restore_auto_delete_on_startup, when=3)
+
+        # --- Восстановление напоминаний о поливе ---
+        async def restore_plantation_reminders_on_startup(context: ContextTypes.DEFAULT_TYPE):
+            await restore_plantation_reminders(context.application)
+            
+        application.job_queue.run_once(restore_plantation_reminders_on_startup, when=5)
 
     print("Бот запущен...")
     application.run_polling()

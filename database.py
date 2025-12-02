@@ -39,10 +39,14 @@ class Player(Base):
     # --- Автопоиск буст ---
     auto_search_boost_count = Column(Integer, default=0)  # дополнительные поиски за день
     auto_search_boost_until = Column(Integer, default=0)  # время истечения буста
+    # --- Тихий режим автопоиска ---
+    auto_search_silent = Column(Boolean, default=False)
+    auto_search_session_stats = Column(String, default='{}')  # JSON со статистикой текущей сессии
     # --- Статистика казино ---
     casino_wins = Column(Integer, default=0)  # количество побед в казино
     casino_losses = Column(Integer, default=0)  # количество поражений в казино
     casino_achievements = Column(String, default='')  # разблокированные достижения (через запятую)
+    selyuk_fragments = Column(Integer, default=0)  # Фрагменты Селюка
     inventory = relationship("InventoryItem", back_populates="owner", cascade="all, delete-orphan")
 
 
@@ -577,6 +581,20 @@ def create_db_and_tables():
     Base.metadata.create_all(bind=engine)
     print("База данных и таблицы успешно созданы.")
 
+def _ensure_player_has_autosearch_columns():
+    """Гарантирует наличие колонок для тихого автопоиска в таблице players."""
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("PRAGMA table_info(players)")).fetchall()
+            cols = [row[1] for row in res]
+            if 'auto_search_silent' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN auto_search_silent BOOLEAN DEFAULT 0"))
+            if 'auto_search_session_stats' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN auto_search_session_stats VARCHAR DEFAULT '{}'"))
+            conn.commit()
+    except Exception as e:
+        print(f"Error checking/adding auto_search columns: {e}")
+
 def _ensure_promos_has_rarity_column():
     """Гарантирует наличие колонки rarity в таблице promos (SQLite)."""
     try:
@@ -587,6 +605,17 @@ def _ensure_promos_has_rarity_column():
                 conn.execute(text("ALTER TABLE promos ADD COLUMN rarity VARCHAR"))
     except Exception:
         pass
+
+def _ensure_player_has_selyuk_fragments_column():
+    """Гарантирует наличие колонки selyuk_fragments в таблице players."""
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("PRAGMA table_info(players)")).fetchall()
+            cols = [row[1] for row in res]
+            if 'selyuk_fragments' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN selyuk_fragments INTEGER DEFAULT 0"))
+    except Exception as e:
+        print(f"Error checking/adding selyuk_fragments column: {e}")
 
 def get_or_create_player(user_id, username):
     """Возвращает игрока по ID. Если его нет, создает нового."""
@@ -756,7 +785,10 @@ def get_promo_usage_total() -> int:
 def redeem_promo(user_id: int, code: str) -> dict:
     db = SessionLocal()
     try:
+        create_db_and_tables()
         _ensure_promos_has_rarity_column()
+        _ensure_player_has_autosearch_columns()
+        _ensure_player_has_casino_stats()
         code_s = (code or '').strip()
         if not code_s:
             return {"ok": False, "reason": "not_found_or_inactive"}
@@ -798,6 +830,9 @@ def redeem_promo(user_id: int, code: str) -> dict:
 
         kind = str(row.kind or '').strip().lower()
         value = int(row.value or 0)
+        
+
+
         result: dict = {"ok": True, "kind": kind, "value": value}
 
         if kind == 'coins':
@@ -875,6 +910,49 @@ def redeem_promo(user_id: int, code: str) -> dict:
         except Exception:
             pass
         return {"ok": False, "reason": "exception"}
+    finally:
+        db.close()
+
+def get_all_active_beds_for_reminders() -> list[dict]:
+    """
+    Возвращает список всех грядок, которые растут, для восстановления напоминаний.
+    Возвращает: [{user_id, bed_index, next_water_ts, water_interval_sec}, ...]
+    """
+    db = SessionLocal()
+    try:
+        # Получаем грядки:
+        # 1. Статус growing
+        # 2. Есть seed_type (чтобы знать интервал полива)
+        # 3. Владелец включил напоминания (remind_plantation = True)
+        
+        results = (
+            db.query(PlantationBed, SeedType.water_interval_sec, Player.user_id)
+            .join(SeedType, PlantationBed.seed_type_id == SeedType.id)
+            .join(Player, PlantationBed.owner_id == Player.user_id)
+            .filter(PlantationBed.state == 'growing')
+            .filter(Player.remind_plantation == True)
+            .all()
+        )
+        
+        out = []
+        for bed, interval, uid in results:
+            # Вычисляем время следующего полива
+            last_watered = bed.last_watered_at or bed.planted_at
+            next_water_ts = last_watered + interval
+            
+            # Если уже пора поливать или время прошло - всё равно добавляем, 
+            # job_queue запустит сразу (when=0 или отрицательное)
+            
+            out.append({
+                'user_id': uid,
+                'bed_index': bed.bed_index,
+                'next_water_ts': next_water_ts,
+                'water_interval_sec': interval
+            })
+        return out
+    except Exception as e:
+        print(f"Error getting active beds for reminders: {e}")
+        return []
     finally:
         db.close()
 
@@ -975,7 +1053,7 @@ def get_or_refresh_shop_offers() -> tuple[list[ShopOffer], int]:
         if need_refresh:
             # полная регенерация
             dbs.query(ShopOffer).delete(synchronize_session=False)
-            drinks = dbs.query(EnergyDrink).all() or []
+            drinks = dbs.query(EnergyDrink).filter(EnergyDrink.is_special == False).all() or []
             if not drinks:
                 dbs.commit()
                 return ([], 0)
@@ -1793,7 +1871,7 @@ def ensure_player_beds(user_id: int, total_beds: int = 1) -> list[PlantationBed]
 def get_player_beds(user_id: int) -> list[PlantationBed]:
     dbs = SessionLocal()
     try:
-        return list(
+        beds = list(
             dbs.query(PlantationBed)
             .options(
                 joinedload(PlantationBed.seed_type), 
@@ -1804,6 +1882,20 @@ def get_player_beds(user_id: int) -> list[PlantationBed]:
             .order_by(PlantationBed.bed_index.asc())
             .all()
         )
+        
+        # Обновляем состояние грядок (ленивая проверка)
+        updated = False
+        for bed in beds:
+            if _update_bed_ready_if_due(dbs, bed):
+                updated = True
+        
+        if updated:
+            dbs.commit()
+            # Refresh beds to ensure we return updated state
+            for bed in beds:
+                dbs.refresh(bed)
+                
+        return beds
     finally:
         dbs.close()
 
@@ -2053,7 +2145,7 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
         bed = (
             dbs.query(PlantationBed)
             .options(
-                joinedload(PlantationBed.seed_type),
+                joinedload(PlantationBed.seed_type).joinedload(SeedType.drink),
                 joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
             )
             .filter(PlantationBed.owner_id == user_id, PlantationBed.bed_index == bed_index)
@@ -2229,15 +2321,24 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
                     dbs.delete(bf)
         except Exception:
             pass
+        # Получаем название напитка для уведомлений
+        drink_name = "Неизвестный"
+        if st.drink and st.drink.name:
+            drink_name = st.drink.name
+
         dbs.commit()
         return {
             "ok": True,
             "yield": amount,
             "drink_id": st.drink_id,
+            "drink_name": drink_name,
             "items_added": items_added,
             "rarity_counts": rarity_counts,
             "effects": {
-                "fertilizers": fertilizer_names,
+                "fertilizers": fertilizer_names,  # Keep for backward compatibility if needed
+                "fertilizer_names": fertilizer_names,
+                "fertilizer_active": fert_applied,
+                "yield_multiplier": yield_multiplier,  # Note: variable name in code is yield_mult
                 "status_effect": se,
                 "water_count": wc,
             },
@@ -2386,55 +2487,280 @@ def try_farmer_autowater(user_id: int, bed_index: int) -> dict:
             .first()
         )
         if not selyuk:
-            return {"ok": False, "reason": "no_farmer"}
+            return {"ok": False, "reason": "no_selyuk"}
+
         if not bool(getattr(selyuk, 'is_enabled', False)):
-            return {"ok": False, "reason": "disabled"}
+            return {"ok": False, "reason": "selyuk_disabled"}
+
+        # Определяем стоимость полива в зависимости от уровня
+        level = int(getattr(selyuk, 'level', 1) or 1)
+        cost = 45 if level >= 2 else 50
 
         balance = int(getattr(selyuk, 'balance_septims', 0) or 0)
-        if balance < 50:
-            return {"ok": False, "reason": "no_funds", "need": 50, "have": balance}
+        if balance < cost:
+            return {"ok": False, "reason": "not_enough_balance"}
 
         bed = (
             dbs.query(PlantationBed)
-            .options(joinedload(PlantationBed.seed_type))
             .filter(PlantationBed.owner_id == int(user_id), PlantationBed.bed_index == int(bed_index))
             .with_for_update(read=False)
             .first()
         )
         if not bed:
-            return {"ok": False, "reason": "no_such_bed"}
-        if bed.state != 'growing' or not bed.seed_type:
-            _update_bed_ready_if_due(dbs, bed)
-            return {"ok": False, "reason": "not_growing", "bed_state": bed.state}
+            return {"ok": False, "reason": "no_bed"}
+        
+        # Проверяем, нужно ли поливать
+        seed_type = bed.seed_type
+        if not seed_type:
+             return {"ok": False, "reason": "no_seed"}
 
+        # Логика проверки времени полива (аналогично water_bed, но упрощенно)
+        # Если state != growing -> не поливаем
+        if str(getattr(bed, 'state', '')) != 'growing':
+             return {"ok": False, "reason": "not_growing"}
+             
         now_ts = int(time.time())
-        last = int(bed.last_watered_at or 0)
-        interval = int(bed.seed_type.water_interval_sec or 0)
-        if last and interval and (now_ts - last) < interval:
-            return {
-                "ok": False,
-                "reason": "too_early_to_water",
-                "next_water_in": interval - (now_ts - last),
-                "bed_state": bed.state,
-            }
+        water_interval = int(seed_type.water_interval_sec or 0)
+        last_water = int(bed.last_watered_at or 0)
+        planted_at = int(bed.planted_at or 0)
+        
+        # Если ни разу не поливали (last_water == 0), разрешаем полив сразу
+        if last_water > 0:
+             reference_time = last_water
+             if now_ts - reference_time < water_interval:
+                  return {"ok": False, "reason": "too_early"}
+        # else: last_water == 0 -> allow immediate water
 
         bed.last_watered_at = now_ts
         bed.water_count = int(bed.water_count or 0) + 1
         _update_bed_ready_if_due(dbs, bed)
 
-        selyuk.balance_septims = balance - 50
+        selyuk.balance_septims = balance - cost
         try:
             selyuk.updated_at = now_ts
         except Exception:
             pass
 
         dbs.commit()
-        return {"ok": True, "bed_state": bed.state, "water_interval_sec": interval}
+        return {"ok": True, "bed_state": bed.state, "water_interval_sec": water_interval, "cost": cost}
     except Exception:
         try:
             dbs.rollback()
         except Exception:
             pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+def upgrade_selyuk_farmer(user_id: int) -> dict:
+    """Повышает уровень Селюка Фермера до 2 за 200 000 монет."""
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+
+        selyuk = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == 'farmer')
+            .with_for_update(read=False)
+            .first()
+        )
+        if not selyuk:
+            return {"ok": False, "reason": "no_selyuk"}
+        
+        current_level = int(getattr(selyuk, 'level', 1) or 1)
+        
+        if current_level == 1:
+            # Upgrade to Level 2
+            cost = 200000
+            if int(player.coins or 0) < cost:
+                return {"ok": False, "reason": "not_enough_coins", "need": cost, "have": int(player.coins or 0)}
+                
+            player.coins = int(player.coins or 0) - cost
+            selyuk.level = 2
+            new_lvl = 2
+        elif current_level == 2:
+            # Upgrade to Level 3
+            cost_coins = 150000
+            cost_fragments = 15
+            
+            if int(player.coins or 0) < cost_coins:
+                return {"ok": False, "reason": "not_enough_coins", "need": cost_coins, "have": int(player.coins or 0)}
+            
+            fragments = int(getattr(player, 'selyuk_fragments', 0) or 0)
+            if fragments < cost_fragments:
+                return {"ok": False, "reason": "not_enough_fragments", "need": cost_fragments, "have": fragments}
+                
+            player.coins = int(player.coins or 0) - cost_coins
+            player.selyuk_fragments = fragments - cost_fragments
+            selyuk.level = 3
+            new_lvl = 3
+        else:
+            return {"ok": False, "reason": "max_level"}
+
+        try:
+            selyuk.updated_at = int(time.time())
+        except Exception:
+            pass
+            
+        dbs.commit()
+        return {"ok": True, "new_level": new_lvl, "coins_left": int(player.coins)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+def try_farmer_auto_harvest(user_id: int) -> dict:
+    """
+    Автоматический сбор урожая для Селюка Фермера 2 уровня.
+    Проверяет все грядки, если готовы - собирает.
+    Возвращает список собранных предметов.
+    """
+    dbs = SessionLocal()
+    try:
+        # 1. Проверяем селюка
+        selyuk = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == 'farmer')
+            .first()
+        )
+        if not selyuk:
+            return {"ok": False, "reason": "no_selyuk"}
+            
+        level = int(getattr(selyuk, 'level', 1) or 1)
+        if level < 2:
+            return {"ok": False, "reason": "low_level"}
+            
+        if not bool(getattr(selyuk, 'is_enabled', False)):
+            return {"ok": False, "reason": "disabled"}
+    finally:
+        dbs.close()
+        
+    # Вызываем сбор для каждой готовой грядки отдельными транзакциями
+    harvested_items = []
+    
+    # Helper для проверки готовности без транзакции (или с короткой)
+    ready_indices = []
+    dbs2 = SessionLocal()
+    try:
+        beds = dbs2.query(PlantationBed).filter(PlantationBed.owner_id == int(user_id)).all()
+        for bed in beds:
+            # Обновляем статус если пришло время
+            _update_bed_ready_if_due(dbs2, bed)
+            if str(getattr(bed, 'state', '')) == 'ready':
+                ready_indices.append(int(bed.bed_index))
+    finally:
+        dbs2.close()
+        
+    if not ready_indices:
+        return {"ok": True, "harvested": []}
+        
+    for idx in ready_indices:
+        res = harvest_bed(user_id, idx)
+        if res.get('ok'):
+            harvested_items.append({
+                'bed_index': idx,
+                'drink_id': res.get('drink_id'),
+                'drink_name': res.get('drink_name'),
+                'yield': res.get('yield'),
+                'items_added': res.get('items_added')
+            })
+            
+    return {"ok": True, "harvested": harvested_items}
+
+
+def try_farmer_auto_plant(user_id: int) -> dict:
+    """
+    Автоматическая посадка семян для Селюка Фермера 3 уровня.
+    Ищет пустые грядки и сажает первые попавшиеся семена из инвентаря.
+    """
+    dbs = SessionLocal()
+    try:
+        # 1. Проверяем селюка
+        selyuk = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == 'farmer')
+            .first()
+        )
+        if not selyuk:
+            return {"ok": False, "reason": "no_selyuk"}
+            
+        level = int(getattr(selyuk, 'level', 1) or 1)
+        if level < 3:
+            return {"ok": False, "reason": "low_level"}
+            
+        if not bool(getattr(selyuk, 'is_enabled', False)):
+            return {"ok": False, "reason": "disabled"}
+            
+        # 2. Ищем пустые грядки
+        empty_beds = (
+            dbs.query(PlantationBed)
+            .filter(PlantationBed.owner_id == int(user_id), PlantationBed.state == 'empty')
+            .all()
+        )
+        
+        if not empty_beds:
+            return {"ok": True, "planted": [], "reason": "no_empty_beds"}
+            
+        planted_items = []
+        
+        # 3. Ищем семена в инвентаре (SeedInventory)
+        inventory_items = (
+            dbs.query(SeedInventory)
+            .filter(SeedInventory.player_id == int(user_id), SeedInventory.quantity > 0)
+            .order_by(SeedInventory.quantity.desc())
+            .all()
+        )
+        
+        if not inventory_items:
+             return {"ok": True, "planted": [], "reason": "no_seeds"}
+             
+        # Преобразуем в список для удобства работы
+        current_seed_idx = 0
+        
+        for bed in empty_beds:
+            if current_seed_idx >= len(inventory_items):
+                break # Кончились типы семян
+                
+            seed_item = inventory_items[current_seed_idx]
+            
+            # Списываем семя
+            seed_item.quantity -= 1
+            if seed_item.quantity <= 0:
+                # Если 0, можно удалить или оставить 0. Обычно удаляем или оставляем.
+                # В SeedInventory часто оставляют 0 или удаляют. Проверим логику бота.
+                # Для надежности просто уменьшаем. Если станет 0, потом почистится или будет игнорироваться.
+                pass
+                
+            if seed_item.quantity == 0:
+                 current_seed_idx += 1
+            
+            # Обновляем грядку
+            bed.state = 'growing'
+            bed.seed_type_id = seed_item.seed_type_id
+            bed.planted_at = int(time.time())
+            bed.last_watered_at = 0
+            bed.water_count = 0
+            
+            planted_items.append({
+                'bed_index': bed.bed_index,
+                'seed_name': seed_item.seed_type.name if seed_item.seed_type else 'Unknown'
+            })
+            
+        dbs.commit()
+        return {"ok": True, "planted": planted_items}
+        
+    except Exception as e:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        print(f"Error in try_farmer_auto_plant: {e}")
         return {"ok": False, "reason": "exception"}
     finally:
         dbs.close()
@@ -5107,6 +5433,30 @@ def count_all_drinks() -> int:
         db.close()
 
 
+def get_total_collection_points() -> int:
+    """
+    Возвращает общее количество очков коллекции (100% прогресса).
+    Логика:
+      - Special напитки: 1 очко (считаются как 1 уникальный предмет)
+      - Остальные (Basic, Medium, Elite, Absolute, Majestic): 5 очков (по 1 за каждую редкость)
+    """
+    db = SessionLocal()
+    try:
+        # Получаем все напитки
+        drinks = db.query(EnergyDrink).all()
+        total_points = 0
+        for drink in drinks:
+            if drink.is_special:
+                total_points += 1
+            else:
+                total_points += 5
+        return total_points
+    except Exception:
+        return 0
+    finally:
+        db.close()
+
+
 def get_total_drinks_count() -> int:
     """Возвращает общее количество напитков в базе."""
     return count_all_drinks()
@@ -6030,5 +6380,45 @@ def admin_delete_drink(drink_id: int) -> bool:
         print(f"[DB] Error deleting drink: {e}")
         db.rollback()
         return False
+    finally:
+        db.close()
+
+
+def get_users_with_level2_farmers() -> list[int]:
+    """Возвращает список ID пользователей, у которых есть Селюк Фермер 2 уровня (или выше) и он включен."""
+    dbs = SessionLocal()
+    try:
+        # Ищем селюков типа 'farmer', уровень >= 2, is_enabled = True
+        # Возвращаем список owner_id
+        rows = (
+            dbs.query(Selyuk.owner_id)
+            .filter(Selyuk.type == 'farmer')
+            .filter(Selyuk.level >= 2)
+            .filter(Selyuk.is_enabled == True)
+            .all()
+        )
+        return [r[0] for r in rows]
+    except Exception as e:
+        print(f"[DB] Error getting users with level 2 farmers: {e}")
+        return []
+    finally:
+        dbs.close()
+
+
+def increment_selyuk_fragments(user_id: int, amount: int = 1) -> int:
+    """Начисляет фрагменты Селюка пользователю. Возвращает новое количество."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        if player:
+            current = int(getattr(player, 'selyuk_fragments', 0) or 0)
+            player.selyuk_fragments = current + amount
+            db.commit()
+            db.refresh(player)
+            return player.selyuk_fragments
+        return 0
+    except Exception:
+        db.rollback()
+        return 0
     finally:
         db.close()

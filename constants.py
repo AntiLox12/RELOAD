@@ -31,7 +31,7 @@ ITEMS_PER_PAGE = 10               # кол-во предметов на стра
 # --- Рулетка ежедневного бонуса ---
 DAILY_BONUS_REWARDS = {
     'coins': {
-        'weight': 60,
+        'weight': 75,
         'amount': 400,
     },
     'absolute_drink': {
@@ -41,10 +41,14 @@ DAILY_BONUS_REWARDS = {
         'weight': 10,
     },
     'vip_plus_7d': {
-        'weight': 9,
+        'weight': 0.1,
     },
     'vip_plus_30d': {
-        'weight': 1,
+        'weight': 0.01,
+    },
+    'selyuk_fragment': {
+        'weight': 5,
+        'amount': 1,
     },
 }
 
@@ -98,6 +102,34 @@ CASINO_GAMES = {
         'multiplier': 1.95,  # x1.95 при выигрыше
         'emoji': '📊',
     },
+    'basketball': {
+        'name': '🏀 Баскетбол',
+        'description': 'Забросьте мяч в корзину!',
+        'win_prob': 0.4,
+        'multiplier': 2.5,
+        'emoji': '🏀',
+    },
+    'football': {
+        'name': '⚽ Футбол',
+        'description': 'Забейте гол!',
+        'win_prob': 0.6,
+        'multiplier': 1.6,
+        'emoji': '⚽',
+    },
+    'bowling': {
+        'name': '🎳 Боулинг',
+        'description': 'Сбейте все кегли!',
+        'win_prob': 0.166,
+        'multiplier': 6.0,
+        'emoji': '🎳',
+    },
+    'darts': {
+        'name': '🎯 Дартс',
+        'description': 'Попадите в яблочко!',
+        'win_prob': 0.166,
+        'multiplier': 6.0,
+        'emoji': '🎯',
+    },
 }
 
 # Эмодзи для слотов
@@ -144,9 +176,9 @@ VIP_DURATIONS_SEC = {
 # --- VIP+ настройки ---
 VIP_PLUS_EMOJI = '💎'
 VIP_PLUS_COSTS = {
-    '1d': 2250,   # 1500 * 1.5
-    '7d': 13500,  # 9000 * 1.5
-    '30d': 45000, # 30000 * 1.5
+    '1d': 7500,
+    '7d': 45000,
+    '30d': 150000,
 }
 VIP_PLUS_DURATIONS_SEC = {
     '1d': 24 * 60 * 60,
