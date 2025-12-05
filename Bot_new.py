@@ -22,6 +22,7 @@ from telegram.ext import (
 )
 import database as db
 from database import SessionLocal, Player
+from sqlalchemy import func
 from collections import defaultdict
 import config
 from typing import Dict
@@ -84,6 +85,18 @@ from constants import (
     RECEIVER_COMMISSION,
     SHOP_PRICES,
     SILK_EMOJIS,
+    BLACKJACK_SUITS,
+    BLACKJACK_RANKS,
+    BLACKJACK_VALUES,
+    BLACKJACK_MULTIPLIER,
+    BLACKJACK_BJ_MULTIPLIER,
+    MINES_GRID_SIZE,
+    MINES_MIN_COUNT,
+    MINES_MAX_COUNT,
+    MINES_DEFAULT_COUNT,
+    CRASH_UPDATE_INTERVAL,
+    CRASH_GROWTH_RATE,
+    CRASH_MAX_MULTIPLIER,
 )
 import silk_ui
 # --- Настройки ---
@@ -169,6 +182,18 @@ def _get_lock(key: str) -> asyncio.Lock:
 # --- Магазин: кэш предложений на пользователя ---
 # SHOP_OFFERS[user_id] = { 'offers': [ {idx, drink_id, drink_name, rarity} ], 'ts': int }
 SHOP_OFFERS: Dict[int, dict] = {}
+
+# --- Блэкджек: активные игры ---
+# BLACKJACK_GAMES[user_id] = { 'bet': int, 'player_hand': list, 'dealer_hand': list, 'deck': list, 'status': str }
+BLACKJACK_GAMES: Dict[int, dict] = {}
+
+# --- Мины: активные игры ---
+# MINES_GAMES[user_id] = { 'bet': int, 'mines_count': int, 'grid': list, 'revealed': set, 'status': str, 'multiplier': float }
+MINES_GAMES: Dict[int, dict] = {}
+
+# --- Краш: активные игры ---
+# CRASH_GAMES[user_id] = { 'bet': int, 'multiplier': float, 'crash_point': float, 'status': str, 'task': asyncio.Task }
+CRASH_GAMES: Dict[int, dict] = {}
 
 TEXTS = {
     'menu_title': {
@@ -1674,28 +1699,51 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 async def handle_player_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
     """Обрабатывает поиск игрока."""
-    player = None
+    player_id = None
+    text_input = text_input.strip()
     
-    if text_input.startswith('@'):
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
-    else:
+    # Убираем @ если есть
+    search_query = text_input.lstrip('@')
+    
+    # Сначала пробуем как ID (число)
+    try:
+        user_id = int(search_query)
+        dbs = SessionLocal()
         try:
-            user_id = int(text_input)
-            dbs = SessionLocal()
-            try:
-                player = dbs.query(Player).filter(Player.user_id == user_id).first()
-            finally:
-                dbs.close()
-        except ValueError:
-            pass
+            player = dbs.query(Player).filter(Player.user_id == user_id).first()
+            if player:
+                player_id = player.user_id
+        finally:
+            dbs.close()
+    except ValueError:
+        # Не число - ищем по username
+        pass
     
-    if player:
-        await show_player_details(update, context, player.user_id)
+    # Если не нашли по ID, ищем по username
+    if not player_id:
+        player = db.get_player_by_username(search_query)
+        if player:
+            player_id = player.user_id
+    
+    # Если всё ещё не нашли, пробуем частичный поиск по username
+    if not player_id:
+        dbs = SessionLocal()
+        try:
+            # Поиск по частичному совпадению (без учёта регистра)
+            player = dbs.query(Player).filter(
+                func.lower(Player.username).contains(search_query.lower())
+            ).first()
+            if player:
+                player_id = player.user_id
+        finally:
+            dbs.close()
+    
+    if player_id:
+        await show_player_details(update, context, player_id)
     else:
         keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        response = f"❌ Игрок не найден!\n\nИспользуйте:\n• <code>@username</code>\n• <code>user_id</code>"
+        response = f"❌ Игрок не найден!\n\nВы искали: <code>{text_input}</code>\n\nИспользуйте:\n• <code>@username</code> или просто <code>username</code>\n• <code>user_id</code> (число)"
         await update.message.reply_html(response, reply_markup=reply_markup)
 
 
@@ -6476,6 +6524,9 @@ async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
          InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
         [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
+        [InlineKeyboardButton("🃏 Блэкджек", callback_data='casino_game_blackjack')],
+        [InlineKeyboardButton("💣 Мины", callback_data='casino_game_mines'),
+         InlineKeyboardButton("📈 Краш", callback_data='casino_game_crash')],
         [InlineKeyboardButton("🏀 Баскетбол", callback_data='casino_game_basketball'),
          InlineKeyboardButton("⚽ Футбол", callback_data='casino_game_football')],
         [InlineKeyboardButton("🎳 Боулинг", callback_data='casino_game_bowling'),
@@ -7133,6 +7184,1166 @@ async def show_game_result(query, user, game_info, bet_amount, win, winnings,
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
     except BadRequest:
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+# === БЛЭКДЖЕК ===
+
+def create_blackjack_deck():
+    """Создаёт и перемешивает колоду для блэкджека."""
+    deck = [(rank, suit) for suit in BLACKJACK_SUITS for rank in BLACKJACK_RANKS]
+    random.shuffle(deck)
+    return deck
+
+
+def calculate_hand_value(hand):
+    """Подсчитывает очки руки с учётом туза (1 или 11)."""
+    value = 0
+    aces = 0
+    for rank, suit in hand:
+        value += BLACKJACK_VALUES[rank]
+        if rank == 'A':
+            aces += 1
+    # Если перебор и есть тузы, считаем их как 1
+    while value > 21 and aces > 0:
+        value -= 10
+        aces -= 1
+    return value
+
+
+def format_card(card):
+    """Форматирует карту для отображения."""
+    rank, suit = card
+    return f"{rank}{suit}"
+
+
+def format_hand(hand, hide_second=False):
+    """Форматирует руку для отображения."""
+    if hide_second and len(hand) >= 2:
+        return f"{format_card(hand[0])} 🂠"
+    return " ".join(format_card(card) for card in hand)
+
+
+async def show_blackjack_bet_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран выбора ставки для блэкджека."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        "<b>🃏 Блэкджек (21)</b>\n\n"
+        "📋 <b>Правила:</b>\n"
+        "• Набери 21 или ближе к 21, чем дилер\n"
+        "• Не перебери (больше 21 = проигрыш)\n"
+        "• Туз = 1 или 11, картинки = 10\n"
+        "• Блэкджек (21 на первых 2 картах) = x2.5\n"
+        "• Обычный выигрыш = x2\n\n"
+        f"💵 Ваш баланс: <b>{coins}</b> септимов\n\n"
+        "Выберите ставку:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("💵 100", callback_data='blackjack_bet_100'),
+         InlineKeyboardButton("💵 500", callback_data='blackjack_bet_500')],
+        [InlineKeyboardButton("💵 1,000", callback_data='blackjack_bet_1000'),
+         InlineKeyboardButton("💵 5,000", callback_data='blackjack_bet_5000')],
+        [InlineKeyboardButton("💵 10,000", callback_data='blackjack_bet_10000'),
+         InlineKeyboardButton("💵 25,000", callback_data='blackjack_bet_25000')],
+        [InlineKeyboardButton("🔙 Назад в казино", callback_data='city_casino')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def start_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_amount: int):
+    """Начинает игру в блэкджек: раздаёт карты."""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Проверка лимитов
+    if bet_amount < CASINO_MIN_BET or bet_amount > CASINO_MAX_BET:
+        await query.answer(f"Ставка должна быть от {CASINO_MIN_BET} до {CASINO_MAX_BET}", show_alert=True)
+        return
+    
+    lock = _get_lock(f"user:{user.id}:blackjack")
+    if lock.locked():
+        await query.answer("Игра уже обрабатывается...", show_alert=True)
+        return
+    
+    async with lock:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        coins = int(getattr(player, 'coins', 0) or 0)
+        
+        if coins < bet_amount:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
+        
+        # Списываем ставку
+        db.increment_coins(user.id, -bet_amount)
+        
+        # Создаём игру
+        deck = create_blackjack_deck()
+        player_hand = [deck.pop(), deck.pop()]
+        dealer_hand = [deck.pop(), deck.pop()]
+        
+        BLACKJACK_GAMES[user.id] = {
+            'bet': bet_amount,
+            'player_hand': player_hand,
+            'dealer_hand': dealer_hand,
+            'deck': deck,
+            'status': 'playing'
+        }
+        
+        player_value = calculate_hand_value(player_hand)
+        
+        # Проверяем блэкджек у игрока
+        if player_value == 21:
+            # Блэкджек! Сразу проверяем дилера
+            dealer_value = calculate_hand_value(dealer_hand)
+            if dealer_value == 21:
+                # Оба блэкджека - ничья
+                await finish_blackjack_game(update, context, user.id, 'push')
+            else:
+                # Игрок выиграл блэкджеком
+                await finish_blackjack_game(update, context, user.id, 'blackjack')
+            return
+        
+        # Показываем игровой экран
+        await show_blackjack_game_screen(update, context, user.id)
+
+
+async def show_blackjack_game_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Показывает текущее состояние игры."""
+    query = update.callback_query
+    
+    game = BLACKJACK_GAMES.get(user_id)
+    if not game:
+        await query.answer("Игра не найдена", show_alert=True)
+        return
+    
+    player_hand = game['player_hand']
+    dealer_hand = game['dealer_hand']
+    bet = game['bet']
+    
+    player_value = calculate_hand_value(player_hand)
+    
+    text = (
+        "<b>🃏 Блэкджек</b>\n\n"
+        f"💰 Ставка: <b>{bet}</b> септимов\n\n"
+        f"🎩 Дилер: {format_hand(dealer_hand, hide_second=True)}\n"
+        f"   Очки: <b>?</b>\n\n"
+        f"👤 Вы: {format_hand(player_hand)}\n"
+        f"   Очки: <b>{player_value}</b>\n\n"
+    )
+    
+    if player_value == 21:
+        text += "🎯 <b>21! Отличная рука!</b>"
+    elif player_value > 21:
+        text += "💥 <b>Перебор!</b>"
+    
+    # Кнопки действий
+    keyboard = []
+    if player_value < 21:
+        row = [
+            InlineKeyboardButton("🃏 Ещё", callback_data='blackjack_hit'),
+            InlineKeyboardButton("✋ Хватит", callback_data='blackjack_stand')
+        ]
+        # Удвоение только на первых двух картах
+        if len(player_hand) == 2:
+            row.append(InlineKeyboardButton("💰 x2", callback_data='blackjack_double'))
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton("🔙 Сдаться", callback_data='blackjack_surrender')])
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def handle_blackjack_hit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок берёт ещё одну карту."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = BLACKJACK_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    # Берём карту
+    game['player_hand'].append(game['deck'].pop())
+    player_value = calculate_hand_value(game['player_hand'])
+    
+    if player_value > 21:
+        # Перебор - проигрыш
+        await finish_blackjack_game(update, context, user.id, 'bust')
+    elif player_value == 21:
+        # Ровно 21 - автоматически останавливаемся
+        await handle_blackjack_stand(update, context)
+    else:
+        # Продолжаем игру
+        await show_blackjack_game_screen(update, context, user.id)
+
+
+async def handle_blackjack_stand(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок останавливается, ход дилера."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = BLACKJACK_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    # Дилер добирает карты до 17
+    dealer_hand = game['dealer_hand']
+    deck = game['deck']
+    
+    while calculate_hand_value(dealer_hand) < 17:
+        dealer_hand.append(deck.pop())
+    
+    player_value = calculate_hand_value(game['player_hand'])
+    dealer_value = calculate_hand_value(dealer_hand)
+    
+    # Определяем результат
+    if dealer_value > 21:
+        result = 'dealer_bust'
+    elif player_value > dealer_value:
+        result = 'win'
+    elif player_value < dealer_value:
+        result = 'lose'
+    else:
+        result = 'push'
+    
+    await finish_blackjack_game(update, context, user.id, result)
+
+
+async def handle_blackjack_double(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок удваивает ставку и берёт одну карту."""
+    query = update.callback_query
+    user = query.from_user
+    
+    game = BLACKJACK_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    # Проверяем, что можно удвоить (только на первых двух картах)
+    if len(game['player_hand']) != 2:
+        await query.answer("Удвоение возможно только на первых двух картах", show_alert=True)
+        return
+    
+    # Проверяем баланс для удвоения
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    bet = game['bet']
+    
+    if coins < bet:
+        await query.answer("Недостаточно септимов для удвоения", show_alert=True)
+        return
+    
+    await query.answer()
+    
+    # Списываем дополнительную ставку
+    db.increment_coins(user.id, -bet)
+    game['bet'] = bet * 2
+    
+    # Берём ровно одну карту
+    game['player_hand'].append(game['deck'].pop())
+    player_value = calculate_hand_value(game['player_hand'])
+    
+    if player_value > 21:
+        # Перебор
+        await finish_blackjack_game(update, context, user.id, 'bust')
+    else:
+        # Автоматически останавливаемся после удвоения
+        await handle_blackjack_stand(update, context)
+
+
+async def handle_blackjack_surrender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок сдаётся и теряет половину ставки."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = BLACKJACK_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    await finish_blackjack_game(update, context, user.id, 'surrender')
+
+
+async def finish_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, result: str):
+    """Завершает игру и показывает результат."""
+    query = update.callback_query
+    user = query.from_user
+    
+    game = BLACKJACK_GAMES.get(user_id)
+    if not game:
+        return
+    
+    game['status'] = 'finished'
+    bet = game['bet']
+    player_hand = game['player_hand']
+    dealer_hand = game['dealer_hand']
+    
+    player_value = calculate_hand_value(player_hand)
+    dealer_value = calculate_hand_value(dealer_hand)
+    
+    winnings = 0
+    win = False
+    
+    # Определяем выплату
+    if result == 'blackjack':
+        winnings = int(bet * BLACKJACK_BJ_MULTIPLIER)
+        result_emoji = "🎰"
+        result_text = "БЛЭКДЖЕК!"
+        win = True
+    elif result == 'win' or result == 'dealer_bust':
+        winnings = int(bet * BLACKJACK_MULTIPLIER)
+        result_emoji = "🎉"
+        result_text = "ПОБЕДА!" if result == 'win' else "Дилер перебрал!"
+        win = True
+    elif result == 'push':
+        winnings = bet  # Возврат ставки
+        result_emoji = "🤝"
+        result_text = "Ничья"
+    elif result == 'surrender':
+        winnings = bet // 2  # Возврат половины ставки
+        result_emoji = "🏳️"
+        result_text = "Сдались"
+    elif result == 'bust':
+        result_emoji = "💥"
+        result_text = "Перебор!"
+    else:  # lose
+        result_emoji = "😢"
+        result_text = "Проигрыш"
+    
+    # Начисляем выигрыш
+    if winnings > 0:
+        db.increment_coins(user_id, winnings)
+    
+    # Обновляем статистику
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    if win:
+        current_wins = int(getattr(player, 'casino_wins', 0) or 0)
+        db.update_player_stats(user_id, casino_wins=current_wins + 1)
+    elif result not in ['push', 'surrender']:
+        current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+        db.update_player_stats(user_id, casino_losses=current_losses + 1)
+    
+    # Логируем
+    db.log_action(
+        user_id=user_id,
+        username=user.username or user.first_name,
+        action_type='casino',
+        action_details=f'blackjack: ставка {bet}, результат {result}, выплата {winnings}',
+        amount=winnings - bet if result != 'push' else 0,
+        success=win
+    )
+    
+    # Проверяем достижения
+    achievement_bonus = check_casino_achievements(user_id, player)
+    
+    # Формируем итоговое сообщение
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    new_balance = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        f"<b>🃏 Блэкджек — {result_emoji} {result_text}</b>\n\n"
+        f"🎩 Дилер: {format_hand(dealer_hand)}\n"
+        f"   Очки: <b>{dealer_value}</b>\n\n"
+        f"👤 Вы: {format_hand(player_hand)}\n"
+        f"   Очки: <b>{player_value}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+    )
+    
+    if win:
+        profit = winnings - bet
+        text += f"💰 Выигрыш: <b>+{profit}</b> септимов\n"
+    elif result == 'push':
+        text += f"↩️ Возврат ставки: <b>{winnings}</b> септимов\n"
+    elif result == 'surrender':
+        text += f"↩️ Возврат половины: <b>{winnings}</b> септимов\n"
+    else:
+        text += f"💸 Потеряно: <b>{bet}</b> септимов\n"
+    
+    text += f"💵 Баланс: <b>{new_balance}</b> септимов"
+    
+    if achievement_bonus:
+        ach = achievement_bonus['achievement']
+        text += f"\n\n🏆 <b>Достижение!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']}"
+    
+    # Очищаем игру
+    del BLACKJACK_GAMES[user_id]
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Играть ещё", callback_data='casino_game_blackjack')],
+        [InlineKeyboardButton("🎮 Другая игра", callback_data='city_casino')],
+        [InlineKeyboardButton("🔙 Выход", callback_data='city_hightown')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception:
+            pass
+
+
+# === МИНЫ (MINES) ===
+
+def create_mines_grid(mines_count: int):
+    """Создаёт поле для игры в мины."""
+    total_cells = MINES_GRID_SIZE * MINES_GRID_SIZE
+    grid = [False] * total_cells  # False = безопасно, True = мина
+    
+    # Расставляем мины случайным образом
+    mine_positions = random.sample(range(total_cells), mines_count)
+    for pos in mine_positions:
+        grid[pos] = True
+    
+    return grid
+
+
+def calculate_mines_multiplier(mines_count: int, revealed_count: int) -> float:
+    """Вычисляет множитель для игры в мины."""
+    total = MINES_GRID_SIZE * MINES_GRID_SIZE
+    safe_cells = total - mines_count
+    
+    if revealed_count == 0:
+        return 1.0
+    
+    # Формула: вероятность открыть N безопасных ячеек
+    multiplier = 1.0
+    for i in range(revealed_count):
+        prob = (safe_cells - i) / (total - i)
+        if prob <= 0:
+            break
+        multiplier /= prob
+    
+    # Учитываем комиссию казино (3%)
+    multiplier *= 0.97
+    
+    return round(multiplier, 2)
+
+
+async def show_mines_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран настройки игры в мины - выбор кол-ва мин."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        "<b>💣 Мины</b>\n\n"
+        "📋 <b>Правила:</b>\n"
+        "• Поле 5×5 (25 ячеек)\n"
+        "• Чем больше мин — тем выше множитель\n"
+        "• Открывайте ячейки и избегайте мин\n"
+        "• Можно забрать выигрыш в любой момент\n"
+        "• Попали на мину = потеряли ставку\n\n"
+        f"💵 Баланс: <b>{coins}</b> септимов\n\n"
+        "Выберите количество мин:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("💣 3 мины", callback_data='mines_count_3'),
+         InlineKeyboardButton("💣 5 мин", callback_data='mines_count_5')],
+        [InlineKeyboardButton("💣 10 мин", callback_data='mines_count_10'),
+         InlineKeyboardButton("💣 15 мин", callback_data='mines_count_15')],
+        [InlineKeyboardButton("💣 20 мин", callback_data='mines_count_20'),
+         InlineKeyboardButton("💣 24 мины", callback_data='mines_count_24')],
+        [InlineKeyboardButton("🔙 Назад в казино", callback_data='city_casino')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_mines_bet_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, mines_count: int):
+    """Экран выбора ставки для игры в мины."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    # Показываем потенциальные множители
+    m1 = calculate_mines_multiplier(mines_count, 1)
+    m3 = calculate_mines_multiplier(mines_count, 3)
+    m5 = calculate_mines_multiplier(mines_count, 5)
+    
+    text = (
+        f"<b>💣 Мины — {mines_count} мин</b>\n\n"
+        f"📊 <b>Множители:</b>\n"
+        f"• 1 ячейка: x{m1}\n"
+        f"• 3 ячейки: x{m3}\n"
+        f"• 5 ячеек: x{m5}\n\n"
+        f"💵 Баланс: <b>{coins}</b> септимов\n\n"
+        "Выберите ставку:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("💵 100", callback_data=f'mines_bet_{mines_count}_100'),
+         InlineKeyboardButton("💵 500", callback_data=f'mines_bet_{mines_count}_500')],
+        [InlineKeyboardButton("💵 1,000", callback_data=f'mines_bet_{mines_count}_1000'),
+         InlineKeyboardButton("💵 5,000", callback_data=f'mines_bet_{mines_count}_5000')],
+        [InlineKeyboardButton("💵 10,000", callback_data=f'mines_bet_{mines_count}_10000'),
+         InlineKeyboardButton("💵 25,000", callback_data=f'mines_bet_{mines_count}_25000')],
+        [InlineKeyboardButton("🔙 Изменить мины", callback_data='casino_game_mines')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def start_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, mines_count: int, bet_amount: int):
+    """Начинает игру в мины."""
+    query = update.callback_query
+    user = query.from_user
+    
+    if bet_amount < CASINO_MIN_BET or bet_amount > CASINO_MAX_BET:
+        await query.answer(f"Ставка должна быть от {CASINO_MIN_BET} до {CASINO_MAX_BET}", show_alert=True)
+        return
+    
+    lock = _get_lock(f"user:{user.id}:mines")
+    if lock.locked():
+        await query.answer("Игра уже обрабатывается...", show_alert=True)
+        return
+    
+    async with lock:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        coins = int(getattr(player, 'coins', 0) or 0)
+        
+        if coins < bet_amount:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
+        
+        # Списываем ставку
+        db.increment_coins(user.id, -bet_amount)
+        
+        # Создаём игру
+        grid = create_mines_grid(mines_count)
+        
+        MINES_GAMES[user.id] = {
+            'bet': bet_amount,
+            'mines_count': mines_count,
+            'grid': grid,
+            'revealed': set(),
+            'status': 'playing',
+            'multiplier': 1.0
+        }
+        
+        await show_mines_game_screen(update, context, user.id)
+
+
+async def show_mines_game_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Показывает игровое поле мин."""
+    query = update.callback_query
+    
+    game = MINES_GAMES.get(user_id)
+    if not game:
+        await query.answer("Игра не найдена", show_alert=True)
+        return
+    
+    bet = game['bet']
+    mines_count = game['mines_count']
+    revealed = game['revealed']
+    multiplier = game['multiplier']
+    potential_win = int(bet * multiplier)
+    
+    text = (
+        f"<b>💣 Мины — {mines_count} мин</b>\n\n"
+        f"💰 Ставка: <b>{bet}</b>\n"
+        f"📈 Множитель: <b>x{multiplier}</b>\n"
+        f"💵 Выигрыш: <b>{potential_win}</b>\n"
+        f"✅ Открыто: <b>{len(revealed)}</b> ячеек\n"
+    )
+    
+    # Строим клавиатуру-поле
+    keyboard = []
+    for row in range(MINES_GRID_SIZE):
+        row_buttons = []
+        for col in range(MINES_GRID_SIZE):
+            cell_idx = row * MINES_GRID_SIZE + col
+            if cell_idx in revealed:
+                # Открытая безопасная ячейка
+                row_buttons.append(InlineKeyboardButton("💎", callback_data=f'mines_noop'))
+            else:
+                # Закрытая ячейка
+                row_buttons.append(InlineKeyboardButton("⬜", callback_data=f'mines_click_{cell_idx}'))
+        keyboard.append(row_buttons)
+    
+    # Кнопка забрать выигрыш
+    if len(revealed) > 0:
+        keyboard.append([InlineKeyboardButton(f"💰 Забрать {potential_win}", callback_data='mines_cashout')])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Сдаться", callback_data='mines_forfeit')])
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def handle_mines_click(update: Update, context: ContextTypes.DEFAULT_TYPE, cell_idx: int):
+    """Обработка клика по ячейке."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = MINES_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    if cell_idx in game['revealed']:
+        return
+    
+    # Проверяем, мина ли это
+    if game['grid'][cell_idx]:
+        # Попали на мину!
+        await finish_mines_game(update, context, user.id, 'exploded', cell_idx)
+    else:
+        # Безопасная ячейка
+        game['revealed'].add(cell_idx)
+        game['multiplier'] = calculate_mines_multiplier(game['mines_count'], len(game['revealed']))
+        
+        # Проверяем, все ли безопасные ячейки открыты
+        total = MINES_GRID_SIZE * MINES_GRID_SIZE
+        safe_cells = total - game['mines_count']
+        if len(game['revealed']) >= safe_cells:
+            # Все открыты - автоматический выигрыш
+            await finish_mines_game(update, context, user.id, 'win')
+        else:
+            await show_mines_game_screen(update, context, user.id)
+
+
+async def handle_mines_cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок забирает выигрыш."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = MINES_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    if len(game['revealed']) == 0:
+        await query.answer("Откройте хотя бы одну ячейку!", show_alert=True)
+        return
+    
+    await finish_mines_game(update, context, user.id, 'cashout')
+
+
+async def handle_mines_forfeit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок сдаётся."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = MINES_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    await finish_mines_game(update, context, user.id, 'forfeit')
+
+
+async def finish_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, result: str, exploded_cell: int = -1):
+    """Завершает игру в мины."""
+    query = update.callback_query
+    user = query.from_user
+    
+    game = MINES_GAMES.get(user_id)
+    if not game:
+        return
+    
+    game['status'] = 'finished'
+    bet = game['bet']
+    multiplier = game['multiplier']
+    grid = game['grid']
+    revealed = game['revealed']
+    mines_count = game['mines_count']
+    
+    winnings = 0
+    win = False
+    
+    if result == 'cashout' or result == 'win':
+        winnings = int(bet * multiplier)
+        result_emoji = "💰"
+        result_text = "ВЫИГРЫШ!" if result == 'win' else "Забрали выигрыш!"
+        win = True
+    elif result == 'exploded':
+        result_emoji = "💥"
+        result_text = "ВЗРЫВ!"
+    else:  # forfeit
+        result_emoji = "🏳️"
+        result_text = "Сдались"
+    
+    # Начисляем выигрыш
+    if winnings > 0:
+        db.increment_coins(user_id, winnings)
+    
+    # Обновляем статистику
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    if win:
+        current_wins = int(getattr(player, 'casino_wins', 0) or 0)
+        db.update_player_stats(user_id, casino_wins=current_wins + 1)
+    elif result == 'exploded':
+        current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+        db.update_player_stats(user_id, casino_losses=current_losses + 1)
+    
+    # Логируем
+    db.log_action(
+        user_id=user_id,
+        username=user.username or user.first_name,
+        action_type='casino',
+        action_details=f'mines: ставка {bet}, мин {mines_count}, результат {result}, множитель x{multiplier}',
+        amount=winnings - bet if win else -bet,
+        success=win
+    )
+    
+    # Показываем поле с минами
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    new_balance = int(getattr(player, 'coins', 0) or 0)
+    
+    # Формируем визуализацию поля
+    field_lines = []
+    for row in range(MINES_GRID_SIZE):
+        row_symbols = []
+        for col in range(MINES_GRID_SIZE):
+            cell_idx = row * MINES_GRID_SIZE + col
+            if grid[cell_idx]:  # Мина
+                if cell_idx == exploded_cell:
+                    row_symbols.append("💥")
+                else:
+                    row_symbols.append("💣")
+            elif cell_idx in revealed:
+                row_symbols.append("💎")
+            else:
+                row_symbols.append("⬜")
+        field_lines.append(" ".join(row_symbols))
+    field_text = "\n".join(field_lines)
+    
+    text = (
+        f"<b>💣 Мины — {result_emoji} {result_text}</b>\n\n"
+        f"<code>{field_text}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+    )
+    
+    if win:
+        profit = winnings - bet
+        text += f"💰 Выигрыш: <b>+{profit}</b> (x{multiplier})\n"
+    else:
+        text += f"💸 Потеряно: <b>{bet}</b> септимов\n"
+    
+    text += f"💵 Баланс: <b>{new_balance}</b> септимов"
+    
+    # Очищаем игру
+    del MINES_GAMES[user_id]
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Играть ещё", callback_data='casino_game_mines')],
+        [InlineKeyboardButton("🎮 Другая игра", callback_data='city_casino')],
+        [InlineKeyboardButton("🔙 Выход", callback_data='city_hightown')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception:
+            pass
+
+
+# === КРАШ (CRASH) ===
+
+def generate_crash_point() -> float:
+    """Генерирует случайную точку краша."""
+    # Используем экспоненциальное распределение для реалистичного краша
+    # Большинство крашей происходит рано, но иногда бывают высокие множители
+    import math
+    e = 2.71828
+    house_edge = 0.04  # 4% преимущество казино
+    
+    # Генерируем случайное число
+    r = random.random()
+    if r < house_edge:
+        return 1.0  # Мгновенный краш
+    
+    # Формула: crash_point = 0.99 / (1 - r)
+    crash = 0.99 / (1 - r)
+    return min(round(crash, 2), CRASH_MAX_MULTIPLIER)
+
+
+async def show_crash_bet_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран выбора ставки для игры Краш."""
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        "<b>📈 Краш</b>\n\n"
+        "📋 <b>Правила:</b>\n"
+        "• Множитель растёт от 1.00x\n"
+        "• Нажмите 'Забрать' чтобы зафиксировать выигрыш\n"
+        "• Если произойдёт КРАШ — вы потеряете ставку\n"
+        "• Чем дольше ждёте — тем выше риск!\n\n"
+        f"💵 Баланс: <b>{coins}</b> септимов\n\n"
+        "Выберите ставку:"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("💵 100", callback_data='crash_bet_100'),
+         InlineKeyboardButton("💵 500", callback_data='crash_bet_500')],
+        [InlineKeyboardButton("💵 1,000", callback_data='crash_bet_1000'),
+         InlineKeyboardButton("💵 5,000", callback_data='crash_bet_5000')],
+        [InlineKeyboardButton("💵 10,000", callback_data='crash_bet_10000'),
+         InlineKeyboardButton("💵 25,000", callback_data='crash_bet_25000')],
+        [InlineKeyboardButton("🔙 Назад в казино", callback_data='city_casino')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def start_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_amount: int):
+    """Начинает игру Краш."""
+    query = update.callback_query
+    user = query.from_user
+    
+    if bet_amount < CASINO_MIN_BET or bet_amount > CASINO_MAX_BET:
+        await query.answer(f"Ставка должна быть от {CASINO_MIN_BET} до {CASINO_MAX_BET}", show_alert=True)
+        return
+    
+    # Проверяем, нет ли уже активной игры
+    if user.id in CRASH_GAMES:
+        game = CRASH_GAMES[user.id]
+        if game.get('status') == 'playing':
+            await query.answer("У вас уже есть активная игра!", show_alert=True)
+            return
+    
+    lock = _get_lock(f"user:{user.id}:crash")
+    if lock.locked():
+        await query.answer("Игра уже обрабатывается...", show_alert=True)
+        return
+    
+    async with lock:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        coins = int(getattr(player, 'coins', 0) or 0)
+        
+        if coins < bet_amount:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
+        
+        # Списываем ставку
+        db.increment_coins(user.id, -bet_amount)
+        
+        # Генерируем точку краша
+        crash_point = generate_crash_point()
+        
+        CRASH_GAMES[user.id] = {
+            'bet': bet_amount,
+            'multiplier': 1.0,
+            'crash_point': crash_point,
+            'status': 'playing',
+            'message_id': None,
+            'chat_id': query.message.chat_id,
+            'task': None
+        }
+        
+        # Показываем начальный экран
+        await show_crash_game_screen(update, context, user.id)
+        
+        # Запускаем асинхронную анимацию
+        task = asyncio.create_task(crash_animation_loop(context, user.id, user.username or user.first_name))
+        CRASH_GAMES[user.id]['task'] = task
+
+
+async def show_crash_game_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Показывает экран игры Краш."""
+    query = update.callback_query
+    
+    game = CRASH_GAMES.get(user_id)
+    if not game:
+        return
+    
+    bet = game['bet']
+    multiplier = game['multiplier']
+    potential_win = int(bet * multiplier)
+    
+    # Визуальная шкала множителя
+    bar_length = min(int(multiplier * 2), 20)
+    bar = "🟢" * bar_length + "⬜" * (20 - bar_length)
+    
+    text = (
+        f"<b>📈 КРАШ</b>\n\n"
+        f"<code>{bar}</code>\n\n"
+        f"📊 Множитель: <b>x{multiplier:.2f}</b>\n"
+        f"💰 Ставка: <b>{bet}</b>\n"
+        f"💵 Выигрыш: <b>{potential_win}</b>\n\n"
+        "⚡ <i>Нажмите 'Забрать' пока не поздно!</i>"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton(f"💰 ЗАБРАТЬ {potential_win}", callback_data='crash_cashout')],
+    ]
+    
+    try:
+        msg = await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        game['message_id'] = msg.message_id
+    except BadRequest:
+        pass
+
+
+async def crash_animation_loop(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str):
+    """Асинхронный цикл анимации краша - НЕ блокирует бота."""
+    try:
+        while True:
+            await asyncio.sleep(CRASH_UPDATE_INTERVAL)
+            
+            game = CRASH_GAMES.get(user_id)
+            if not game or game['status'] != 'playing':
+                break
+            
+            # Увеличиваем множитель
+            game['multiplier'] = round(game['multiplier'] + CRASH_GROWTH_RATE + (game['multiplier'] * 0.05), 2)
+            
+            # Проверяем краш
+            if game['multiplier'] >= game['crash_point']:
+                game['status'] = 'crashed'
+                await finish_crash_game_internal(context, user_id, username, 'crashed')
+                break
+            
+            # Обновляем экран
+            bet = game['bet']
+            multiplier = game['multiplier']
+            potential_win = int(bet * multiplier)
+            
+            bar_length = min(int(multiplier * 2), 20)
+            bar = "🟢" * bar_length + "⬜" * (20 - bar_length)
+            
+            text = (
+                f"<b>📈 КРАШ</b>\n\n"
+                f"<code>{bar}</code>\n\n"
+                f"📊 Множитель: <b>x{multiplier:.2f}</b>\n"
+                f"💰 Ставка: <b>{bet}</b>\n"
+                f"💵 Выигрыш: <b>{potential_win}</b>\n\n"
+                "⚡ <i>Нажмите 'Забрать' пока не поздно!</i>"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton(f"💰 ЗАБРАТЬ {potential_win}", callback_data='crash_cashout')],
+            ]
+            
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=game['chat_id'],
+                    message_id=game['message_id'],
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
+                
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Crash animation error: {e}")
+
+
+async def handle_crash_cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Игрок забирает выигрыш."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    game = CRASH_GAMES.get(user.id)
+    if not game or game['status'] != 'playing':
+        await query.answer("Игра не найдена или завершена", show_alert=True)
+        return
+    
+    game['status'] = 'cashed_out'
+    
+    # Отменяем задачу анимации
+    if game.get('task'):
+        game['task'].cancel()
+    
+    await finish_crash_game(update, context, user.id, 'cashout')
+
+
+async def finish_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, result: str):
+    """Завершает игру Краш (вызывается при cashout)."""
+    query = update.callback_query
+    user = query.from_user
+    
+    game = CRASH_GAMES.get(user_id)
+    if not game:
+        return
+    
+    bet = game['bet']
+    multiplier = game['multiplier']
+    crash_point = game['crash_point']
+    
+    winnings = 0
+    win = False
+    
+    if result == 'cashout':
+        winnings = int(bet * multiplier)
+        result_emoji = "💰"
+        result_text = f"ЗАБРАЛИ на x{multiplier:.2f}!"
+        win = True
+    else:
+        result_emoji = "💥"
+        result_text = f"КРАШ на x{crash_point:.2f}!"
+    
+    # Начисляем выигрыш
+    if winnings > 0:
+        db.increment_coins(user_id, winnings)
+    
+    # Обновляем статистику
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    if win:
+        current_wins = int(getattr(player, 'casino_wins', 0) or 0)
+        db.update_player_stats(user_id, casino_wins=current_wins + 1)
+    else:
+        current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+        db.update_player_stats(user_id, casino_losses=current_losses + 1)
+    
+    # Логируем
+    db.log_action(
+        user_id=user_id,
+        username=user.username or user.first_name,
+        action_type='casino',
+        action_details=f'crash: ставка {bet}, результат {result}, множитель x{multiplier:.2f}, crash_point x{crash_point:.2f}',
+        amount=winnings - bet if win else -bet,
+        success=win
+    )
+    
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    new_balance = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        f"<b>📈 Краш — {result_emoji} {result_text}</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+    )
+    
+    if win:
+        profit = winnings - bet
+        text += f"💰 Выигрыш: <b>+{profit}</b> (x{multiplier:.2f})\n"
+    else:
+        text += f"💸 Потеряно: <b>{bet}</b> септимов\n"
+        text += f"📊 Краш был на: <b>x{crash_point:.2f}</b>\n"
+    
+    text += f"💵 Баланс: <b>{new_balance}</b> септимов"
+    
+    # Очищаем игру
+    del CRASH_GAMES[user_id]
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Играть ещё", callback_data='casino_game_crash')],
+        [InlineKeyboardButton("🎮 Другая игра", callback_data='city_casino')],
+        [InlineKeyboardButton("🔙 Выход", callback_data='city_hightown')],
+    ]
+    
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def finish_crash_game_internal(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, result: str):
+    """Завершает игру Краш (вызывается из анимации при краше)."""
+    game = CRASH_GAMES.get(user_id)
+    if not game:
+        return
+    
+    bet = game['bet']
+    multiplier = game['multiplier']
+    crash_point = game['crash_point']
+    chat_id = game['chat_id']
+    message_id = game['message_id']
+    
+    # Обновляем статистику
+    player = db.get_or_create_player(user_id, username)
+    current_losses = int(getattr(player, 'casino_losses', 0) or 0)
+    db.update_player_stats(user_id, casino_losses=current_losses + 1)
+    
+    # Логируем
+    db.log_action(
+        user_id=user_id,
+        username=username,
+        action_type='casino',
+        action_details=f'crash: ставка {bet}, КРАШ, crash_point x{crash_point:.2f}',
+        amount=-bet,
+        success=False
+    )
+    
+    player = db.get_or_create_player(user_id, username)
+    new_balance = int(getattr(player, 'coins', 0) or 0)
+    
+    text = (
+        f"<b>📈 Краш — 💥 КРАШ на x{crash_point:.2f}!</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💸 Потеряно: <b>{bet}</b> септимов\n"
+        f"💵 Баланс: <b>{new_balance}</b> септимов"
+    )
+    
+    # Очищаем игру
+    del CRASH_GAMES[user_id]
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Играть ещё", callback_data='casino_game_crash')],
+        [InlineKeyboardButton("🎮 Другая игра", callback_data='city_casino')],
+        [InlineKeyboardButton("🔙 Выход", callback_data='city_hightown')],
+    ]
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
 
 
 async def show_casino_achievements_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11386,7 +12597,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # casino_game_{game_type}
         try:
             game_type = data.replace('casino_game_', '')
-            await show_casino_game(update, context, game_type)
+            # Специальные игры обрабатываются отдельно
+            if game_type == 'blackjack':
+                await show_blackjack_bet_screen(update, context)
+            elif game_type == 'mines':
+                await show_mines_settings(update, context)
+            elif game_type == 'crash':
+                await show_crash_bet_screen(update, context)
+            else:
+                await show_casino_game(update, context, game_type)
         except Exception as e:
             logger.error(f"Error in casino_game: {e}")
             await update.callback_query.answer('Ошибка', show_alert=True)
@@ -11436,6 +12655,70 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error in casino_play: {e}")
             await update.callback_query.answer('Ошибка', show_alert=True)
+    # --- Блэкджек ---
+    elif data == 'casino_game_blackjack':
+        await show_blackjack_bet_screen(update, context)
+    elif data.startswith('blackjack_bet_'):
+        # blackjack_bet_{amount}
+        try:
+            amount = int(data.replace('blackjack_bet_', ''))
+            await start_blackjack_game(update, context, amount)
+        except Exception as e:
+            logger.error(f"Error in blackjack_bet: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data == 'blackjack_hit':
+        await handle_blackjack_hit(update, context)
+    elif data == 'blackjack_stand':
+        await handle_blackjack_stand(update, context)
+    elif data == 'blackjack_double':
+        await handle_blackjack_double(update, context)
+    elif data == 'blackjack_surrender':
+        await handle_blackjack_surrender(update, context)
+    # --- Мины ---
+    elif data == 'casino_game_mines':
+        await show_mines_settings(update, context)
+    elif data.startswith('mines_count_'):
+        try:
+            mines_count = int(data.replace('mines_count_', ''))
+            await show_mines_bet_screen(update, context, mines_count)
+        except Exception as e:
+            logger.error(f"Error in mines_count: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('mines_bet_'):
+        # mines_bet_{mines_count}_{amount}
+        try:
+            parts = data.replace('mines_bet_', '').split('_')
+            mines_count = int(parts[0])
+            amount = int(parts[1])
+            await start_mines_game(update, context, mines_count, amount)
+        except Exception as e:
+            logger.error(f"Error in mines_bet: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('mines_click_'):
+        try:
+            cell_idx = int(data.replace('mines_click_', ''))
+            await handle_mines_click(update, context, cell_idx)
+        except Exception as e:
+            logger.error(f"Error in mines_click: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data == 'mines_cashout':
+        await handle_mines_cashout(update, context)
+    elif data == 'mines_forfeit':
+        await handle_mines_forfeit(update, context)
+    elif data == 'mines_noop':
+        await update.callback_query.answer()
+    # --- Краш ---
+    elif data == 'casino_game_crash':
+        await show_crash_bet_screen(update, context)
+    elif data.startswith('crash_bet_'):
+        try:
+            amount = int(data.replace('crash_bet_', ''))
+            await start_crash_game(update, context, amount)
+        except Exception as e:
+            logger.error(f"Error in crash_bet: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data == 'crash_cashout':
+        await handle_crash_cashout(update, context)
     elif data.startswith('plantation_buy_'):
         # plantation_buy_{seed_id}_{qty}
         try:
