@@ -24,8 +24,9 @@ COLOR_EMOJIS = {
     'Absolute': '🟣',
     'Majestic': '🟠',
     'Special': '⭐',
+    'Plant': '🌿',
 }
-RARITY_ORDER = ['Special', 'Majestic', 'Absolute', 'Elite', 'Medium', 'Basic']
+RARITY_ORDER = ['Plant', 'Special', 'Majestic', 'Absolute', 'Elite', 'Medium', 'Basic']
 ITEMS_PER_PAGE = 10               # кол-во предметов на страницу инвентаря
 
 # --- Рулетка ежедневного бонуса ---
@@ -229,6 +230,7 @@ RECEIVER_PRICES = {
     'Absolute': 120,
     'Majestic': 750,
     'Special': 300,
+    'Plant': 400,
 }
 
 # --- Магазин (покупка энергетиков) ---

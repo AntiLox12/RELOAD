@@ -2217,75 +2217,90 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
         rarity_counts = {}
         if amount > 0 and st.drink_id:
             try:
-                # Базовые веса редкостей
-                rarity_weights = {k: float(v) for k, v in RARITIES.items()}
-                # Смещения весов от удобрений и полива - улучшенные эффекты
-                if fert_applied and fert_effect_types:
-                    # Применяем эффекты от каждого активного удобрения
-                    for fert_effect_type in fert_effect_types:
-                        # Различные эффекты в зависимости от типа удобрения
-                        if fert_effect_type in ('quality', 'complex', 'growth_quality'):
-                            # Усиливаем высокие редкости, снижаем Basic
-                            if 'Basic' in rarity_weights:
-                                rarity_weights['Basic'] *= 0.5  # Сильнее снижаем Basic
-                            if 'Medium' in rarity_weights:
-                                rarity_weights['Medium'] *= 2.5  # Усиливаем Medium
-                            if 'Elite' in rarity_weights:
-                                rarity_weights['Elite'] *= 4.0  # Значительно усиливаем Elite
-                            if 'Absolute' in rarity_weights:
-                                rarity_weights['Absolute'] *= 6.0  # Сильно усиливаем Absolute
-                            if 'Majestic' in rarity_weights:
-                                rarity_weights['Majestic'] *= 8.0  # Максимально усиливаем Majestic
-                        elif fert_effect_type in ('yield', 'mega_yield', 'time'):
-                            # Средний эффект на редкость
-                            if 'Basic' in rarity_weights:
-                                rarity_weights['Basic'] *= 0.7
-                            if 'Medium' in rarity_weights:
-                                rarity_weights['Medium'] *= 1.8
-                            if 'Elite' in rarity_weights:
-                                rarity_weights['Elite'] *= 2.5
-                            if 'Absolute' in rarity_weights:
-                                rarity_weights['Absolute'] *= 3.0
-                            if 'Majestic' in rarity_weights:
-                                rarity_weights['Majestic'] *= 4.0
-                        else:
-                            # Базовые удобрения - умеренный эффект
-                            if 'Basic' in rarity_weights:
-                                rarity_weights['Basic'] *= 0.8
-                            if 'Medium' in rarity_weights:
-                                rarity_weights['Medium'] *= 1.5
-                            if 'Elite' in rarity_weights:
-                                rarity_weights['Elite'] *= 2.0
-                if wc > 0:
-                    # Полив чуть усиливает Medium/Elite
-                    if 'Medium' in rarity_weights:
-                        rarity_weights['Medium'] *= (1.0 + min(wc, 5) * 0.03)
-                    if 'Elite' in rarity_weights:
-                        rarity_weights['Elite'] *= (1.0 + min(wc, 5) * 0.02)
-                if se:
-                    # Негативные статусы ухудшают качество
-                    if 'Basic' in rarity_weights:
-                        rarity_weights['Basic'] *= 1.15
-                    for rk in ('Medium', 'Elite', 'Absolute', 'Majestic'):
-                        if rk in rarity_weights:
-                            rarity_weights[rk] *= 0.85
+                # Проверяем, является ли энергетик плантационным
+                drink = st.drink
+                is_plantation_drink = getattr(drink, 'is_plantation', False) if drink else False
+                
+                if is_plantation_drink:
+                    # Плантационные энергетики всегда получают редкость 'Plant'
+                    for _ in range(amount):
+                        try:
+                            add_drink_to_inventory(user_id, st.drink_id, 'Plant')
+                            items_added += 1
+                            rarity_counts['Plant'] = int(rarity_counts.get('Plant', 0) or 0) + 1
+                        except Exception:
+                            pass
+                else:
+                    # Обычные энергетики — применяем систему весов редкостей
+                    # Базовые веса редкостей
+                    rarity_weights = {k: float(v) for k, v in RARITIES.items()}
+                    # Смещения весов от удобрений и полива - улучшенные эффекты
+                    if fert_applied and fert_effect_types:
+                        # Применяем эффекты от каждого активного удобрения
+                        for fert_effect_type in fert_effect_types:
+                            # Различные эффекты в зависимости от типа удобрения
+                            if fert_effect_type in ('quality', 'complex', 'growth_quality'):
+                                # Усиливаем высокие редкости, снижаем Basic
+                                if 'Basic' in rarity_weights:
+                                    rarity_weights['Basic'] *= 0.5  # Сильнее снижаем Basic
+                                if 'Medium' in rarity_weights:
+                                    rarity_weights['Medium'] *= 2.5  # Усиливаем Medium
+                                if 'Elite' in rarity_weights:
+                                    rarity_weights['Elite'] *= 4.0  # Значительно усиливаем Elite
+                                if 'Absolute' in rarity_weights:
+                                    rarity_weights['Absolute'] *= 6.0  # Сильно усиливаем Absolute
+                                if 'Majestic' in rarity_weights:
+                                    rarity_weights['Majestic'] *= 8.0  # Максимально усиливаем Majestic
+                            elif fert_effect_type in ('yield', 'mega_yield', 'time'):
+                                # Средний эффект на редкость
+                                if 'Basic' in rarity_weights:
+                                    rarity_weights['Basic'] *= 0.7
+                                if 'Medium' in rarity_weights:
+                                    rarity_weights['Medium'] *= 1.8
+                                if 'Elite' in rarity_weights:
+                                    rarity_weights['Elite'] *= 2.5
+                                if 'Absolute' in rarity_weights:
+                                    rarity_weights['Absolute'] *= 3.0
+                                if 'Majestic' in rarity_weights:
+                                    rarity_weights['Majestic'] *= 4.0
+                            else:
+                                # Базовые удобрения - умеренный эффект
+                                if 'Basic' in rarity_weights:
+                                    rarity_weights['Basic'] *= 0.8
+                                if 'Medium' in rarity_weights:
+                                    rarity_weights['Medium'] *= 1.5
+                                if 'Elite' in rarity_weights:
+                                    rarity_weights['Elite'] *= 2.0
+                    if wc > 0:
+                        # Полив чуть усиливает Medium/Elite
+                        if 'Medium' in rarity_weights:
+                            rarity_weights['Medium'] *= (1.0 + min(wc, 5) * 0.03)
+                        if 'Elite' in rarity_weights:
+                            rarity_weights['Elite'] *= (1.0 + min(wc, 5) * 0.02)
+                    if se:
+                        # Негативные статусы ухудшают качество
+                        if 'Basic' in rarity_weights:
+                            rarity_weights['Basic'] *= 1.15
+                        for rk in ('Medium', 'Elite', 'Absolute', 'Majestic'):
+                            if rk in rarity_weights:
+                                rarity_weights[rk] *= 0.85
 
-                # Страховка: если все веса некорректны — откат к Basic
-                total_w = sum(w for w in rarity_weights.values() if w > 0)
-                if not total_w:
-                    rarity_weights = {'Basic': 1.0}
+                    # Страховка: если все веса некорректны — откат к Basic
+                    total_w = sum(w for w in rarity_weights.values() if w > 0)
+                    if not total_w:
+                        rarity_weights = {'Basic': 1.0}
 
-                # Выбираем редкость для каждого предмета
-                rarities = list(rarity_weights.keys())
-                weights = list(rarity_weights.values())
-                chosen = random.choices(rarities, weights=weights, k=amount)
-                for rrt in chosen:
-                    try:
-                        add_drink_to_inventory(user_id, st.drink_id, rrt)
-                        items_added += 1
-                        rarity_counts[rrt] = int(rarity_counts.get(rrt, 0) or 0) + 1
-                    except Exception:
-                        pass
+                    # Выбираем редкость для каждого предмета
+                    rarities = list(rarity_weights.keys())
+                    weights = list(rarity_weights.values())
+                    chosen = random.choices(rarities, weights=weights, k=amount)
+                    for rrt in chosen:
+                        try:
+                            add_drink_to_inventory(user_id, st.drink_id, rrt)
+                            items_added += 1
+                            rarity_counts[rrt] = int(rarity_counts.get(rrt, 0) or 0) + 1
+                        except Exception:
+                            pass
             except Exception:
                 # Фоллбек: добавляем все как Basic
                 for _ in range(amount):
@@ -3311,6 +3326,15 @@ def get_drink_by_id(drink_id: int) -> EnergyDrink | None:
     db = SessionLocal()
     try:
         return db.query(EnergyDrink).filter(EnergyDrink.id == drink_id).first()
+    finally:
+        db.close()
+
+
+def get_drink_by_name(name: str) -> EnergyDrink | None:
+    """Возвращает энергетик по его названию или None, если не найден."""
+    db = SessionLocal()
+    try:
+        return db.query(EnergyDrink).filter(EnergyDrink.name == name).first()
     finally:
         db.close()
 

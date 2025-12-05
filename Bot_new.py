@@ -4557,7 +4557,7 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 "👨‍🌾 Селюк фермер не может работать, пока выключены напоминания о поливе.\n"
                 "Включите напоминания в настройках, чтобы фермер поливал грядки автоматически."
             )
-        elif reason == 'no_funds':
+        elif reason == 'not_enough_balance':
             text = (
                 f"💧 Грядка {bed_index} готова к поливу!\n\n"
                 "👨‍🌾 Селюку фермеру не хватает септимов на балансе, полей грядку вручную или пополни баланс селюка."
@@ -14026,6 +14026,14 @@ async def finalize_addp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     data = context.user_data
+    name = data.get('name', '').strip()
+    
+    # Проверка на дубликат названия
+    existing = db.get_drink_by_name(name)
+    if existing:
+        await update.message.reply_text("❌ Энергетик с таким названием уже существует!")
+        return ConversationHandler.END
+    
     image_path = None
     if data.get('file_id'):
         try:
@@ -14037,7 +14045,7 @@ async def finalize_addp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_path = None
 
     drink = db.add_energy_drink(
-        name=data.get('name', '').strip(),
+        name=name,
         description=data.get('description', '').strip(),
         image_path=image_path,
         is_special=False,
@@ -14046,9 +14054,9 @@ async def finalize_addp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     p_index = getattr(drink, 'plantation_index', None)
     if p_index:
-        await update.message.reply_text(f"Плантационный энергетик успешно добавлен! Его P-ID: P{p_index}")
+        await update.message.reply_text(f"🌿 Плантационный энергетик успешно добавлен! Его P-ID: P{p_index}")
     else:
-        await update.message.reply_text("Плантационный энергетик успешно добавлен!")
+        await update.message.reply_text("🌿 Плантационный энергетик успешно добавлен!")
 
     return ConversationHandler.END
 
