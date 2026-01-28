@@ -28,6 +28,7 @@ async def show_city_silk(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
     
     # Получить статистику игрока
     stats = silk_city.get_silk_city_stats(user.id)
@@ -39,26 +40,50 @@ async def show_city_silk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_silk = sum(item.quantity for item in silk_inventory)
     
     # VIP статус
-    vip_status = "🔥 V.I.P активен" if db.is_vip(user.id) else ""
+    if lang == 'en':
+        vip_status = "🔥 V.I.P active" if db.is_vip(user.id) else ""
+    else:
+        vip_status = "🔥 V.I.P активен" if db.is_vip(user.id) else ""
     vip_line = f"   {vip_status}\n" if vip_status else ""
     
-    text = (
-        f"🧵 <b>ДОБРО ПОЖАЛОВАТЬ В ГОРОД ШЁЛКА</b> 🧵\n\n"
-        f"🏛️ <i>Центр шёлкового производства и торговли тканями!</i>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 <b>ВАША СТАТИСТИКА:</b>\n\n"
-        f"{SILK_EMOJIS['plantation']} Активных плантаций: <b>{active_plantations}</b>\n"
-        f"{SILK_EMOJIS['inventory']} Шёлка в инвентаре: <b>{total_silk}</b> единиц\n"
-        f"{SILK_EMOJIS['coins']} Доступно септимов: <b>{player.coins:,}</b> 💎\n"
-        f"{vip_line}"
-        f"\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📍 <b>ДОСТУПНЫЕ ЛОКАЦИИ:</b>\n\n"
-        f"🌳 <b>Плантации</b> - создавайте и управляйте\n"
-        f"📊 <b>Рынок</b> - продавайте по лучшим ценам\n"
-        f"💼 <b>Инвентарь</b> - просматривайте запасы\n"
-        f"📈 <b>Статистика</b> - отслеживайте прогресс\n\n"
-        f"<i>Выберите раздел:</i>"
-    )
+    if lang == 'en':
+        text = (
+            f"🧵 <b>WELCOME TO SILK CITY</b> 🧵\n\n"
+            f"🏛️ <i>The center of silk production and trading!</i>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>YOUR STATS:</b>\n\n"
+            f"{SILK_EMOJIS['plantation']} Active plantations: <b>{active_plantations}</b>\n"
+            f"{SILK_EMOJIS['inventory']} Silk in inventory: <b>{total_silk}</b> units\n"
+            f"{SILK_EMOJIS['coins']} Coins available: <b>{player.coins:,}</b> 💎\n"
+            f"{vip_line}"
+            f"\n⭐ Each silk harvest gives <b>+3 rating</b>.\n"
+            f"\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📍 <b>LOCATIONS:</b>\n\n"
+            f"🌳 <b>Plantations</b> - create and manage\n"
+            f"📊 <b>Market</b> - sell at the best prices\n"
+            f"💼 <b>Inventory</b> - view your stock\n"
+            f"📈 <b>Statistics</b> - track progress\n\n"
+            f"<i>Choose a section:</i>"
+        )
+    else:
+        text = (
+            f"🧵 <b>ДОБРО ПОЖАЛОВАТЬ В ГОРОД ШЁЛКА</b> 🧵\n\n"
+            f"🏛️ <i>Центр шёлкового производства и торговли тканями!</i>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>ВАША СТАТИСТИКА:</b>\n\n"
+            f"{SILK_EMOJIS['plantation']} Активных плантаций: <b>{active_plantations}</b>\n"
+            f"{SILK_EMOJIS['inventory']} Шёлка в инвентаре: <b>{total_silk}</b> единиц\n"
+            f"{SILK_EMOJIS['coins']} Доступно септимов: <b>{player.coins:,}</b> 💎\n"
+            f"{vip_line}"
+            f"\n⭐ Каждый сбор шёлка даёт <b>+3 рейтинга</b>.\n"
+            f"\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📍 <b>ДОСТУПНЫЕ ЛОКАЦИИ:</b>\n\n"
+            f"🌳 <b>Плантации</b> - создавайте и управляйте\n"
+            f"📊 <b>Рынок</b> - продавайте по лучшим ценам\n"
+            f"💼 <b>Инвентарь</b> - просматривайте запасы\n"
+            f"📈 <b>Статистика</b> - отслеживайте прогресс\n\n"
+            f"<i>Выберите раздел:</i>"
+        )
     
     keyboard = [
         [InlineKeyboardButton(f"{SILK_EMOJIS['plantation']} Мои плантации", callback_data='silk_plantations')],
@@ -78,6 +103,8 @@ async def show_silk_plantations(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
     plantations = silk_city.get_player_plantations(user.id)
     
     # Обновить статусы плантаций
@@ -86,10 +113,16 @@ async def show_silk_plantations(update: Update, context: ContextTypes.DEFAULT_TY
     
     active_plantations = [p for p in plantations if p.status in ['growing', 'ready']]
     
-    text = f"{SILK_EMOJIS['plantation']} **МОИ ПЛАНТАЦИИ**\n\n"
+    if lang == 'en':
+        text = f"{SILK_EMOJIS['plantation']} <b>MY PLANTATIONS</b>\n\n⭐ Each harvest gives <b>+3 rating</b>.\n\n"
+    else:
+        text = f"{SILK_EMOJIS['plantation']} <b>МОИ ПЛАНТАЦИИ</b>\n\n⭐ Каждый сбор даёт <b>+3 рейтинга</b>.\n\n"
     
     if not active_plantations:
-        text += "У вас пока нет активных плантаций.\nСоздайте свою первую плантацию!"
+        if lang == 'en':
+            text += "You don't have any active plantations yet.\nCreate your first plantation!"
+        else:
+            text += "У вас пока нет активных плантаций.\nСоздайте свою первую плантацию!"
     else:
         for i, plantation in enumerate(active_plantations, 1):
             status_emoji = _get_status_emoji(plantation.status)
@@ -451,12 +484,16 @@ async def handle_silk_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Обработать сбор урожая."""
     query = update.callback_query
     user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
     
     result = silk_city.harvest_plantation(user.id, plantation_id)
     
     if result["ok"]:
         silk_gained = result["silk_gained"]
         coins_gained = result["coins_gained"]
+        rating_added = int(result.get('rating_added') or 0)
+        new_rating = result.get('new_rating')
         
         # Формируем сообщение о полученном шёлке
         silk_text = []
@@ -468,19 +505,29 @@ async def handle_silk_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE
                 silk_text.append(f"{emoji} {name}: {quantity}")
         
         silk_summary = ", ".join(silk_text) if silk_text else "шёлка нет"
-        
-        await query.answer(
-            f"Урожай собран! Получено: {silk_summary}. Бонус: +{coins_gained} 🪙",
-            show_alert=True
-        )
+
+        if lang == 'en':
+            msg = f"Harvest collected! Received: {silk_summary}. Bonus: +{coins_gained} 🪙"
+            if rating_added > 0:
+                msg += f" | ⭐ +{rating_added}"
+                if new_rating is not None:
+                    msg += f" (Rating: {int(new_rating)})"
+        else:
+            msg = f"Урожай собран! Получено: {silk_summary}. Бонус: +{coins_gained} 🪙"
+            if rating_added > 0:
+                msg += f" | ⭐ +{rating_added}"
+                if new_rating is not None:
+                    msg += f" (Рейтинг: {int(new_rating)})"
+
+        await query.answer(msg, show_alert=True)
     else:
         reason = result.get("reason")
         if reason == "not_ready":
-            await query.answer("Урожай ещё не готов!", show_alert=True)
+            await query.answer("Harvest is not ready yet!" if lang == 'en' else "Урожай ещё не готов!", show_alert=True)
         elif reason == "plantation_not_found":
-            await query.answer("Плантация не найдена.", show_alert=True)
+            await query.answer("Plantation not found." if lang == 'en' else "Плантация не найдена.", show_alert=True)
         else:
-            await query.answer("Ошибка сбора урожая. Попробуйте позже.", show_alert=True)
+            await query.answer("Harvest error. Try again later." if lang == 'en' else "Ошибка сбора урожая. Попробуйте позже.", show_alert=True)
     
     # Вернуться к списку плантаций
     await show_silk_plantations(update, context)

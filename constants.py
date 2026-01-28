@@ -28,6 +28,7 @@ COLOR_EMOJIS = {
 }
 RARITY_ORDER = ['Plant', 'Special', 'Majestic', 'Absolute', 'Elite', 'Medium', 'Basic']
 ITEMS_PER_PAGE = 10               # кол-во предметов на страницу инвентаря
+FAVORITE_DRINK_WEIGHT_MULT = 1.5  # множитель веса при поиске для энергетиков из избранного
 
 # --- Рулетка ежедневного бонуса ---
 DAILY_BONUS_REWARDS = {

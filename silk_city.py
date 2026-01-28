@@ -219,13 +219,18 @@ def harvest_plantation(user_id: int, plantation_id: int) -> Dict:
         })
         
         dbs.commit()
+
+        rating_added = 3
+        new_rating = db.increment_rating(user_id, rating_added)
         
         logger.info(f"[SILK] User {user_id} harvested plantation {plantation_id}: {silk_gained}, +{bonus_coins} coins")
         
         return {
             "ok": True,
             "silk_gained": silk_gained,
-            "coins_gained": bonus_coins
+            "coins_gained": bonus_coins,
+            "rating_added": int(rating_added),
+            "new_rating": int(new_rating) if new_rating is not None else None,
         }
         
     except Exception as e:

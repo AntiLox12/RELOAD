@@ -3,10 +3,14 @@
 import os
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, BigInteger, Index, and_, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, joinedload
+from sqlalchemy.exc import IntegrityError, OperationalError
 import re
 from sqlalchemy import text, func
 import time
 import random
+import json
+import logging
+import traceback
 from constants import RARITIES, RECEIVER_PRICES, RECEIVER_COMMISSION, SHOP_PRICES, ADMIN_USERNAMES
 
 # --- Настройка базы данных ---
@@ -16,13 +20,17 @@ engine = create_engine(f"sqlite:///{DATABASE_FILE}", connect_args={"check_same_t
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 Base = declarative_base()
 
+logger = logging.getLogger(__name__)
+
 # --- Описание таблиц в базе данных ---
 
 class Player(Base):
     __tablename__ = 'players'
     user_id = Column(BigInteger, primary_key=True, index=True)
     username = Column(String)
+    display_name = Column(String)
     coins = Column(Integer, default=0)
+    rating = Column(Integer, default=0)
     last_search = Column(Integer, default=0)
     last_bonus_claim = Column(Integer, default=0)
     last_add = Column(Integer, default=0)
@@ -42,12 +50,81 @@ class Player(Base):
     # --- Тихий режим автопоиска ---
     auto_search_silent = Column(Boolean, default=False)
     auto_search_session_stats = Column(String, default='{}')  # JSON со статистикой текущей сессии
+    farmer_auto_water = Column(Boolean, default=True)
+    farmer_auto_harvest = Column(Boolean, default=True)
+    farmer_auto_plant = Column(Boolean, default=True)
+    farmer_auto_fertilize = Column(Boolean, default=True)
+    farmer_fert_priority = Column(String, default='[]')
+    farmer_silent = Column(Boolean, default=False)
+    farmer_summary_enabled = Column(Boolean, default=True)
+    farmer_summary_interval_sec = Column(Integer, default=3600)
+    farmer_summary_last_ts = Column(Integer, default=0)
+    farmer_min_balance = Column(Integer, default=0)
+    farmer_daily_limit = Column(Integer, default=0)
+    farmer_daily_spent = Column(Integer, default=0)
+    farmer_daily_day = Column(Integer, default=0)
+    farmer_seed_mode = Column(String, default='any')
+    farmer_seed_ids = Column(String, default='[]')
+    farmer_seed_priority = Column(String, default='[]')
+    farmer_session_stats = Column(String, default='{}')
     # --- Статистика казино ---
     casino_wins = Column(Integer, default=0)  # количество побед в казино
     casino_losses = Column(Integer, default=0)  # количество поражений в казино
     casino_achievements = Column(String, default='')  # разблокированные достижения (через запятую)
     selyuk_fragments = Column(Integer, default=0)  # Фрагменты Селюка
+    luck_coupon_charges = Column(Integer, default=0)  # Купон удачи: оставшиеся попытки повышенного шанса на двойной дроп
+    favorite_drink_1 = Column(Integer, default=0)
+    favorite_drink_2 = Column(Integer, default=0)
+    favorite_drink_3 = Column(Integer, default=0)
     inventory = relationship("InventoryItem", back_populates="owner", cascade="all, delete-orphan")
+
+
+class FriendRequest(Base):
+    __tablename__ = 'friend_requests'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    to_user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    status = Column(String, default='pending', index=True)  # pending | accepted | rejected | cancelled
+    created_at = Column(Integer, default=lambda: int(time.time()), index=True)
+    updated_at = Column(Integer, default=lambda: int(time.time()), index=True)
+
+    from_user = relationship('Player', foreign_keys=[from_user_id])
+    to_user = relationship('Player', foreign_keys=[to_user_id])
+
+    __table_args__ = (
+        Index('idx_friend_req_from_to_status', 'from_user_id', 'to_user_id', 'status'),
+    )
+
+
+class Friendship(Base):
+    __tablename__ = 'friendships'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    friend_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    created_at = Column(Integer, default=lambda: int(time.time()), index=True)
+
+    user = relationship('Player', foreign_keys=[user_id])
+    friend = relationship('Player', foreign_keys=[friend_id])
+
+    __table_args__ = (
+        Index('idx_friendships_pair_unique', 'user_id', 'friend_id', unique=True),
+        Index('idx_friendships_user', 'user_id'),
+        Index('idx_friendships_friend', 'friend_id'),
+    )
+
+
+class FriendTransferLog(Base):
+    __tablename__ = 'friend_transfer_logs'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    from_user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    to_user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    kind = Column(String, index=True)  # coins | fragments | vip_7d | rating
+    amount = Column(Integer, default=0)
+    created_at = Column(Integer, default=lambda: int(time.time()), index=True)
+
+    __table_args__ = (
+        Index('idx_friend_transfer_from_kind_time', 'from_user_id', 'kind', 'created_at'),
+    )
 
 
 class Selyuk(Base):
@@ -76,6 +153,7 @@ class EnergyDrink(Base):
     is_special = Column(Boolean, default=False)
     is_plantation = Column(Boolean, default=False)
     plantation_index = Column(Integer, nullable=True)
+    default_rarity = Column(String, nullable=True)
 
 class InventoryItem(Base):
     __tablename__ = 'inventory_items'
@@ -104,6 +182,13 @@ class AutoSellSetting(Base):
     __table_args__ = (
         Index('idx_autosell_user_rarity', 'user_id', 'rarity', unique=True),
     )
+
+
+class RarityEmoji(Base):
+    __tablename__ = 'rarity_emojis'
+    rarity = Column(String, primary_key=True)
+    emoji = Column(String)
+    updated_at = Column(Integer, default=lambda: int(time.time()))
 
 # --- Магазинные офферы (персистентны, обновляются раз в 4 часа) ---
 
@@ -581,6 +666,29 @@ def create_db_and_tables():
     Base.metadata.create_all(bind=engine)
     print("База данных и таблицы успешно созданы.")
 
+def ensure_schema():
+    """Проверяет и обновляет схему БД (миграции)."""
+    Base.metadata.create_all(bind=engine)
+    try:
+        with engine.connect() as connection:
+            # Миграция: default_rarity
+            try:
+                connection.execute(text("SELECT default_rarity FROM energy_drinks LIMIT 1"))
+            except Exception:
+                print("Adding column 'default_rarity' to table 'energy_drinks'")
+                try:
+                    connection.execute(text("ALTER TABLE energy_drinks ADD COLUMN default_rarity VARCHAR"))
+                    connection.commit()
+                except Exception as e:
+                    print(f"Failed to add column 'default_rarity': {e}")
+    except Exception as e:
+        print(f"Schema update error: {e}")
+
+    try:
+        _ensure_player_has_display_name_column()
+    except Exception:
+        pass
+
 def _ensure_player_has_autosearch_columns():
     """Гарантирует наличие колонок для тихого автопоиска в таблице players."""
     try:
@@ -594,6 +702,22 @@ def _ensure_player_has_autosearch_columns():
             conn.commit()
     except Exception as e:
         print(f"Error checking/adding auto_search columns: {e}")
+
+def _ensure_player_has_casino_stats():
+    """Гарантирует наличие колонок статистики казино в таблице players."""
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("PRAGMA table_info(players)")).fetchall()
+            cols = [row[1] for row in res]
+            if 'casino_wins' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN casino_wins INTEGER DEFAULT 0"))
+            if 'casino_losses' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN casino_losses INTEGER DEFAULT 0"))
+            if 'casino_achievements' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN casino_achievements VARCHAR DEFAULT ''"))
+            conn.commit()
+    except Exception as e:
+        print(f"Error checking/adding casino columns: {e}")
 
 def _ensure_promos_has_rarity_column():
     """Гарантирует наличие колонки rarity в таблице promos (SQLite)."""
@@ -617,23 +741,56 @@ def _ensure_player_has_selyuk_fragments_column():
     except Exception as e:
         print(f"Error checking/adding selyuk_fragments column: {e}")
 
-def get_or_create_player(user_id, username):
+def _ensure_player_has_display_name_column():
+    """Гарантирует наличие колонки display_name в таблице players."""
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("PRAGMA table_info(players)")).fetchall()
+            cols = [row[1] for row in res]
+            if 'display_name' not in cols:
+                conn.execute(text("ALTER TABLE players ADD COLUMN display_name VARCHAR"))
+                conn.commit()
+    except Exception as e:
+        print(f"Error checking/adding display_name column: {e}")
+
+def get_or_create_player(user_id, username=None, display_name=None):
     """Возвращает игрока по ID. Если его нет, создает нового."""
     db = SessionLocal()
     try:
-        player = db.query(Player).filter(Player.user_id == user_id).first()
+        try:
+            player = db.query(Player).filter(Player.user_id == user_id).first()
+        except OperationalError as e:
+            err = str(e).lower()
+            if "no such column" in err and "players.display_name" in err:
+                try:
+                    _ensure_player_has_display_name_column()
+                except Exception:
+                    pass
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                player = db.query(Player).filter(Player.user_id == user_id).first()
+            else:
+                raise
         # Нормализуем username: только валидные @username (буквы/цифры/подчёркивания 3-32)
         new_uname = None
+        new_display = None
         try:
             if username:
                 uname = str(username).lstrip('@')
                 if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
                     new_uname = uname
+            if display_name:
+                new_display = str(display_name).strip()
+            if (not new_display) and username and (new_uname is None):
+                new_display = str(username).strip()
         except Exception:
             new_uname = None
+            new_display = None
         if not player:
             # Создаём игрока; заполняем username только если он валиден
-            player = Player(user_id=user_id, username=new_uname)
+            player = Player(user_id=user_id, username=new_uname, display_name=new_display)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -646,7 +803,81 @@ def get_or_create_player(user_id, username):
                     db.commit()
                 except Exception:
                     db.rollback()
+            if new_display and new_display != getattr(player, 'display_name', None):
+                try:
+                    player.display_name = new_display
+                    db.commit()
+                except Exception:
+                    db.rollback()
         return player
+    finally:
+        db.close()
+
+
+def add_energy_drink_with_id(drink_id: int, name: str, description: str, image_path: str | None = None, is_special: bool = True, is_plantation: bool = False, default_rarity: str | None = None):
+    """Создаёт или обновляет энергетик с заданным ID (для эксклюзивов под события/ачивки).
+
+    Примечания:
+    - ID задаётся вручную, поэтому убедитесь, что не конфликтует с уже существующими записями.
+    - default_rarity сохраняется в базе, чтобы при выдаче (/giveexdrink) можно было использовать его по умолчанию.
+    """
+    db = SessionLocal()
+    try:
+        existing_by_name = None
+        try:
+            if name is not None:
+                existing_by_name = db.query(EnergyDrink).filter(EnergyDrink.name == name).first()
+        except Exception:
+            existing_by_name = None
+
+        drink = db.query(EnergyDrink).filter(EnergyDrink.id == int(drink_id)).first()
+        if existing_by_name and int(getattr(existing_by_name, 'id', 0) or 0) != int(drink_id):
+            raise ValueError(
+                f"Энергетик с названием '{name}' уже существует (ID: {existing_by_name.id}). "
+                f"Используйте другое название или отредактируйте существующий энергетик."
+            )
+
+        if drink:
+            drink.name = name
+            drink.description = description
+            drink.image_path = image_path
+            drink.is_special = bool(is_special)
+            # Обновляем дефолтную редкость, если передана (или сбрасываем, если явно None, но обычно лучше не сбрасывать случайно)
+            if default_rarity is not None:
+                drink.default_rarity = str(default_rarity)
+            try:
+                drink.is_plantation = bool(is_plantation)
+            except Exception:
+                pass
+        else:
+            drink = EnergyDrink(
+                id=int(drink_id),
+                name=name,
+                description=description,
+                image_path=image_path,
+                is_special=bool(is_special),
+                default_rarity=str(default_rarity) if default_rarity else None
+            )
+            try:
+                drink.is_plantation = bool(is_plantation)
+            except Exception:
+                pass
+            db.add(drink)
+
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise ValueError(
+                f"Нельзя сохранить энергетик: название '{name}' уже занято. "
+                f"Переименуйте энергетик или обновите существующий."
+            )
+        except Exception:
+            db.rollback()
+            raise
+
+        db.refresh(drink)
+        return drink
     finally:
         db.close()
 
@@ -685,15 +916,113 @@ def get_active_ban(user_id: int) -> dict | None:
     finally:
         db.close()
 
+def increment_rating(user_id: int, amount: int = 1, max_rating: int = 1000) -> int | None:
+    """Увеличивает рейтинг игрока на amount (не более max_rating). Создаёт игрока при отсутствии."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=user_id, username=None)
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+        current = int(getattr(player, 'rating', 0) or 0)
+        new_rating = min(int(max_rating), current + int(amount))
+        if new_rating != current:
+            player.rating = new_rating
+            db.commit()
+        return int(new_rating)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        db.close()
+
+
+def set_player_rating(user_id: int, rating: int, max_rating: int = 1000) -> int | None:
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=None)
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        try:
+            value = int(rating)
+        except Exception:
+            value = 0
+
+        value = max(0, min(int(max_rating), value))
+        player.rating = value
+        db.commit()
+        return int(value)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        db.close()
+
+
+def change_player_rating(user_id: int, delta: int, max_rating: int = 1000) -> int | None:
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=None)
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        current = int(getattr(player, 'rating', 0) or 0)
+        try:
+            d = int(delta)
+        except Exception:
+            d = 0
+
+        value = current + d
+        value = max(0, min(int(max_rating), int(value)))
+        if value != current:
+            player.rating = value
+            db.commit()
+        return int(value)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        db.close()
+
 def create_promo(code: str, kind: str, value: int, max_uses: int, per_user_limit: int, expires_at: int | None, active: bool = True, rarity: str | None = None) -> dict:
     db = SessionLocal()
     try:
         _ensure_promos_has_rarity_column()
-        existing = db.query(Promo).filter(Promo.code == code).first()
+        code_norm = _normalize_promo_code(code)
+        if not code_norm or len(code_norm) < 3:
+            return {"ok": False, "reason": "invalid_code"}
+        # Быстрый чек по точному совпадению
+        existing = db.query(Promo).filter(func.lower(Promo.code) == code_norm.lower()).first()
         if existing:
             return {"ok": False, "reason": "exists"}
+        # Доп. чек на "похожий" код (например, кириллица/латиница)
+        try:
+            rows = db.query(Promo.code).all()
+            for (c,) in rows:
+                if _normalize_promo_code(c) == code_norm:
+                    return {"ok": False, "reason": "exists"}
+        except Exception:
+            pass
         row = Promo(
-            code=code.strip(),
+            code=code_norm,
             kind=kind.strip(),
             value=int(value),
             max_uses=int(max_uses or 0),
@@ -708,7 +1037,113 @@ def create_promo(code: str, kind: str, value: int, max_uses: int, per_user_limit
         return {"ok": True, "id": int(row.id)}
     except Exception:
         db.rollback()
+        try:
+            logger.exception("[PROMO] create_promo exception: code=%r kind=%r value=%r", code, kind, value)
+        except Exception:
+            try:
+                print(traceback.format_exc())
+            except Exception:
+                pass
         return {"ok": False, "reason": "exception"}
+    finally:
+        db.close()
+
+
+def _normalize_promo_code(code: str) -> str:
+    """Нормализует промокод, чтобы не ломался ввод из-за кириллицы/латиницы и регистра.
+
+    Пример проблемы: в базе может быть 'РМТ...' (кириллица), а пользователь вводит 'PMT...' (латиница).
+    """
+    s = (code or '').strip()
+    if not s:
+        return ''
+    # Заменяем визуально похожие кириллические/греческие буквы на латинские
+    # (частая проблема при вводе/копировании промокодов)
+    table = str.maketrans({
+        # Cyrillic -> Latin
+        'А': 'A', 'а': 'A',
+        'В': 'B', 'в': 'B',
+        'С': 'C', 'с': 'C',
+        'Е': 'E', 'е': 'E',
+        'Н': 'H', 'н': 'H',
+        'К': 'K', 'к': 'K',
+        'М': 'M', 'м': 'M',
+        'О': 'O', 'о': 'O',
+        'Р': 'P', 'р': 'P',
+        'Т': 'T', 'т': 'T',
+        'У': 'Y', 'у': 'Y',
+        'Х': 'X', 'х': 'X',
+        'Л': 'L', 'л': 'L',
+        'Ј': 'J', 'ј': 'J',
+        # Greek -> Latin
+        'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Η': 'H', 'Ι': 'I', 'Κ': 'K', 'Μ': 'M',
+        'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y', 'Χ': 'X',
+        'α': 'A', 'β': 'B', 'ε': 'E', 'η': 'H', 'ι': 'I', 'κ': 'K', 'μ': 'M',
+        'ν': 'N', 'ο': 'O', 'ρ': 'P', 'τ': 'T', 'υ': 'Y', 'χ': 'X',
+        # Fullwidth Latin/digits -> normal
+        'Ａ': 'A', 'Ｂ': 'B', 'Ｃ': 'C', 'Ｄ': 'D', 'Ｅ': 'E', 'Ｆ': 'F', 'Ｇ': 'G', 'Ｈ': 'H', 'Ｉ': 'I', 'Ｊ': 'J',
+        'Ｋ': 'K', 'Ｌ': 'L', 'Ｍ': 'M', 'Ｎ': 'N', 'Ｏ': 'O', 'Ｐ': 'P', 'Ｑ': 'Q', 'Ｒ': 'R', 'Ｓ': 'S', 'Ｔ': 'T',
+        'Ｕ': 'U', 'Ｖ': 'V', 'Ｗ': 'W', 'Ｘ': 'X', 'Ｙ': 'Y', 'Ｚ': 'Z',
+        '０': '0', '１': '1', '２': '2', '３': '3', '４': '4', '５': '5', '６': '6', '７': '7', '８': '8', '９': '9',
+    })
+    s = s.translate(table)
+    # Фолбэк: если пользователь вводит код в русской раскладке (йцукен), пробуем восстановить латиницув (qwerty)
+    try:
+        kbd = str.maketrans({
+            # верхний ряд
+            'й': 'Q', 'ц': 'W', 'у': 'E', 'к': 'R', 'е': 'T', 'н': 'Y', 'г': 'U', 'ш': 'I', 'щ': 'O', 'з': 'P',
+            'Й': 'Q', 'Ц': 'W', 'У': 'E', 'К': 'R', 'Е': 'T', 'Н': 'Y', 'Г': 'U', 'Ш': 'I', 'Щ': 'O', 'З': 'P',
+            # средний ряд
+            'ф': 'A', 'ы': 'S', 'в': 'D', 'а': 'F', 'п': 'G', 'р': 'H', 'о': 'J', 'л': 'K', 'д': 'L',
+            'Ф': 'A', 'Ы': 'S', 'В': 'D', 'А': 'F', 'П': 'G', 'Р': 'H', 'О': 'J', 'Л': 'K', 'Д': 'L',
+            # нижний ряд
+            'я': 'Z', 'ч': 'X', 'с': 'C', 'м': 'V', 'и': 'B', 'т': 'N', 'ь': 'M',
+            'Я': 'Z', 'Ч': 'X', 'С': 'C', 'М': 'V', 'И': 'B', 'Т': 'N', 'Ь': 'M',
+        })
+        s = s.translate(kbd)
+    except Exception:
+        pass
+    # Удаляем все пробельные символы и любые не буквенно-цифровые (включая невидимые при копировании)
+    # Оставляем только [A-Z0-9].
+    s = ''.join(ch for ch in s if ch.isalnum())
+    return s.upper()
+
+
+def normalize_promo_code(code: str) -> str:
+    """Публичный хелпер нормализации промокода (для UI/отладки)."""
+    return _normalize_promo_code(code)
+
+
+def find_promos_by_code_debug(code: str, limit: int = 10) -> dict:
+    """Диагностика: ищет промокоды по нормализованному коду и возвращает кандидатов.
+
+    Использовать только для админ-отладки.
+    """
+    db = SessionLocal()
+    try:
+        code_norm = _normalize_promo_code(code)
+        if not code_norm:
+            return {"ok": False, "code_norm": "", "items": []}
+        rows = db.query(Promo).order_by(Promo.created_at.desc()).all()
+        items: list[dict] = []
+        for r in rows:
+            raw = getattr(r, 'code', '')
+            if _normalize_promo_code(str(raw)) == code_norm:
+                items.append({
+                    'id': int(r.id),
+                    'code': str(r.code),
+                    'kind': str(r.kind),
+                    'value': int(r.value or 0),
+                    'active': bool(r.active),
+                    'expires_at': int(r.expires_at or 0) if getattr(r, 'expires_at', None) else None,
+                    'max_uses': int(r.max_uses or 0),
+                    'per_user_limit': int(r.per_user_limit or 0),
+                })
+                if len(items) >= int(limit or 10):
+                    break
+        return {"ok": True, "code_norm": code_norm, "items": items}
+    except Exception:
+        return {"ok": False, "code_norm": "", "items": []}
     finally:
         db.close()
 
@@ -759,7 +1194,20 @@ def deactivate_promo_by_id(promo_id: int) -> bool:
 def deactivate_promo_by_code(code: str) -> bool:
     db = SessionLocal()
     try:
-        row = db.query(Promo).filter(Promo.code == code.strip()).first()
+        code_norm = _normalize_promo_code(code)
+        if not code_norm:
+            return False
+        row = db.query(Promo).filter(func.lower(Promo.code) == code_norm.lower()).first()
+        if not row:
+            # Фолбэк на нормализованное сравнение в Python (кириллица/латиница)
+            try:
+                rows = db.query(Promo).all()
+                for r in rows:
+                    if _normalize_promo_code(getattr(r, 'code', '')) == code_norm:
+                        row = r
+                        break
+            except Exception:
+                row = None
         if not row:
             return False
         row.active = False
@@ -789,11 +1237,22 @@ def redeem_promo(user_id: int, code: str) -> dict:
         _ensure_promos_has_rarity_column()
         _ensure_player_has_autosearch_columns()
         _ensure_player_has_casino_stats()
-        code_s = (code or '').strip()
-        if not code_s:
+        code_norm = _normalize_promo_code(code)
+        if not code_norm:
             return {"ok": False, "reason": "not_found_or_inactive"}
 
-        row = db.query(Promo).filter(func.lower(Promo.code) == code_s.lower()).first()
+        # Сначала пробуем быстрый поиск по нормализованному коду
+        row = db.query(Promo).filter(func.lower(Promo.code) == code_norm.lower()).first()
+        if not row:
+            # Фолбэк: если в базе код сохранён кириллицей/латиницей, найдём через нормализацию в Python
+            try:
+                candidates = db.query(Promo).all()
+                for r in candidates:
+                    if _normalize_promo_code(getattr(r, 'code', '')) == code_norm:
+                        row = r
+                        break
+            except Exception:
+                row = None
         if not row or not bool(row.active):
             return {"ok": False, "reason": "not_found_or_inactive"}
 
@@ -823,7 +1282,7 @@ def redeem_promo(user_id: int, code: str) -> dict:
         # Гарантируем наличие игрока
         player = db.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=int(user_id), username=str(user_id))
+            player = Player(user_id=int(user_id), username=None)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -885,7 +1344,12 @@ def redeem_promo(user_id: int, code: str) -> dict:
             drink = db.query(EnergyDrink).filter(EnergyDrink.id == int(value)).first()
             if not drink:
                 return {"ok": False, "reason": "invalid_drink"}
-            rarity = str(getattr(row, 'rarity', '') or '').strip() or 'Basic'
+            # Если редкость промокода не указана — используем встроенную default_rarity энергетика (если она есть)
+            rarity = str(getattr(row, 'rarity', '') or '').strip()
+            if not rarity:
+                rarity = str(getattr(drink, 'default_rarity', '') or '').strip()
+            if not rarity:
+                rarity = 'Basic'
             # Добавляем в инвентарь в рамках одной сессии
             item = db.query(InventoryItem).filter_by(player_id=int(user_id), drink_id=int(drink.id), rarity=rarity).first()
             if item:
@@ -909,6 +1373,13 @@ def redeem_promo(user_id: int, code: str) -> dict:
             db.rollback()
         except Exception:
             pass
+        try:
+            logger.exception("[PROMO] redeem_promo exception: user_id=%s code=%r", user_id, code)
+        except Exception:
+            try:
+                print(traceback.format_exc())
+            except Exception:
+                pass
         return {"ok": False, "reason": "exception"}
     finally:
         db.close()
@@ -1080,6 +1551,235 @@ def get_or_refresh_shop_offers() -> tuple[list[ShopOffer], int]:
         dbs.close()
 
 
+def try_farmer_auto_fertilize(user_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+
+        if not bool(getattr(player, 'farmer_auto_fertilize', True)):
+            return {"ok": False, "reason": "disabled_by_settings"}
+
+        selyuk = (
+            dbs.query(Selyuk)
+            .filter(Selyuk.owner_id == int(user_id), Selyuk.type == 'farmer')
+            .first()
+        )
+        if not selyuk:
+            return {"ok": False, "reason": "no_selyuk"}
+
+        level = int(getattr(selyuk, 'level', 1) or 1)
+        if level < 4:
+            return {"ok": False, "reason": "low_level"}
+
+        if not bool(getattr(selyuk, 'is_enabled', False)):
+            return {"ok": False, "reason": "disabled"}
+
+        inv_rows = (
+            dbs.query(FertilizerInventory)
+            .options(joinedload(FertilizerInventory.fertilizer))
+            .filter(FertilizerInventory.player_id == int(user_id), FertilizerInventory.quantity > 0)
+            .order_by(FertilizerInventory.id.asc())
+            .all()
+        )
+
+        if not inv_rows:
+            return {"ok": True, "applied": [], "reason": "no_fertilizers"}
+
+        inv_map = {}
+        inv_order = []
+        for row in inv_rows:
+            fid = int(getattr(row, 'fertilizer_id', 0) or 0)
+            if fid <= 0:
+                continue
+            qty = int(getattr(row, 'quantity', 0) or 0)
+            if qty <= 0:
+                continue
+            inv_map[fid] = row
+            inv_order.append(fid)
+
+        try:
+            prio_ids = _json_load_safe(getattr(player, 'farmer_fert_priority', '[]'), [])
+        except Exception:
+            prio_ids = []
+        try:
+            prio_ids = [int(x) for x in prio_ids]
+        except Exception:
+            prio_ids = []
+
+        beds = (
+            dbs.query(PlantationBed)
+            .options(
+                joinedload(PlantationBed.fertilizer),
+                joinedload(PlantationBed.seed_type),
+                joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+            )
+            .filter(PlantationBed.owner_id == int(user_id))
+            .order_by(PlantationBed.bed_index.asc())
+            .all()
+        )
+
+        now_ts = int(time.time())
+        applied = []
+
+        def _pick_fertilizer_id() -> int | None:
+            for x in prio_ids:
+                if x in inv_map and int(getattr(inv_map[x], 'quantity', 0) or 0) > 0:
+                    return int(x)
+            for x in inv_order:
+                if x in inv_map and int(getattr(inv_map[x], 'quantity', 0) or 0) > 0:
+                    return int(x)
+            return None
+
+        for bed in beds:
+            if not bed or str(getattr(bed, 'state', '')) != 'growing' or not getattr(bed, 'seed_type', None):
+                continue
+            if int(getattr(bed, 'water_count', 0) or 0) <= 0:
+                continue
+
+            try:
+                _cleanup_expired_bed_fertilizers(dbs, bed, now_ts)
+            except Exception:
+                pass
+
+            try:
+                fs = get_fertilizer_status(bed, check_duration=True)
+                active_count = len(list(fs.get('fertilizers_info', []) or []))
+            except Exception:
+                active_count = 0
+
+            while active_count < 3:
+                fid = _pick_fertilizer_id()
+                if not fid:
+                    break
+
+                row = inv_map.get(fid)
+                if not row or int(getattr(row, 'quantity', 0) or 0) <= 0:
+                    try:
+                        inv_map.pop(fid, None)
+                    except Exception:
+                        pass
+                    continue
+
+                dbs.add(BedFertilizer(bed_id=bed.id, fertilizer_id=fid, applied_at=now_ts))
+
+                try:
+                    fert = getattr(row, 'fertilizer', None)
+                    new_growth_factor = _fert_growth_factor(getattr(fert, 'effect', '') or '') if fert else None
+                    if new_growth_factor is not None:
+                        try:
+                            cur_growth_factor = None
+                            if getattr(bed, 'fertilizer', None):
+                                cur_growth_factor = _fert_growth_factor(getattr(bed.fertilizer, 'effect', '') or '')
+                            if cur_growth_factor is None or float(new_growth_factor) < float(cur_growth_factor):
+                                bed.fertilizer_id = fid
+                                bed.fertilizer_applied_at = now_ts
+                        except Exception:
+                            bed.fertilizer_id = fid
+                            bed.fertilizer_applied_at = now_ts
+                except Exception:
+                    pass
+
+                try:
+                    row.quantity = int(getattr(row, 'quantity', 0) or 0) - 1
+                except Exception:
+                    row.quantity = 0
+
+                active_count += 1
+                applied.append({'bed_index': int(getattr(bed, 'bed_index', 0) or 0), 'fertilizer_id': int(fid)})
+
+                if int(getattr(row, 'quantity', 0) or 0) <= 0:
+                    try:
+                        inv_map.pop(fid, None)
+                    except Exception:
+                        pass
+
+                if not inv_map:
+                    break
+
+        if applied:
+            try:
+                stats = _json_load_safe(getattr(player, 'farmer_session_stats', '{}'), {})
+                stats = _farmer_stats_inc_inplace(stats, {'fertilize_count': len(applied)})
+                player.farmer_session_stats = _json_dump_safe(stats)
+            except Exception:
+                pass
+
+        dbs.commit()
+        return {"ok": True, "applied": applied}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def _fert_growth_factor(effect: str) -> float | None:
+    try:
+        eff = (effect or '').lower()
+    except Exception:
+        eff = ''
+    if not eff:
+        return None
+    if 'время' in eff:
+        return 0.4
+    if 'рост+кач' in eff:
+        return 0.7
+    if 'всё' in eff:
+        return 0.7
+    if 'рост' in eff:
+        return 0.75
+    return None
+
+
+def _best_growth_factor_from_bed(bed: PlantationBed) -> float | None:
+    best: float | None = None
+    try:
+        if getattr(bed, 'fertilizer', None):
+            f = _fert_growth_factor(getattr(bed.fertilizer, 'effect', '') or '')
+            if f is not None:
+                best = f if best is None else min(best, f)
+    except Exception:
+        pass
+    try:
+        if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
+            for bf in bed.active_fertilizers:
+                fert = getattr(bf, 'fertilizer', None)
+                if not fert:
+                    continue
+                f = _fert_growth_factor(getattr(fert, 'effect', '') or '')
+                if f is None:
+                    continue
+                best = f if best is None else min(best, f)
+    except Exception:
+        pass
+    return best
+
+
+def _cleanup_expired_bed_fertilizers(dbs, bed: PlantationBed, now_ts: int) -> None:
+    try:
+        if not hasattr(bed, 'active_fertilizers') or not bed.active_fertilizers:
+            return
+        for bf in list(bed.active_fertilizers):
+            fert = getattr(bf, 'fertilizer', None)
+            if not fert:
+                try:
+                    dbs.delete(bf)
+                except Exception:
+                    pass
+                continue
+            dur = int(getattr(fert, 'duration_sec', 0) or 0)
+            appl = int(getattr(bf, 'applied_at', 0) or 0)
+            if dur <= 0 or appl <= 0:
+                continue
+    except Exception:
+        pass
+
+
 def get_autosell_settings(user_id: int) -> dict:
     """Возвращает словарь настроек автопродажи по редкостям для указанного пользователя.
 
@@ -1209,7 +1909,7 @@ def purchase_next_bed(user_id: int) -> dict:
         price = 1000 * (2 ** (next_index - 2))
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id), coins=0)
+            player = Player(user_id=user_id, username=None, coins=0)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -1251,7 +1951,7 @@ def purchase_shop_offer(user_id: int, offer_index: int) -> dict:
 
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -1298,7 +1998,12 @@ def purchase_shop_offer(user_id: int, offer_index: int) -> dict:
 def list_seed_types() -> list[SeedType]:
     dbs = SessionLocal()
     try:
-        return list(dbs.query(SeedType).order_by(SeedType.id.asc()).all())
+        return list(
+            dbs.query(SeedType)
+            .options(joinedload(SeedType.drink))
+            .order_by(SeedType.id.asc())
+            .all()
+        )
     finally:
         dbs.close()
 
@@ -1306,7 +2011,12 @@ def list_seed_types() -> list[SeedType]:
 def get_seed_type_by_id(seed_type_id: int) -> SeedType | None:
     dbs = SessionLocal()
     try:
-        return dbs.query(SeedType).filter(SeedType.id == seed_type_id).first()
+        return (
+            dbs.query(SeedType)
+            .options(joinedload(SeedType.drink))
+            .filter(SeedType.id == seed_type_id)
+            .first()
+        )
     finally:
         dbs.close()
 
@@ -1583,7 +2293,7 @@ def purchase_seeds(user_id: int, seed_type_id: int, quantity: int) -> dict:
             return {"ok": False, "reason": "no_such_seed"}
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -1723,7 +2433,7 @@ def purchase_fertilizer(user_id: int, fertilizer_id: int, quantity: int) -> dict
             return {"ok": False, "reason": "no_such_fertilizer"}
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -1793,6 +2503,7 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
         # Проверяем количество активных удобрений (максимум 3)
         # Используем check_duration=True, чтобы считать только удобрения с активным временем действия
         now_ts = int(time.time())
+        _cleanup_expired_bed_fertilizers(dbs, bed, now_ts)
         fert_status = get_fertilizer_status(bed, check_duration=True)
         active_count = len(fert_status.get('fertilizers_info', []))
         
@@ -1816,9 +2527,19 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
         )
         dbs.add(bed_fert)
         
-        # Также обновляем старые поля для обратной совместимости
-        bed.fertilizer_id = fertilizer_id
-        bed.fertilizer_applied_at = now_ts
+        # Также обновляем старые поля для обратной совместимости.
+        new_growth_factor = _fert_growth_factor(getattr(fert, 'effect', '') or '')
+        if new_growth_factor is not None:
+            try:
+                cur_growth_factor = None
+                if getattr(bed, 'fertilizer', None):
+                    cur_growth_factor = _fert_growth_factor(getattr(bed.fertilizer, 'effect', '') or '')
+                if cur_growth_factor is None or float(new_growth_factor) < float(cur_growth_factor):
+                    bed.fertilizer_id = fertilizer_id
+                    bed.fertilizer_applied_at = now_ts
+            except Exception:
+                bed.fertilizer_id = fertilizer_id
+                bed.fertilizer_applied_at = now_ts
         
         inv.quantity = int(inv.quantity or 0) - 1
         dbs.commit()
@@ -2008,20 +2729,14 @@ def get_actual_grow_time(bed: PlantationBed) -> int:
         return 0
     
     base_grow_time = int(bed.seed_type.grow_time_sec or 0)
-    
-    # Если удобрение применено, рассчитываем ускоренное время
-    if bed.fertilizer_id and bed.fertilizer:
-        effect = getattr(bed.fertilizer, 'effect', '') or ''
-        # Удобрения на ускорение роста
-        if 'время' in effect:  # СуперРост (-время)
-            return int(base_grow_time * 0.4)  # Сокращение на 60%
-        elif 'рост+кач' in effect:  # Стимул-Х
-            return int(base_grow_time * 0.7)  # Сокращение на 30%
-        elif 'всё' in effect:  # Комплексное
-            return int(base_grow_time * 0.7)  # Сокращение на 30%
-        elif 'рост' in effect:  # Азотное (+рост)
-            return int(base_grow_time * 0.75)  # Сокращение на 25%
-    
+
+    best_factor = _best_growth_factor_from_bed(bed)
+    if best_factor is not None:
+        try:
+            return int(base_grow_time * float(best_factor))
+        except Exception:
+            return base_grow_time
+
     return base_grow_time
 
 
@@ -2074,6 +2789,26 @@ def plant_seed(user_id: int, bed_index: int, seed_type_id: int) -> dict:
             return {"ok": False, "reason": "no_seeds"}
         # Посадка
         now_ts = int(time.time())
+
+        try:
+            bed.fertilizer_id = None
+        except Exception:
+            pass
+        try:
+            bed.fertilizer_applied_at = 0
+        except Exception:
+            pass
+        try:
+            bed.status_effect = None
+        except Exception:
+            pass
+        try:
+            if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
+                for bf in list(bed.active_fertilizers):
+                    dbs.delete(bf)
+        except Exception:
+            pass
+
         bed.state = 'growing'
         bed.seed_type_id = seed_type_id
         bed.planted_at = now_ts
@@ -2093,6 +2828,174 @@ def plant_seed(user_id: int, bed_index: int, seed_type_id: int) -> dict:
         dbs.close()
 
 
+def _water_bed_core(dbs, bed: PlantationBed) -> dict:
+    if not bed:
+        return {"ok": False, "reason": "no_such_bed"}
+
+    if bed.state != 'growing' or not bed.seed_type:
+        _update_bed_ready_if_due(dbs, bed)
+        return {"ok": False, "reason": "not_growing", "bed_state": bed.state}
+
+    now_ts = int(time.time())
+    last = int(bed.last_watered_at or 0)
+    interval = int(bed.seed_type.water_interval_sec or 0)
+    if last and interval and (now_ts - last) < interval:
+        return {
+            "ok": False,
+            "reason": "too_early_to_water",
+            "next_water_in": interval - (now_ts - last),
+            "bed_state": bed.state,
+            "water_interval_sec": interval,
+        }
+
+    bed.last_watered_at = now_ts
+    bed.water_count = int(bed.water_count or 0) + 1
+    _update_bed_ready_if_due(dbs, bed)
+    return {"ok": True, "bed_state": bed.state, "water_interval_sec": interval}
+
+
+def _farmer_day_int(ts: int | None = None) -> int:
+    try:
+        return int(time.strftime('%Y%m%d', time.localtime(int(ts or time.time()))))
+    except Exception:
+        return 0
+
+
+def _json_load_safe(s: str | None, default):
+    try:
+        if not s:
+            return default
+        v = json.loads(s)
+        return v if v is not None else default
+    except Exception:
+        return default
+
+
+def _json_dump_safe(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        try:
+            return json.dumps(obj)
+        except Exception:
+            return '{}'
+
+
+def _farmer_reset_daily_if_needed(player: Player, now_ts: int):
+    today = _farmer_day_int(now_ts)
+    cur = int(getattr(player, 'farmer_daily_day', 0) or 0)
+    if cur != today:
+        try:
+            player.farmer_daily_day = today
+        except Exception:
+            pass
+        try:
+            player.farmer_daily_spent = 0
+        except Exception:
+            pass
+
+
+def _farmer_stats_inc_inplace(stats: dict, inc: dict) -> dict:
+    out = dict(stats or {})
+    for k, v in (inc or {}).items():
+        try:
+            out[k] = int(out.get(k, 0) or 0) + int(v or 0)
+        except Exception:
+            pass
+    return out
+
+
+def add_farmer_stats(user_id: int, inc: dict) -> bool:
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            return False
+        now_ts = int(time.time())
+        _farmer_reset_daily_if_needed(player, now_ts)
+        stats = _json_load_safe(getattr(player, 'farmer_session_stats', '{}'), {})
+        stats = _farmer_stats_inc_inplace(stats, inc)
+        player.farmer_session_stats = _json_dump_safe(stats)
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        dbs.close()
+
+
+def get_players_with_farmer_summaries_due(now_ts: int | None = None) -> list[dict]:
+    ts = int(now_ts or time.time())
+    dbs = SessionLocal()
+    try:
+        players = (
+            dbs.query(Player)
+            .filter(Player.farmer_summary_enabled == True)
+            .filter(Player.farmer_silent == True)
+            .all()
+        )
+        out = []
+        for p in players:
+            last_ts = int(getattr(p, 'farmer_summary_last_ts', 0) or 0)
+            interval = int(getattr(p, 'farmer_summary_interval_sec', 3600) or 3600)
+            if interval <= 0:
+                interval = 3600
+            if ts - last_ts < interval:
+                continue
+            raw_stats = getattr(p, 'farmer_session_stats', '{}')
+            stats = _json_load_safe(raw_stats, {})
+            if not isinstance(stats, dict) or not stats:
+                continue
+            nonzero = False
+            for vv in stats.values():
+                try:
+                    if int(vv or 0) != 0:
+                        nonzero = True
+                        break
+                except Exception:
+                    continue
+            if not nonzero:
+                continue
+            out.append({
+                'user_id': int(p.user_id),
+                'summary_interval_sec': interval,
+                'summary_last_ts': last_ts,
+                'stats': stats,
+            })
+        return out
+    finally:
+        dbs.close()
+
+
+def clear_farmer_stats_after_summary(user_id: int, now_ts: int | None = None) -> bool:
+    ts = int(now_ts or time.time())
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            return False
+        _farmer_reset_daily_if_needed(player, ts)
+        player.farmer_session_stats = '{}'
+        try:
+            player.farmer_summary_last_ts = ts
+        except Exception:
+            pass
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        dbs.close()
+
+
 def water_bed(user_id: int, bed_index: int) -> dict:
     """Полив грядки. Возвращает dict: {ok, reason?, next_water_in?, bed_state?}
     Возможные reason: no_such_bed, not_growing, too_early_to_water
@@ -2107,24 +3010,10 @@ def water_bed(user_id: int, bed_index: int) -> dict:
             .with_for_update(read=False)
             .first()
         )
-        if not bed:
-            return {"ok": False, "reason": "no_such_bed"}
-        if bed.state != 'growing' or not bed.seed_type:
-            # Попробуем автообновить, если уже готово
-            _update_bed_ready_if_due(dbs, bed)
-            return {"ok": False, "reason": "not_growing", "bed_state": bed.state}
-        # Проверка интервала полива
-        now_ts = int(time.time())
-        last = int(bed.last_watered_at or 0)
-        interval = int(bed.seed_type.water_interval_sec or 0)
-        if last and interval and (now_ts - last) < interval:
-            return {"ok": False, "reason": "too_early_to_water", "next_water_in": interval - (now_ts - last), "bed_state": bed.state}
-        bed.last_watered_at = now_ts
-        bed.water_count = int(bed.water_count or 0) + 1
-        # Обновим готовность, если срок истёк
-        _update_bed_ready_if_due(dbs, bed)
-        dbs.commit()
-        return {"ok": True, "bed_state": bed.state, "water_interval_sec": interval}
+        res = _water_bed_core(dbs, bed)
+        if res.get('ok'):
+            dbs.commit()
+        return res
     except Exception:
         try:
             dbs.rollback()
@@ -2336,6 +3225,21 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
                     dbs.delete(bf)
         except Exception:
             pass
+        rating_added = 3
+        new_rating = None
+        try:
+            player = (
+                dbs.query(Player)
+                .filter(Player.user_id == int(user_id))
+                .with_for_update(read=False)
+                .first()
+            )
+            if player:
+                current_rating = int(getattr(player, 'rating', 0) or 0)
+                new_rating = min(1000, current_rating + int(rating_added))
+                player.rating = int(new_rating)
+        except Exception:
+            new_rating = None
         # Получаем название напитка для уведомлений
         drink_name = "Неизвестный"
         if st.drink and st.drink.name:
@@ -2349,11 +3253,13 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
             "drink_name": drink_name,
             "items_added": items_added,
             "rarity_counts": rarity_counts,
+            "rating_added": int(rating_added),
+            "new_rating": int(new_rating) if new_rating is not None else None,
             "effects": {
                 "fertilizers": fertilizer_names,  # Keep for backward compatibility if needed
                 "fertilizer_names": fertilizer_names,
                 "fertilizer_active": fert_applied,
-                "yield_multiplier": yield_multiplier,  # Note: variable name in code is yield_mult
+                "yield_multiplier": yield_mult,
                 "status_effect": se,
                 "water_count": wc,
             },
@@ -2488,9 +3394,15 @@ def topup_selyuk_balance_from_player(user_id: int, selyuk_type: str, amount: int
 def try_farmer_autowater(user_id: int, bed_index: int) -> dict:
     dbs = SessionLocal()
     try:
-        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
         if not player:
             return {"ok": False, "reason": "no_player"}
+
+        now_ts = int(time.time())
+        _farmer_reset_daily_if_needed(player, now_ts)
+
+        if not bool(getattr(player, 'farmer_auto_water', True)):
+            return {"ok": False, "reason": "disabled_by_settings"}
 
         if not bool(getattr(player, 'remind_plantation', False)):
             return {"ok": False, "reason": "remind_disabled"}
@@ -2515,40 +3427,25 @@ def try_farmer_autowater(user_id: int, bed_index: int) -> dict:
         if balance < cost:
             return {"ok": False, "reason": "not_enough_balance"}
 
+        min_keep = int(getattr(player, 'farmer_min_balance', 0) or 0)
+        if min_keep > 0 and (balance - cost) < min_keep:
+            return {"ok": False, "reason": "min_balance_guard", "min_balance": min_keep}
+
+        daily_limit = int(getattr(player, 'farmer_daily_limit', 0) or 0)
+        daily_spent = int(getattr(player, 'farmer_daily_spent', 0) or 0)
+        if daily_limit > 0 and (daily_spent + cost) > daily_limit:
+            return {"ok": False, "reason": "daily_limit_reached", "daily_limit": daily_limit, "daily_spent": daily_spent}
+
         bed = (
             dbs.query(PlantationBed)
+            .options(joinedload(PlantationBed.seed_type))
             .filter(PlantationBed.owner_id == int(user_id), PlantationBed.bed_index == int(bed_index))
             .with_for_update(read=False)
             .first()
         )
-        if not bed:
-            return {"ok": False, "reason": "no_bed"}
-        
-        # Проверяем, нужно ли поливать
-        seed_type = bed.seed_type
-        if not seed_type:
-             return {"ok": False, "reason": "no_seed"}
-
-        # Логика проверки времени полива (аналогично water_bed, но упрощенно)
-        # Если state != growing -> не поливаем
-        if str(getattr(bed, 'state', '')) != 'growing':
-             return {"ok": False, "reason": "not_growing"}
-             
-        now_ts = int(time.time())
-        water_interval = int(seed_type.water_interval_sec or 0)
-        last_water = int(bed.last_watered_at or 0)
-        planted_at = int(bed.planted_at or 0)
-        
-        # Если ни разу не поливали (last_water == 0), разрешаем полив сразу
-        if last_water > 0:
-             reference_time = last_water
-             if now_ts - reference_time < water_interval:
-                  return {"ok": False, "reason": "too_early"}
-        # else: last_water == 0 -> allow immediate water
-
-        bed.last_watered_at = now_ts
-        bed.water_count = int(bed.water_count or 0) + 1
-        _update_bed_ready_if_due(dbs, bed)
+        res = _water_bed_core(dbs, bed)
+        if not res.get('ok'):
+            return res
 
         selyuk.balance_septims = balance - cost
         try:
@@ -2556,8 +3453,20 @@ def try_farmer_autowater(user_id: int, bed_index: int) -> dict:
         except Exception:
             pass
 
+        try:
+            player.farmer_daily_spent = int(getattr(player, 'farmer_daily_spent', 0) or 0) + cost
+        except Exception:
+            pass
+        try:
+            stats = _json_load_safe(getattr(player, 'farmer_session_stats', '{}'), {})
+            stats = _farmer_stats_inc_inplace(stats, {'water_count': 1, 'water_spent': cost})
+            player.farmer_session_stats = _json_dump_safe(stats)
+        except Exception:
+            pass
+
         dbs.commit()
-        return {"ok": True, "bed_state": bed.state, "water_interval_sec": water_interval, "cost": cost}
+        res['cost'] = cost
+        return res
     except Exception:
         try:
             dbs.rollback()
@@ -2611,6 +3520,21 @@ def upgrade_selyuk_farmer(user_id: int) -> dict:
             player.selyuk_fragments = fragments - cost_fragments
             selyuk.level = 3
             new_lvl = 3
+        elif current_level == 3:
+            cost_coins = 250000
+            cost_fragments = 25
+
+            if int(player.coins or 0) < cost_coins:
+                return {"ok": False, "reason": "not_enough_coins", "need": cost_coins, "have": int(player.coins or 0)}
+
+            fragments = int(getattr(player, 'selyuk_fragments', 0) or 0)
+            if fragments < cost_fragments:
+                return {"ok": False, "reason": "not_enough_fragments", "need": cost_fragments, "have": fragments}
+
+            player.coins = int(player.coins or 0) - cost_coins
+            player.selyuk_fragments = fragments - cost_fragments
+            selyuk.level = 4
+            new_lvl = 4
         else:
             return {"ok": False, "reason": "max_level"}
 
@@ -2638,6 +3562,11 @@ def try_farmer_auto_harvest(user_id: int) -> dict:
     """
     dbs = SessionLocal()
     try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+        if not bool(getattr(player, 'farmer_auto_harvest', True)):
+            return {"ok": False, "reason": "disabled_by_settings"}
         # 1. Проверяем селюка
         selyuk = (
             dbs.query(Selyuk)
@@ -2685,6 +3614,16 @@ def try_farmer_auto_harvest(user_id: int) -> dict:
                 'yield': res.get('yield'),
                 'items_added': res.get('items_added')
             })
+
+    try:
+        total_items = sum(int(x.get('items_added') or 0) for x in harvested_items)
+    except Exception:
+        total_items = 0
+    if harvested_items:
+        try:
+            add_farmer_stats(int(user_id), {'harvest_count': len(harvested_items), 'harvest_items': total_items})
+        except Exception:
+            pass
             
     return {"ok": True, "harvested": harvested_items}
 
@@ -2696,6 +3635,12 @@ def try_farmer_auto_plant(user_id: int) -> dict:
     """
     dbs = SessionLocal()
     try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not player:
+            return {"ok": False, "reason": "no_player"}
+        if not bool(getattr(player, 'farmer_auto_plant', True)):
+            return {"ok": False, "reason": "disabled_by_settings"}
+
         # 1. Проверяем селюка
         selyuk = (
             dbs.query(Selyuk)
@@ -2724,25 +3669,66 @@ def try_farmer_auto_plant(user_id: int) -> dict:
             
         planted_items = []
         
-        # 3. Ищем семена в инвентаре (SeedInventory)
         inventory_items = (
             dbs.query(SeedInventory)
+            .options(joinedload(SeedInventory.seed_type))
             .filter(SeedInventory.player_id == int(user_id), SeedInventory.quantity > 0)
-            .order_by(SeedInventory.quantity.desc())
             .all()
         )
-        
+
         if not inventory_items:
-             return {"ok": True, "planted": [], "reason": "no_seeds"}
-             
-        # Преобразуем в список для удобства работы
+            return {"ok": True, "planted": [], "reason": "no_seeds"}
+
+        seed_mode = str(getattr(player, 'farmer_seed_mode', 'any') or 'any')
+        allow_ids = _json_load_safe(getattr(player, 'farmer_seed_ids', '[]'), [])
+        prio_ids = _json_load_safe(getattr(player, 'farmer_seed_priority', '[]'), [])
+        try:
+            allow_ids = [int(x) for x in allow_ids]
+        except Exception:
+            allow_ids = []
+        try:
+            prio_ids = [int(x) for x in prio_ids]
+        except Exception:
+            prio_ids = []
+
+        inv_map = {}
+        for it in inventory_items:
+            try:
+                sid = int(getattr(it, 'seed_type_id', 0) or 0)
+            except Exception:
+                continue
+            if sid <= 0:
+                continue
+            inv_map[sid] = it
+
+        def _is_allowed(seed_id: int) -> bool:
+            if seed_mode == 'whitelist':
+                return seed_id in set(allow_ids)
+            if seed_mode == 'blacklist':
+                return seed_id not in set(allow_ids)
+            return True
+
+        ordered_ids = []
+        for sid in prio_ids:
+            if sid in inv_map and _is_allowed(sid):
+                ordered_ids.append(sid)
+        rest = [sid for sid in inv_map.keys() if sid not in set(ordered_ids) and _is_allowed(sid)]
+        rest.sort(key=lambda x: int(getattr(inv_map[x], 'quantity', 0) or 0), reverse=True)
+        ordered_ids.extend(rest)
+        if not ordered_ids:
+            return {"ok": True, "planted": [], "reason": "no_allowed_seeds"}
+
         current_seed_idx = 0
         
         for bed in empty_beds:
-            if current_seed_idx >= len(inventory_items):
+            if current_seed_idx >= len(ordered_ids):
                 break # Кончились типы семян
                 
-            seed_item = inventory_items[current_seed_idx]
+            seed_id = int(ordered_ids[current_seed_idx])
+            seed_item = inv_map.get(seed_id)
+            if not seed_item:
+                current_seed_idx += 1
+                continue
             
             # Списываем семя
             seed_item.quantity -= 1
@@ -2752,8 +3738,8 @@ def try_farmer_auto_plant(user_id: int) -> dict:
                 # Для надежности просто уменьшаем. Если станет 0, потом почистится или будет игнорироваться.
                 pass
                 
-            if seed_item.quantity == 0:
-                 current_seed_idx += 1
+            if int(seed_item.quantity or 0) <= 0:
+                current_seed_idx += 1
             
             # Обновляем грядку
             bed.state = 'growing'
@@ -2768,6 +3754,11 @@ def try_farmer_auto_plant(user_id: int) -> dict:
             })
             
         dbs.commit()
+        if planted_items:
+            try:
+                add_farmer_stats(int(user_id), {'plant_count': len(planted_items)})
+            except Exception:
+                pass
         return {"ok": True, "planted": planted_items}
         
     except Exception as e:
@@ -2807,12 +3798,19 @@ def get_auto_search_daily_limit(user_id: int) -> int:
         player = dbs.query(Player).filter(Player.user_id == user_id).first()
         if not player:
             return int(AUTO_SEARCH_DAILY_LIMIT)
-        
-        base_limit = int(AUTO_SEARCH_DAILY_LIMIT)
-        
-        # Проверяем VIP+ статус (удваивает базовый лимит)
+
+        base_limit = int(get_setting_int('auto_search_daily_limit_base', int(AUTO_SEARCH_DAILY_LIMIT)))
+        vip_mult = float(get_setting_float('auto_search_vip_daily_mult', 1.0))
+        vip_plus_mult = float(get_setting_float('auto_search_vip_plus_daily_mult', 2.0))
+
+        # Множители лимита (VIP/VIP+)
         if is_vip_plus(user_id):
-            base_limit *= 2
+            base_limit = int(round(base_limit * vip_plus_mult))
+        elif is_vip(user_id):
+            base_limit = int(round(base_limit * vip_mult))
+
+        if base_limit < 0:
+            base_limit = 0
         
         boost_count = int(getattr(player, 'auto_search_boost_count', 0) or 0)
         boost_until = int(getattr(player, 'auto_search_boost_until', 0) or 0)
@@ -3005,7 +4003,7 @@ def purchase_generic_bonus(user_id: int, cost_coins: int, kind: str, extra: str 
         # Блокируем запись игрока
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -3069,7 +4067,7 @@ def purchase_bonus_with_stock(
         # Блокируем игрока
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -3155,7 +4153,7 @@ def purchase_tg_premium(user_id: int, cost_coins: int, duration_seconds: int) ->
         # Блокируем запись игрока и склад TG Premium
         player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
@@ -3232,13 +4230,621 @@ def get_player_by_username(username: str) -> Player | None:
     finally:
         db.close()
 
+
+def find_player_by_identifier(identifier, partial_limit: int = 5) -> dict:
+    dbs = SessionLocal()
+    try:
+        if identifier is None:
+            return {"ok": False, "reason": "invalid"}
+
+        if isinstance(identifier, int):
+            player = dbs.query(Player).filter(Player.user_id == int(identifier)).first()
+            return {"ok": True, "player": player} if player else {"ok": False, "reason": "not_found"}
+
+        raw = str(identifier).strip()
+        if not raw:
+            return {"ok": False, "reason": "invalid"}
+
+        uname = raw
+        if "t.me/" in uname.lower():
+            uname = uname.split("/", 3)[-1]
+        if uname.startswith("@"): 
+            uname = uname[1:]
+        uname = uname.strip()
+        if not uname:
+            return {"ok": False, "reason": "invalid"}
+
+        # ВАЖНО: ID не должен "перебивать" ник с цифрами (например nick123).
+        # Поэтому распознаём ID только когда ввод явно является ID:
+        # - чистые цифры
+        # - или явный префикс id:/id#/id (с пробелами)
+        uid = None
+        try:
+            if re.fullmatch(r"\d{3,}", uname):
+                uid = int(uname)
+            else:
+                m = re.fullmatch(r"(?i)id\s*[:#]?\s*(\d{3,})", raw.strip())
+                if m:
+                    uid = int(m.group(1))
+        except Exception:
+            uid = None
+
+        if uid is not None:
+            player = dbs.query(Player).filter(Player.user_id == int(uid)).first()
+            return {"ok": True, "player": player} if player else {"ok": False, "reason": "not_found"}
+
+        if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname):
+            player = (
+                dbs.query(Player)
+                .filter(Player.username.isnot(None))
+                .filter(func.lower(Player.username) == uname.lower())
+                .first()
+            )
+            if player:
+                return {"ok": True, "player": player}
+
+        player = (
+            dbs.query(Player)
+            .filter(Player.display_name.isnot(None))
+            .filter(func.lower(Player.display_name) == uname.lower())
+            .first()
+        )
+        if player:
+            return {"ok": True, "player": player}
+
+        candidates = (
+            dbs.query(Player)
+            .filter(Player.username.isnot(None))
+            .filter(func.lower(Player.username).contains(uname.lower()))
+            .order_by(Player.user_id.asc())
+            .limit(int(partial_limit) + 1)
+            .all()
+        )
+
+        if not candidates:
+            candidates = (
+                dbs.query(Player)
+                .filter(Player.display_name.isnot(None))
+                .filter(func.lower(Player.display_name).contains(uname.lower()))
+                .order_by(Player.user_id.asc())
+                .limit(int(partial_limit) + 1)
+                .all()
+            )
+
+        if not candidates:
+            return {"ok": False, "reason": "not_found"}
+        if len(candidates) == 1:
+            return {"ok": True, "player": candidates[0]}
+
+        out = []
+        for p in candidates[: int(partial_limit)]:
+            out.append({"user_id": int(p.user_id), "username": (p.username or getattr(p, 'display_name', None) or str(p.user_id))})
+        return {"ok": False, "reason": "multiple", "candidates": out}
+    except Exception:
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+FRIEND_COINS_DAILY_LIMIT = 10_000
+FRIEND_FRAGMENTS_DAILY_LIMIT = 5
+FRIEND_RATING_48H_LIMIT = 3
+FRIEND_VIP_GIFT_COOLDOWN_SEC = 14 * 24 * 60 * 60
+
+
+def search_players_by_username(query: str, page: int = 0, per_page: int = 5) -> dict:
+    """Ищет игроков по username (частичное совпадение, без учета регистра) с пагинацией."""
+    dbs = SessionLocal()
+    try:
+        q = (str(query or '').strip().lstrip('@'))
+        if not q:
+            return {"ok": False, "reason": "empty"}
+
+        page = max(0, int(page or 0))
+        per_page = max(1, min(10, int(per_page or 5)))
+
+        base = (
+            dbs.query(Player)
+            .filter(Player.username.isnot(None))
+            .filter(func.lower(Player.username).contains(q.lower()))
+        )
+
+        total = int(base.count() or 0)
+        rows = (
+            base.order_by(func.lower(Player.username).asc(), Player.user_id.asc())
+            .offset(page * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        items = []
+        for p in rows:
+            items.append({"user_id": int(p.user_id), "username": getattr(p, 'username', None)})
+        return {"ok": True, "items": items, "total": total, "page": page, "per_page": per_page, "query": q}
+    finally:
+        dbs.close()
+
+
+def _ensure_player_row(dbs, user_id: int) -> Player:
+    player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+    if not player:
+        player = Player(user_id=int(user_id), username=None)
+        dbs.add(player)
+        dbs.commit()
+        dbs.refresh(player)
+    return player
+
+
+def are_friends(user_id: int, other_id: int) -> bool:
+    dbs = SessionLocal()
+    try:
+        if int(user_id) == int(other_id):
+            return False
+        row = (
+            dbs.query(Friendship)
+            .filter(Friendship.user_id == int(user_id))
+            .filter(Friendship.friend_id == int(other_id))
+            .first()
+        )
+        return bool(row)
+    finally:
+        dbs.close()
+
+
+def get_pending_friend_requests_count(user_id: int) -> int:
+    """Количество входящих заявок в друзья (pending)."""
+    dbs = SessionLocal()
+    try:
+        return int(
+            dbs.query(func.count(FriendRequest.id))
+            .filter(FriendRequest.to_user_id == int(user_id))
+            .filter(FriendRequest.status == 'pending')
+            .scalar()
+            or 0
+        )
+    finally:
+        dbs.close()
+
+
+def list_pending_incoming_friend_requests(user_id: int, page: int = 0, per_page: int = 6) -> dict:
+    dbs = SessionLocal()
+    try:
+        page = max(0, int(page or 0))
+        per_page = max(1, min(10, int(per_page or 6)))
+
+        base = (
+            dbs.query(FriendRequest)
+            .options(joinedload(FriendRequest.from_user))
+            .filter(FriendRequest.to_user_id == int(user_id))
+            .filter(FriendRequest.status == 'pending')
+        )
+        total = int(base.count() or 0)
+        rows = (
+            base.order_by(FriendRequest.created_at.desc())
+            .offset(page * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        items = []
+        for r in rows:
+            p = getattr(r, 'from_user', None)
+            items.append(
+                {
+                    "request_id": int(r.id),
+                    "from_user_id": int(r.from_user_id),
+                    "from_username": getattr(p, 'username', None) if p else None,
+                    "created_at": int(getattr(r, 'created_at', 0) or 0),
+                }
+            )
+        return {"ok": True, "items": items, "total": total, "page": page, "per_page": per_page}
+    finally:
+        dbs.close()
+
+
+def list_friends(user_id: int, page: int = 0, per_page: int = 8) -> dict:
+    dbs = SessionLocal()
+    try:
+        page = max(0, int(page or 0))
+        per_page = max(1, min(12, int(per_page or 8)))
+
+        base = (
+            dbs.query(Friendship)
+            .options(joinedload(Friendship.friend))
+            .filter(Friendship.user_id == int(user_id))
+        )
+        total = int(base.count() or 0)
+        rows = (
+            base.order_by(Friendship.created_at.desc())
+            .offset(page * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        items = []
+        for rel in rows:
+            p = getattr(rel, 'friend', None)
+            items.append(
+                {
+                    "user_id": int(getattr(p, 'user_id', rel.friend_id) or rel.friend_id),
+                    "username": getattr(p, 'username', None) if p else None,
+                }
+            )
+        return {"ok": True, "items": items, "total": total, "page": page, "per_page": per_page}
+    finally:
+        dbs.close()
+
+
+def send_friend_request(from_user_id: int, to_user_id: int) -> dict:
+    """Создаёт заявку в друзья. Если есть встречная заявка (pending), автоматически принимает."""
+    dbs = SessionLocal()
+    try:
+        from_user_id = int(from_user_id)
+        to_user_id = int(to_user_id)
+        if from_user_id == to_user_id:
+            return {"ok": False, "reason": "self"}
+
+        _ensure_player_row(dbs, from_user_id)
+        _ensure_player_row(dbs, to_user_id)
+
+        if are_friends(from_user_id, to_user_id):
+            return {"ok": False, "reason": "already_friends"}
+
+        existing_out = (
+            dbs.query(FriendRequest)
+            .filter(FriendRequest.from_user_id == from_user_id)
+            .filter(FriendRequest.to_user_id == to_user_id)
+            .filter(FriendRequest.status == 'pending')
+            .first()
+        )
+        if existing_out:
+            return {"ok": False, "reason": "already_sent", "request_id": int(existing_out.id)}
+
+        existing_in = (
+            dbs.query(FriendRequest)
+            .filter(FriendRequest.from_user_id == to_user_id)
+            .filter(FriendRequest.to_user_id == from_user_id)
+            .filter(FriendRequest.status == 'pending')
+            .with_for_update(read=False)
+            .first()
+        )
+        if existing_in:
+            existing_in.status = 'accepted'
+            existing_in.updated_at = int(time.time())
+            _create_friendship_pair(dbs, from_user_id, to_user_id)
+            dbs.commit()
+            return {"ok": True, "auto_accepted": True, "request_id": int(existing_in.id)}
+
+        req = FriendRequest(from_user_id=from_user_id, to_user_id=to_user_id, status='pending')
+        dbs.add(req)
+        dbs.commit()
+        dbs.refresh(req)
+        return {"ok": True, "request_id": int(req.id)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def _create_friendship_pair(dbs, a: int, b: int) -> None:
+    now_ts = int(time.time())
+    for u, f in ((a, b), (b, a)):
+        exists = (
+            dbs.query(Friendship)
+            .filter(Friendship.user_id == int(u))
+            .filter(Friendship.friend_id == int(f))
+            .first()
+        )
+        if not exists:
+            dbs.add(Friendship(user_id=int(u), friend_id=int(f), created_at=now_ts))
+
+
+def accept_friend_request(user_id: int, request_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        r = (
+            dbs.query(FriendRequest)
+            .filter(FriendRequest.id == int(request_id))
+            .with_for_update(read=False)
+            .first()
+        )
+        if not r:
+            return {"ok": False, "reason": "not_found"}
+        if int(r.to_user_id) != int(user_id):
+            return {"ok": False, "reason": "not_allowed"}
+        if str(r.status) != 'pending':
+            return {"ok": False, "reason": "not_pending"}
+        r.status = 'accepted'
+        r.updated_at = int(time.time())
+        _create_friendship_pair(dbs, int(r.from_user_id), int(r.to_user_id))
+
+        dup = (
+            dbs.query(FriendRequest)
+            .filter(
+                or_(
+                    and_(FriendRequest.from_user_id == int(r.from_user_id), FriendRequest.to_user_id == int(r.to_user_id)),
+                    and_(FriendRequest.from_user_id == int(r.to_user_id), FriendRequest.to_user_id == int(r.from_user_id)),
+                )
+            )
+            .filter(FriendRequest.status == 'pending')
+            .all()
+        )
+        for d in dup:
+            if int(d.id) != int(r.id):
+                d.status = 'cancelled'
+                d.updated_at = int(time.time())
+
+        dbs.commit()
+        return {"ok": True, "from_user_id": int(r.from_user_id), "to_user_id": int(r.to_user_id)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def reject_friend_request(user_id: int, request_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        r = (
+            dbs.query(FriendRequest)
+            .filter(FriendRequest.id == int(request_id))
+            .with_for_update(read=False)
+            .first()
+        )
+        if not r:
+            return {"ok": False, "reason": "not_found"}
+        if int(r.to_user_id) != int(user_id):
+            return {"ok": False, "reason": "not_allowed"}
+        if str(r.status) != 'pending':
+            return {"ok": False, "reason": "not_pending"}
+        r.status = 'rejected'
+        r.updated_at = int(time.time())
+        dbs.commit()
+        return {"ok": True, "from_user_id": int(r.from_user_id)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def cancel_friend_request(user_id: int, request_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        r = (
+            dbs.query(FriendRequest)
+            .filter(FriendRequest.id == int(request_id))
+            .with_for_update(read=False)
+            .first()
+        )
+        if not r:
+            return {"ok": False, "reason": "not_found"}
+        if int(r.from_user_id) != int(user_id):
+            return {"ok": False, "reason": "not_allowed"}
+        if str(r.status) != 'pending':
+            return {"ok": False, "reason": "not_pending"}
+        r.status = 'cancelled'
+        r.updated_at = int(time.time())
+        dbs.commit()
+        return {"ok": True, "to_user_id": int(r.to_user_id)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def _sum_transfers_amount(dbs, from_user_id: int, kind: str, since_ts: int) -> int:
+    return int(
+        dbs.query(func.coalesce(func.sum(FriendTransferLog.amount), 0))
+        .filter(FriendTransferLog.from_user_id == int(from_user_id))
+        .filter(FriendTransferLog.kind == str(kind))
+        .filter(FriendTransferLog.created_at >= int(since_ts))
+        .scalar()
+        or 0
+    )
+
+
+def _count_transfers(dbs, from_user_id: int, kind: str, since_ts: int) -> int:
+    return int(
+        dbs.query(func.count(FriendTransferLog.id))
+        .filter(FriendTransferLog.from_user_id == int(from_user_id))
+        .filter(FriendTransferLog.kind == str(kind))
+        .filter(FriendTransferLog.created_at >= int(since_ts))
+        .scalar()
+        or 0
+    )
+
+
+def transfer_coins_to_friend(from_user_id: int, to_user_id: int, amount: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        from_user_id = int(from_user_id)
+        to_user_id = int(to_user_id)
+        amount = int(amount)
+        if amount <= 0:
+            return {"ok": False, "reason": "invalid_amount"}
+        if not are_friends(from_user_id, to_user_id):
+            return {"ok": False, "reason": "not_friends"}
+
+        now_ts = int(time.time())
+        used = _sum_transfers_amount(dbs, from_user_id, 'coins', now_ts - 86400)
+        remaining = max(0, int(FRIEND_COINS_DAILY_LIMIT) - int(used))
+        if amount > remaining:
+            return {"ok": False, "reason": "limit_reached", "remaining": remaining}
+
+        p_from = dbs.query(Player).filter(Player.user_id == from_user_id).with_for_update(read=False).first()
+        p_to = dbs.query(Player).filter(Player.user_id == to_user_id).with_for_update(read=False).first()
+        if not p_from or not p_to:
+            return {"ok": False, "reason": "player_not_found"}
+
+        have = int(getattr(p_from, 'coins', 0) or 0)
+        if have < amount:
+            return {"ok": False, "reason": "not_enough_coins", "have": have}
+
+        p_from.coins = have - amount
+        p_to.coins = int(getattr(p_to, 'coins', 0) or 0) + amount
+        dbs.add(FriendTransferLog(from_user_id=from_user_id, to_user_id=to_user_id, kind='coins', amount=amount))
+        dbs.commit()
+        return {"ok": True, "coins_left": int(p_from.coins), "remaining_today": int(remaining - amount)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def transfer_fragments_to_friend(from_user_id: int, to_user_id: int, amount: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        from_user_id = int(from_user_id)
+        to_user_id = int(to_user_id)
+        amount = int(amount)
+        if amount <= 0:
+            return {"ok": False, "reason": "invalid_amount"}
+        if not are_friends(from_user_id, to_user_id):
+            return {"ok": False, "reason": "not_friends"}
+
+        now_ts = int(time.time())
+        used = _sum_transfers_amount(dbs, from_user_id, 'fragments', now_ts - 86400)
+        remaining = max(0, int(FRIEND_FRAGMENTS_DAILY_LIMIT) - int(used))
+        if amount > remaining:
+            return {"ok": False, "reason": "limit_reached", "remaining": remaining}
+
+        p_from = dbs.query(Player).filter(Player.user_id == from_user_id).with_for_update(read=False).first()
+        p_to = dbs.query(Player).filter(Player.user_id == to_user_id).with_for_update(read=False).first()
+        if not p_from or not p_to:
+            return {"ok": False, "reason": "player_not_found"}
+
+        have = int(getattr(p_from, 'selyuk_fragments', 0) or 0)
+        if have < amount:
+            return {"ok": False, "reason": "not_enough_fragments", "have": have}
+
+        p_from.selyuk_fragments = have - amount
+        p_to.selyuk_fragments = int(getattr(p_to, 'selyuk_fragments', 0) or 0) + amount
+        dbs.add(FriendTransferLog(from_user_id=from_user_id, to_user_id=to_user_id, kind='fragments', amount=amount))
+        dbs.commit()
+        return {"ok": True, "fragments_left": int(p_from.selyuk_fragments), "remaining_today": int(remaining - amount)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def gift_vip_7d_to_friend(from_user_id: int, to_user_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        from_user_id = int(from_user_id)
+        to_user_id = int(to_user_id)
+        if from_user_id == to_user_id:
+            return {"ok": False, "reason": "self"}
+        if not are_friends(from_user_id, to_user_id):
+            return {"ok": False, "reason": "not_friends"}
+
+        if not is_vip(from_user_id):
+            return {"ok": False, "reason": "sender_not_vip"}
+        if is_vip_plus(from_user_id):
+            return {"ok": False, "reason": "sender_is_vip_plus"}
+
+        now_ts = int(time.time())
+        sent_recent = _count_transfers(dbs, from_user_id, 'vip_7d', now_ts - int(FRIEND_VIP_GIFT_COOLDOWN_SEC))
+        if sent_recent > 0:
+            return {"ok": False, "reason": "cooldown"}
+
+        p_to = dbs.query(Player).filter(Player.user_id == to_user_id).with_for_update(read=False).first()
+        if not p_to:
+            return {"ok": False, "reason": "player_not_found"}
+
+        cur = int(getattr(p_to, 'vip_until', 0) or 0)
+        start_ts = cur if cur > now_ts else now_ts
+        new_until = start_ts + (7 * 24 * 60 * 60)
+        p_to.vip_until = int(new_until)
+
+        dbs.add(FriendTransferLog(from_user_id=from_user_id, to_user_id=to_user_id, kind='vip_7d', amount=1))
+        dbs.commit()
+        return {"ok": True, "vip_until": int(new_until)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def transfer_rating_to_friend(from_user_id: int, to_user_id: int, amount: int, max_rating: int = 1000) -> dict:
+    dbs = SessionLocal()
+    try:
+        from_user_id = int(from_user_id)
+        to_user_id = int(to_user_id)
+        amount = int(amount)
+        if amount <= 0:
+            return {"ok": False, "reason": "invalid_amount"}
+        if not are_friends(from_user_id, to_user_id):
+            return {"ok": False, "reason": "not_friends"}
+
+        now_ts = int(time.time())
+        used = _sum_transfers_amount(dbs, from_user_id, 'rating', now_ts - (48 * 60 * 60))
+        remaining = max(0, int(FRIEND_RATING_48H_LIMIT) - int(used))
+        if amount > remaining:
+            return {"ok": False, "reason": "limit_reached", "remaining": remaining}
+
+        p_from = dbs.query(Player).filter(Player.user_id == from_user_id).with_for_update(read=False).first()
+        p_to = dbs.query(Player).filter(Player.user_id == to_user_id).with_for_update(read=False).first()
+        if not p_from or not p_to:
+            return {"ok": False, "reason": "player_not_found"}
+
+        have = int(getattr(p_from, 'rating', 0) or 0)
+        if have < amount:
+            return {"ok": False, "reason": "not_enough_rating", "have": have}
+
+        recv = int(getattr(p_to, 'rating', 0) or 0)
+        if recv + amount > int(max_rating):
+            return {"ok": False, "reason": "receiver_max_rating"}
+
+        p_from.rating = max(0, have - amount)
+        p_to.rating = max(0, min(int(max_rating), recv + amount))
+        dbs.add(FriendTransferLog(from_user_id=from_user_id, to_user_id=to_user_id, kind='rating', amount=amount))
+        dbs.commit()
+        return {"ok": True, "rating_left": int(p_from.rating), "remaining_48h": int(remaining - amount)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
 def increment_coins(user_id: int, amount: int) -> int | None:
     """Увеличивает баланс монет игрока на amount и возвращает новый баланс. Создаёт игрока при отсутствии."""
     db = SessionLocal()
     try:
         player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -3263,7 +4869,7 @@ def decrement_coins(user_id: int, amount: int) -> dict:
     try:
         player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
-            player = Player(user_id=user_id, username=str(user_id), coins=0)
+            player = Player(user_id=user_id, username=None, coins=0)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -3349,6 +4955,46 @@ def add_drink_to_inventory(user_id, drink_id, rarity):
             new_item = InventoryItem(player_id=user_id, drink_id=drink_id, rarity=rarity, quantity=1)
             db.add(new_item)
         db.commit()
+    finally:
+        db.close()
+
+
+def add_custom_drink_to_inventory(user_id: int, drink_id: int, rarity: str, quantity: int = 1):
+    """Добавляет в инвентарь энергетик с произвольным drink_id и редкостью.
+
+    Использование:
+    - Подходит для эксклюзивных напитков (достижения/события), где редкость может быть уникальной.
+    - Если редкость отсутствует в RECEIVER_PRICES, такой предмет нельзя будет продать через Приёмник.
+    """
+    if quantity is None or int(quantity) <= 0:
+        return False
+
+    db = SessionLocal()
+    try:
+        item = (
+            db.query(InventoryItem)
+            .filter_by(player_id=int(user_id), drink_id=int(drink_id), rarity=str(rarity))
+            .first()
+        )
+        if item:
+            item.quantity = int(item.quantity or 0) + int(quantity)
+        else:
+            new_item = InventoryItem(
+                player_id=int(user_id),
+                drink_id=int(drink_id),
+                rarity=str(rarity),
+                quantity=int(quantity),
+            )
+            db.add(new_item)
+
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
     finally:
         db.close()
 
@@ -3501,6 +5147,115 @@ def update_player(user_id, **kwargs):
     finally:
         db.close()
 
+def clear_favorite_drink_slot(user_id: int, slot: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        slot = int(slot or 0)
+        if slot not in (1, 2, 3):
+            return {"ok": False, "reason": "bad_slot"}
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=None)
+            dbs.add(player)
+            dbs.commit()
+            dbs.refresh(player)
+        col = f"favorite_drink_{slot}"
+        try:
+            setattr(player, col, 0)
+        except Exception:
+            return {"ok": False, "reason": "unsupported"}
+        dbs.commit()
+        return {"ok": True}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+def set_favorite_drink_slot(user_id: int, slot: int, inventory_item_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        slot = int(slot or 0)
+        if slot not in (1, 2, 3):
+            return {"ok": False, "reason": "bad_slot"}
+        item_id = int(inventory_item_id or 0)
+        if item_id <= 0:
+            return {"ok": False, "reason": "bad_item"}
+        item = dbs.query(InventoryItem).filter(InventoryItem.id == item_id).first()
+        if not item:
+            return {"ok": False, "reason": "not_found"}
+        if int(item.player_id) != int(user_id):
+            return {"ok": False, "reason": "forbidden"}
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=None)
+            dbs.add(player)
+            dbs.commit()
+            dbs.refresh(player)
+        cols = ("favorite_drink_1", "favorite_drink_2", "favorite_drink_3")
+        for c in cols:
+            try:
+                if int(getattr(player, c, 0) or 0) == item_id:
+                    setattr(player, c, 0)
+            except Exception:
+                pass
+        col = f"favorite_drink_{slot}"
+        try:
+            setattr(player, col, item_id)
+        except Exception:
+            return {"ok": False, "reason": "unsupported"}
+        dbs.commit()
+        return {"ok": True}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def get_player_favorite_drink_ids(user_id: int) -> set[int]:
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not player:
+            return set()
+
+        item_ids: list[int] = []
+        for slot in (1, 2, 3):
+            try:
+                item_id = int(getattr(player, f"favorite_drink_{slot}", 0) or 0)
+            except Exception:
+                item_id = 0
+            if item_id > 0:
+                item_ids.append(item_id)
+
+        if not item_ids:
+            return set()
+
+        items = (
+            dbs.query(InventoryItem)
+            .filter(InventoryItem.player_id == int(user_id))
+            .filter(InventoryItem.id.in_(item_ids))
+            .all()
+        )
+        drink_ids: set[int] = set()
+        for it in items:
+            try:
+                did = int(getattr(it, 'drink_id', 0) or 0)
+            except Exception:
+                did = 0
+            if did > 0:
+                drink_ids.add(did)
+        return drink_ids
+    finally:
+        dbs.close()
+
 def get_inventory_item(item_id):
     """Возвращает элемент инвентаря по его ID вместе с данными о напитке."""
     db = SessionLocal()
@@ -3557,6 +5312,7 @@ def get_leaderboard(limit: int = 10):
                 func.sum(InventoryItem.quantity).label('total_drinks'),
                 Player.vip_until,
                 Player.vip_plus_until,
+                Player.rating,
             )
             .join(InventoryItem, Player.user_id == InventoryItem.player_id)
             .outerjoin(
@@ -3567,7 +5323,7 @@ def get_leaderboard(limit: int = 10):
                 )
             )
             .filter(UserBan.user_id == None)
-            .group_by(Player.user_id)
+            .group_by(Player.user_id, Player.username, Player.vip_until, Player.vip_plus_until, Player.rating)
             .order_by(func.sum(InventoryItem.quantity).desc())
             .limit(limit)
             .all()
@@ -3753,13 +5509,19 @@ def ensure_schema():
     # Важно: использовать транзакцию с автокоммитом, чтобы ALTER TABLE применялись (SQLAlchemy 2.x)
     with engine.begin() as conn:
         # Получаем текущие столбцы таблицы players
-        res = conn.exec_driver_sql("PRAGMA table_info(players)")
-        cols = [row[1] for row in res]
+        try:
+            existing = [row[1] for row in conn.execute(text("PRAGMA table_info(players)"))]
+        except Exception:
+            existing = []
+
+        cols = existing
 
         if 'language' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN language TEXT DEFAULT 'ru'")
         if 'remind' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN remind INTEGER DEFAULT 0")
+        if 'rating' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN rating INTEGER DEFAULT 0")
         if 'last_bonus_claim' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN last_bonus_claim INTEGER DEFAULT 0")
         if 'last_add' not in cols:
@@ -3782,6 +5544,51 @@ def ensure_schema():
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN auto_search_boost_count INTEGER DEFAULT 0")
         if 'auto_search_boost_until' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN auto_search_boost_until INTEGER DEFAULT 0")
+
+        if 'luck_coupon_charges' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN luck_coupon_charges INTEGER DEFAULT 0")
+
+        if 'favorite_drink_1' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_drink_1 INTEGER DEFAULT 0")
+        if 'favorite_drink_2' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_drink_2 INTEGER DEFAULT 0")
+        if 'favorite_drink_3' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_drink_3 INTEGER DEFAULT 0")
+
+        if 'farmer_auto_water' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_auto_water INTEGER DEFAULT 1")
+        if 'farmer_auto_harvest' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_auto_harvest INTEGER DEFAULT 1")
+        if 'farmer_auto_plant' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_auto_plant INTEGER DEFAULT 1")
+        if 'farmer_auto_fertilize' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_auto_fertilize INTEGER DEFAULT 1")
+        if 'farmer_fert_priority' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_fert_priority TEXT DEFAULT '[]'")
+        if 'farmer_silent' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_silent INTEGER DEFAULT 0")
+        if 'farmer_summary_enabled' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_summary_enabled INTEGER DEFAULT 1")
+        if 'farmer_summary_interval_sec' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_summary_interval_sec INTEGER DEFAULT 3600")
+        if 'farmer_summary_last_ts' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_summary_last_ts INTEGER DEFAULT 0")
+        if 'farmer_min_balance' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_min_balance INTEGER DEFAULT 0")
+        if 'farmer_daily_limit' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_daily_limit INTEGER DEFAULT 0")
+        if 'farmer_daily_spent' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_daily_spent INTEGER DEFAULT 0")
+        if 'farmer_daily_day' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_daily_day INTEGER DEFAULT 0")
+        if 'farmer_seed_mode' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_seed_mode TEXT DEFAULT 'any'")
+        if 'farmer_seed_ids' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_seed_ids TEXT DEFAULT '[]'")
+        if 'farmer_seed_priority' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_seed_priority TEXT DEFAULT '[]'")
+        if 'farmer_session_stats' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_session_stats TEXT DEFAULT '{}'")
 
         # Обновления для energy_drinks (плантационные энергетики)
         res_drinks = conn.exec_driver_sql("PRAGMA table_info(energy_drinks)")
@@ -4016,6 +5823,64 @@ def is_protected_user(user_id: int) -> bool:
         pass
     return False
 
+
+def get_rarity_emoji_override(rarity: str) -> str | None:
+    db = SessionLocal()
+    try:
+        key = (rarity or '').strip()
+        if not key:
+            return None
+        rec = db.query(RarityEmoji).filter(RarityEmoji.rarity == key).first()
+        if not rec:
+            return None
+        val = getattr(rec, 'emoji', None)
+        return str(val) if val else None
+    finally:
+        db.close()
+
+
+def set_rarity_emoji_override(rarity: str, emoji: str) -> bool:
+    db = SessionLocal()
+    try:
+        key = (rarity or '').strip()
+        val = (emoji or '').strip()
+        if not key or not val:
+            return False
+        rec = db.query(RarityEmoji).filter(RarityEmoji.rarity == key).first()
+        ts = int(time.time())
+        if rec:
+            rec.emoji = val
+            rec.updated_at = ts
+        else:
+            rec = RarityEmoji(rarity=key, emoji=val, updated_at=ts)
+            db.add(rec)
+        db.commit()
+        return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        db.close()
+
+
+def list_rarity_emoji_overrides() -> list[tuple[str, str]]:
+    db = SessionLocal()
+    try:
+        rows = db.query(RarityEmoji).all()
+        out: list[tuple[str, str]] = []
+        for r in rows:
+            rk = getattr(r, 'rarity', None)
+            ev = getattr(r, 'emoji', None)
+            if rk and ev:
+                out.append((str(rk), str(ev)))
+        out.sort(key=lambda x: x[0].lower())
+        return out
+    finally:
+        db.close()
+
 # --- VIP helpers ---
 
 def get_vip_until(user_id: int) -> int:
@@ -4066,7 +5931,7 @@ def purchase_vip(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
         player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
             # Автосоздание игрока при редком коллизии
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -4108,7 +5973,7 @@ def purchase_vip_plus(user_id: int, cost_coins: int, duration_seconds: int) -> d
         player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
             # Автосоздание игрока при редком коллизии
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -4168,7 +6033,7 @@ def extend_vip(user_id: int, duration_seconds: int) -> int:
         player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
             # Автосоздание игрока
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -4198,7 +6063,7 @@ def extend_vip_plus(user_id: int, duration_seconds: int) -> int:
         player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
             # Автосоздание игрока
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             db.add(player)
             db.commit()
             db.refresh(player)
@@ -4417,6 +6282,47 @@ def get_receiver_unit_payout(rarity: str) -> int:
     except Exception:
         return 0
 
+def get_rating_bonus_percent(rating: int) -> float:
+    """Процент бонуса к продаже по рейтингу (0..25)."""
+    try:
+        value = int(rating or 0)
+    except Exception:
+        value = 0
+    if value >= 1000:
+        return 25.0
+    if value >= 250:
+        extra = 13.0 + (value - 250) * (12.0 / 750.0)
+        return min(25.0, extra)
+    if value >= 200:
+        return 12.5
+    if value >= 150:
+        return 10.0
+    if value >= 100:
+        return 7.5
+    if value >= 50:
+        return 5.0
+    return 0.0
+
+def get_rating_bonus_multiplier(rating: int) -> float:
+    return 1.0 + (get_rating_bonus_percent(rating) / 100.0)
+
+def get_receiver_unit_payout_with_rating(rarity: str, rating: int) -> int:
+    base = get_receiver_unit_payout(rarity)
+    if base <= 0:
+        return 0
+    payout = int(base * get_rating_bonus_multiplier(rating))
+    return max(0, payout)
+
+def get_receiver_unit_payout_for_user(user_id: int, rarity: str) -> int:
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == user_id).first()
+        rating = int(getattr(player, 'rating', 0) or 0) if player else 0
+        return get_receiver_unit_payout_with_rating(rarity, rating)
+    finally:
+        dbs.close()
+
+
 def sell_inventory_item(user_id: int, item_id: int, quantity: int) -> dict:
     """Продажа предметов из инвентаря в Приёмник.
     - Уменьшает количество/удаляет предмет, начисляет монеты.
@@ -4443,13 +6349,6 @@ def sell_inventory_item(user_id: int, item_id: int, quantity: int) -> dict:
         if qty_to_sell <= 0:
             return {"ok": False, "reason": "empty"}
 
-        unit_payout = get_receiver_unit_payout(item.rarity)
-        if unit_payout <= 0:
-            return {"ok": False, "reason": "unsupported_rarity"}
-
-        total_payout = int(unit_payout) * int(qty_to_sell)
-
-        # Начисляем монеты
         player = (
             dbs.query(Player)
             .filter(Player.user_id == user_id)
@@ -4458,10 +6357,17 @@ def sell_inventory_item(user_id: int, item_id: int, quantity: int) -> dict:
         )
         if not player:
             # Создаём игрока, если внезапно отсутствует
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
+
+        rating_value = int(getattr(player, 'rating', 0) or 0)
+        unit_payout = get_receiver_unit_payout_with_rating(item.rarity, rating_value)
+        if unit_payout <= 0:
+            return {"ok": False, "reason": "unsupported_rarity"}
+
+        total_payout = int(unit_payout) * int(qty_to_sell)
 
         player.coins = int(player.coins or 0) + int(total_payout)
 
@@ -4516,13 +6422,6 @@ def sell_all_but_one(user_id: int, item_id: int) -> dict:
         
         qty_to_sell = qty_available - 1  # Продаём все кроме одного
 
-        unit_payout = get_receiver_unit_payout(item.rarity)
-        if unit_payout <= 0:
-            return {"ok": False, "reason": "unsupported_rarity"}
-
-        total_payout = int(unit_payout) * int(qty_to_sell)
-
-        # Начисляем монеты
         player = (
             dbs.query(Player)
             .filter(Player.user_id == user_id)
@@ -4531,10 +6430,17 @@ def sell_all_but_one(user_id: int, item_id: int) -> dict:
         )
         if not player:
             # Создаём игрока, если внезапно отсутствует
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
+
+        rating_value = int(getattr(player, 'rating', 0) or 0)
+        unit_payout = get_receiver_unit_payout_with_rating(item.rarity, rating_value)
+        if unit_payout <= 0:
+            return {"ok": False, "reason": "unsupported_rarity"}
+
+        total_payout = int(unit_payout) * int(qty_to_sell)
 
         player.coins = int(player.coins or 0) + int(total_payout)
 
@@ -4550,6 +6456,75 @@ def sell_all_but_one(user_id: int, item_id: int) -> dict:
             "total_payout": int(total_payout),
             "coins_after": int(player.coins),
             "item_left_qty": int(item_left_qty),
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def sell_all_inventory(user_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        user_items = (
+            dbs.query(InventoryItem)
+            .filter(InventoryItem.player_id == user_id)
+            .all()
+        )
+        if not user_items:
+            return {"ok": False, "reason": "no_items"}
+
+        player = (
+            dbs.query(Player)
+            .filter(Player.user_id == user_id)
+            .with_for_update(read=False)
+            .first()
+        )
+        if not player:
+            player = Player(user_id=user_id, username=None)
+            dbs.add(player)
+            dbs.commit()
+            dbs.refresh(player)
+
+        rating_value = int(getattr(player, 'rating', 0) or 0)
+        total_items_sold = 0
+        total_earned = 0
+        items_processed = 0
+        skipped_items = 0
+
+        for item in user_items:
+            qty_available = int(item.quantity or 0)
+            if qty_available <= 0:
+                continue
+
+            unit_payout = get_receiver_unit_payout_with_rating(item.rarity, rating_value)
+            if unit_payout <= 0:
+                skipped_items += 1
+                continue
+
+            item_payout = int(unit_payout) * int(qty_available)
+            total_items_sold += qty_available
+            total_earned += item_payout
+            items_processed += 1
+
+            dbs.delete(item)
+
+        if total_items_sold == 0:
+            return {"ok": False, "reason": "nothing_to_sell"}
+
+        player.coins = int(player.coins or 0) + int(total_earned)
+        dbs.commit()
+        return {
+            "ok": True,
+            "total_items_sold": int(total_items_sold),
+            "total_earned": int(total_earned),
+            "items_processed": int(items_processed),
+            "skipped_items": int(skipped_items),
+            "coins_after": int(player.coins),
         }
     except Exception:
         try:
@@ -4585,11 +6560,12 @@ def sell_absolutely_all_but_one(user_id: int) -> dict:
         )
         if not player:
             # Создаём игрока, если внезапно отсутствует
-            player = Player(user_id=user_id, username=str(user_id))
+            player = Player(user_id=user_id, username=None)
             dbs.add(player)
             dbs.commit()
             dbs.refresh(player)
         
+        rating_value = int(getattr(player, 'rating', 0) or 0)
         total_items_sold = 0
         total_earned = 0
         items_processed = 0
@@ -4603,7 +6579,7 @@ def sell_absolutely_all_but_one(user_id: int) -> dict:
                 continue
                 
             # Получаем выплату за предмет
-            unit_payout = get_receiver_unit_payout(item.rarity)
+            unit_payout = get_receiver_unit_payout_with_rating(item.rarity, rating_value)
             if unit_payout <= 0:
                 continue  # Пропускаем неподдерживаемые редкости
             
@@ -6300,20 +8276,38 @@ def search_drinks_by_name(search_query: str):
         db.close()
 
 
+class _AttrDict(dict):
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as e:
+            raise AttributeError(key) from e
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+    def __delattr__(self, key):
+        try:
+            del self[key]
+        except KeyError as e:
+            raise AttributeError(key) from e
+
+
 def get_drink_by_id(drink_id: int):
     """Получает напиток по ID."""
     db = SessionLocal()
     try:
         drink = db.query(EnergyDrink).filter(EnergyDrink.id == drink_id).first()
         if drink:
-            return {
+            return _AttrDict({
                 'id': drink.id,
                 'name': drink.name,
                 'description': drink.description,
                 'is_special': drink.is_special,
                 'image_path': drink.image_path,
-                'has_image': bool(drink.image_path)
-            }
+                'has_image': bool(drink.image_path),
+                'default_rarity': drink.default_rarity,
+            })
         return None
     except Exception as e:
         print(f"[DB] Error getting drink by id: {e}")
@@ -6424,6 +8418,24 @@ def get_users_with_level2_farmers() -> list[int]:
         return [r[0] for r in rows]
     except Exception as e:
         print(f"[DB] Error getting users with level 2 farmers: {e}")
+        return []
+    finally:
+        dbs.close()
+
+
+def get_users_with_level4_farmers() -> list[int]:
+    dbs = SessionLocal()
+    try:
+        rows = (
+            dbs.query(Selyuk.owner_id)
+            .filter(Selyuk.type == 'farmer')
+            .filter(Selyuk.level >= 4)
+            .filter(Selyuk.is_enabled == True)
+            .all()
+        )
+        return [r[0] for r in rows]
+    except Exception as e:
+        print(f"[DB] Error getting users with level 4 farmers: {e}")
         return []
     finally:
         dbs.close()

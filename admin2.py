@@ -1,11 +1,15 @@
 # file: admin2.py
 
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ConversationHandler
 import database as db
 from datetime import datetime
-from constants import ADMIN_USERNAMES
+from constants import ADMIN_USERNAMES, ENERGY_IMAGES_DIR, RARITIES, COLOR_EMOJIS
 import logging
+import os
+import re
+import random
+import time
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -27,6 +31,13 @@ def _is_creator_or_lvl3(user) -> bool:
     is_creator = (user.username in ADMIN_USERNAMES)
     lvl = db.get_admin_level(user.id)
     return is_creator or lvl == 3
+
+
+def _parse_yes_no(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    val = value.strip().lower()
+    return val in ('y', 'yes', 'true', '1', 'да', 'д', 'on')
 
 async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/receipt <id> — показать детали чека покупки (только Создатель и ур.3)."""
@@ -132,6 +143,8 @@ async def admin2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /tgset <число> — установить склад TG Premium в указанное значение.\n"
         "• /receipt <id> — показать детали чека покупки.\n"
         "• /verifyreceipt <id> — отметить чек как проверенный.\n"
+        "• /addexdrink <id> | <name> | <description> | [special=yes/no] — создать/обновить энергетик с фиксированным ID (для эксклюзивов).\n"
+        "• /giveexdrink <user_id|@username> <drink_id> <rarity> [qty=1] — выдать пользователю эксклюзивный энергетик с нужной редкостью.\n"
         "• /addvip <@username|all> <дни> — добавить VIP статус пользователю или всем.\n"
         "• /addautosearch <@username|all> <count> <days> — добавить автопоиск буст (дополнительные поиски в день) пользователю или всем.\n"
         "• /listboosts — показать всех пользователей с активными бустами автопоиска.\n"
@@ -254,6 +267,361 @@ async def stockset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"Склад [{kind}] установлен: {new_stock}")
 
 
+async def setrareemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    if not _is_creator_or_lvl3(user):
+        await msg.reply_text("Нет прав: команда доступна только Создателю и ур.3.")
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await msg.reply_text(
+            "Использование: /setrareemoji <rarity> <emoji>\n"
+            "Если в названии редкости есть пробелы — пишите её словами, эмодзи последним аргументом.\n"
+            "Пример: /setrareemoji Грустный Вайб 😔"
+        )
+        return
+
+    emoji = str(args[-1]).strip()
+    rarity = " ".join([str(x) for x in args[:-1]]).strip()
+    if not rarity or not emoji:
+        await msg.reply_text("❌ Пустая редкость или эмодзи.")
+        return
+
+    try:
+        ok = bool(db.set_rarity_emoji_override(rarity, emoji))
+    except Exception as e:
+        await msg.reply_text(f"❌ Ошибка БД: {e}")
+        return
+
+    if not ok:
+        await msg.reply_text("❌ Не удалось сохранить (проверьте аргументы).")
+        return
+
+    try:
+        COLOR_EMOJIS[str(rarity)] = str(emoji)
+    except Exception:
+        pass
+
+    await msg.reply_text(f"✅ Эмодзи для редкости '{rarity}' установлен: {emoji}")
+
+
+async def listrareemoji_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    if not _is_creator_or_lvl3(user):
+        await msg.reply_text("Нет прав: команда доступна только Создателю и ур.3.")
+        return
+
+    try:
+        rows = db.list_rarity_emoji_overrides()
+    except Exception as e:
+        await msg.reply_text(f"❌ Ошибка БД: {e}")
+        return
+
+    if not rows:
+        await msg.reply_text("Список пуст.")
+        return
+
+    lines = []
+    for rarity, emoji in rows:
+        lines.append(f"{emoji} {rarity}")
+    await msg.reply_text("\n".join(lines))
+
+
+ADDEX_PHOTO = 7
+
+async def addexdrink_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/addexdrink <id> | <name> | <description> | [special=yes/no] | [rarity] — начало добавления."""
+    msg = update.message
+    user = update.effective_user
+    if not _is_creator_or_lvl3(user):
+        await msg.reply_text("Нет прав: команда доступна только Создателю и ур.3.")
+        return ConversationHandler.END
+
+    raw = (msg.text or "").partition(" ")[2].strip()
+    if not raw:
+        await msg.reply_text("Использование: /addexdrink <id> | <name> | <description> | [special=yes/no]\nПример: /addexdrink 9001 | Achievement Cola | За событие | yes")
+        return ConversationHandler.END
+
+    parts = [p.strip() for p in raw.split("|")]
+    if len(parts) < 3:
+        await msg.reply_text("Нужно минимум 3 части через '|': <id> | <name> | <description> | [special=yes/no] | [rarity]")
+        return ConversationHandler.END
+
+    try:
+        drink_id = int(parts[0])
+    except ValueError:
+        await msg.reply_text(f"❌ ID '{parts[0]}' должен быть числом.\nПример: /addexdrink 9001 | ...")
+        return ConversationHandler.END
+
+    name = parts[1]
+    description = parts[2]
+    special = _parse_yes_no(parts[3], default=True) if len(parts) >= 4 else True
+    rarity = parts[4] if len(parts) >= 5 else None
+
+    # Сохраняем данные во временное хранилище
+    context.user_data['addex_data'] = {
+        'id': drink_id,
+        'name': name,
+        'description': description,
+        'special': special,
+        'rarity': rarity
+    }
+
+    await msg.reply_text(
+        f"📝 Данные получены:\nID: {drink_id}\nНазвание: {name}\nСпец: {special}\n\n"
+        "📸 Теперь отправьте <b>ФОТО</b> энергетика или нажмите /skip для пропуска."
+    )
+    return ADDEX_PHOTO
+
+async def addexdrink_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фото для addexdrink."""
+    msg = update.message
+    data = context.user_data.get('addex_data')
+    if not data:
+        await msg.reply_text("Ошибка контекста. Начните заново /addexdrink")
+        return ConversationHandler.END
+
+    image_path = None
+    if msg.photo:
+        try:
+            photo_file = msg.photo[-1]
+            file = await context.bot.get_file(photo_file.file_id)
+            os.makedirs(ENERGY_IMAGES_DIR, exist_ok=True)
+            image_path = f"{int(time.time())}_{random.randint(1000,9999)}.jpg"
+            await file.download_to_drive(os.path.join(ENERGY_IMAGES_DIR, image_path))
+        except Exception as e:
+            await msg.reply_text(f"❌ Ошибка загрузки фото: {e}")
+            return ConversationHandler.END
+    
+    return await _finalize_addex(update, context, data, image_path)
+
+async def addexdrink_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пропуск фото для addexdrink."""
+    data = context.user_data.get('addex_data')
+    if not data:
+        await update.message.reply_text("Ошибка контекста. Начните заново /addexdrink")
+        return ConversationHandler.END
+    
+    return await _finalize_addex(update, context, data, None)
+
+async def _finalize_addex(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, image_path: str | None):
+    try:
+        drink = db.add_energy_drink_with_id(
+            data['id'], 
+            data['name'], 
+            data['description'], 
+            image_path=image_path, 
+            is_special=data['special'],
+            default_rarity=data.get('rarity')
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при сохранении: {e}")
+        return ConversationHandler.END
+
+    extra = ""
+    rarity = data.get('rarity')
+    special = data.get('special')
+    
+    if rarity:
+        extra = f"\n⚠️ Редкость '{rarity}' СОХРАНЕНА как дефолтная. При выдаче (/giveexdrink) её можно не указывать."
+        if not special and rarity not in RARITIES:
+             extra += "\n❗ Внимание: НЕ-специальный энергетик с нестандартной редкостью."
+
+    await update.message.reply_text(
+        f"✅ Энергетик сохранён!\nID: {drink.id}\nНазвание: {drink.name}\nОсобенный: {'да' if drink.is_special else 'нет'}{extra}"
+    )
+    context.user_data.pop('addex_data', None)
+    return ConversationHandler.END
+
+async def addexdrink_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('addex_data', None)
+    await update.message.reply_text("❌ Добавление отменено.")
+    return ConversationHandler.END
+
+
+async def giveexdrink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/giveexdrink <user_id|@username> <drink_id> [rarity] [qty=1] — выдать эксклюзивный энергетик.
+    Если rarity не указан, берется дефолтный из базы.
+    """
+    msg = update.message
+    user = update.effective_user
+    if not _is_creator_or_lvl3(user):
+        await msg.reply_text("Нет прав: команда доступна только Создателю и ур.3.")
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await msg.reply_text("Использование: /giveexdrink <user_id|@username> <drink_id> [rarity] [qty=1]")
+        return
+
+    target_raw = args[0]
+    drink_id_raw = args[1]
+    
+    # Парсим drink_id
+    try:
+        m = re.search(r"\d+", str(drink_id_raw))
+        if not m:
+            raise ValueError("no digits")
+        drink_id = int(m.group(0))
+    except ValueError:
+        await msg.reply_text("ID энергетика должен быть числом.")
+        return
+
+    # Парсим target (user_id или username)
+    target_id: int | None = None
+    target_username: str | None = None
+    try:
+        raw = str(target_raw).strip()
+        if raw.lstrip('+').isdigit():
+            target_id = int(raw)
+        else:
+            target_username = raw[1:] if raw.startswith('@') else raw
+    except Exception:
+        target_id = None
+        target_username = None
+
+    # Логика разбора 3 и 4 аргументов (rarity, qty)
+    # Возможные варианты:
+    # 2 args: user drink -> rarity=default, qty=1
+    # 3 args: user drink qty(int) -> rarity=default, qty=N
+    # 3 args: user drink rarity(str) -> rarity=STR, qty=1
+    # 4 args: user drink rarity qty -> rarity=STR, qty=N
+    
+    rarity = None
+    qty = 1
+    
+    if len(args) >= 3:
+        arg3 = args[2]
+        # Проверяем, число ли это
+        if arg3.isdigit():
+            # Это количество, значит редкость не указана (флаг авто)
+            qty = int(arg3)
+        else:
+            # Это строка, значит редкость
+            rarity = arg3
+            
+    if len(args) >= 4:
+        # Если было 4 аргумента, то 3-й точно редкость, а 4-й количество
+        if args[3].isdigit():
+            qty = int(args[3])
+    
+    # Если редкость не определена из аргументов, берем из базы
+    if not rarity:
+        drink = db.get_drink_by_id(drink_id)
+        if drink and isinstance(drink, dict):
+            # В get_drink_by_id возвращается словарь, но там может не быть default_rarity, т.к. мы его только добавили
+            pass 
+        # Лучше запросить через модель напрямую, если хелпер не обновлен
+        # Но у нас есть db.get_drink_by_id. 
+        # Давайте обновим get_drink_by_id в database.py или сделаем прямой запрос тут? 
+        # Проще пока сделать фоллбэк: если нет в базе - ошибка или дефолт
+        
+        # Попробуем получить default_rarity через сессию (или обновим get_drink_by_id, но это лишний шаг)
+        # В database.py get_drink_by_id возвращает dict, но мы не обновляли его код, чтобы возвращал default_rarity.
+        # Поэтому сделаем прямой запрос к DB или используем add_energy_drink_with_id (нет, он для записи)
+        
+        # Получим default_rarity "хаком" или добавим функцию в db. 
+        # Добавим функцию get_drink_default_rarity в db в следующем шаге? Нет, лучше сразу тут, если есть доступ к DB session? 
+        # В admin2.py импортирован db, но сессии там нет.
+        # Сделаем запрос через существующий механизм или добавим хелпер.
+        # Пока предположим, что rarity обязателен, если нет дефолта.
+        
+        # Давайте запросим default_rarity.
+        try:
+            default_rarity = None
+            try:
+                default_rarity = getattr(drink, 'default_rarity', None)
+            except Exception:
+                default_rarity = None
+            if not default_rarity and isinstance(drink, dict):
+                default_rarity = drink.get('default_rarity')
+            if default_rarity:
+                rarity = str(default_rarity)
+        except Exception:
+            rarity = None
+
+    # Валидируем drink
+    drink_obj = db.get_drink_by_id(drink_id)
+    if not drink_obj:
+        await msg.reply_text(f"❌ Энергетик с ID {drink_id} не найден.")
+        return
+
+    # Если редкость всё ещё не определена — просим указать
+    if not rarity:
+        await msg.reply_text("❌ Редкость не указана и в базе нет default_rarity для этого напитка. Укажите rarity вручную: /giveexdrink <user> <drink_id> <rarity> [qty]")
+        return
+
+    # Валидируем qty
+    try:
+        qty = int(qty)
+    except Exception:
+        qty = 1
+    if qty <= 0:
+        await msg.reply_text("❌ Количество должно быть положительным числом.")
+        return
+
+    # Разрешение пользователя через единый поиск
+    if target_id is None:
+        ident = f"@{target_username}" if target_username else str(target_raw)
+        res = db.find_player_by_identifier(ident)
+        if res.get('reason') == 'multiple':
+            lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+            for c in (res.get('candidates') or []):
+                cu = c.get('username')
+                lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+            await msg.reply_text("\n".join(lines))
+            return
+        if res.get('ok') and res.get('player'):
+            p = res['player']
+            target_id = int(getattr(p, 'user_id', 0) or 0) or None
+            target_username = getattr(p, 'username', None) or target_username
+        else:
+            # Фоллбэк: попробуем получить ID через Telegram
+            if target_username:
+                try:
+                    chat_obj = await context.bot.get_chat(f"@{target_username}")
+                    if getattr(chat_obj, 'id', None):
+                        target_id = int(chat_obj.id)
+                except Exception:
+                    pass
+
+    if target_id is None:
+        shown = f"@{target_username}" if target_username else str(target_raw)
+        await msg.reply_text(f"❌ Не удалось определить пользователя {shown}.")
+        return
+
+    # Регистрируем игрока, чтобы инвентарь был привязан к players
+    try:
+        db.get_or_create_player(target_id, target_username or str(target_id))
+    except Exception:
+        pass
+
+    # Выдаём
+    ok = False
+    try:
+        ok = bool(db.add_custom_drink_to_inventory(target_id, drink_id, str(rarity), int(qty)))
+    except Exception:
+        ok = False
+
+    if not ok:
+        await msg.reply_text("❌ Не удалось выдать энергетик (ошибка БД).")
+        return
+
+    # Сообщение об успехе
+    try:
+        drink_name = (drink_obj or {}).get('name') if isinstance(drink_obj, dict) else getattr(drink_obj, 'name', None)
+    except Exception:
+        drink_name = None
+    drink_name = drink_name or f"ID {drink_id}"
+    shown = f"@{target_username}" if target_username else str(target_id)
+    await msg.reply_text(f"✅ Выдано: {drink_name} (ID {drink_id})\nПользователь: {shown}\nРедкость: {rarity}\nКол-во: {qty}")
+
+    return
+
+
 async def addautosearch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/addautosearch <@username|all> <count> <days> — добавить автопоиск буст пользователю или всем."""
     msg = update.message
@@ -301,15 +669,18 @@ async def addautosearch_command(update: Update, context: ContextTypes.DEFAULT_TY
             await msg.reply_text(f"❌ Ошибка при добавлении буста всем: {e}")
     else:
         # Добавляем буст конкретному пользователю
-        # Убираем @ если есть
-        if target.startswith('@'):
-            target = target[1:]
-        
-        # Ищем пользователя по username
-        target_player = db.get_player_by_username(target)
-        if not target_player:
-            await msg.reply_text(f"❌ Пользователь @{target} не найден в базе данных.")
+        res = db.find_player_by_identifier(target)
+        if res.get('reason') == 'multiple':
+            lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+            for c in (res.get('candidates') or []):
+                cu = c.get('username')
+                lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+            await msg.reply_text("\n".join(lines))
             return
+        if not (res.get('ok') and res.get('player')):
+            await msg.reply_text(f"❌ Пользователь {target} не найден в базе данных.")
+            return
+        target_player = res['player']
         
         # Добавляем буст
         try:
@@ -339,8 +710,9 @@ async def addautosearch_command(update: Update, context: ContextTypes.DEFAULT_TY
                 boost_end_date = datetime.fromtimestamp(boost_until).strftime('%Y-%m-%d %H:%M:%S')
                 
                 # Уведомляем администратора
+                shown = f"@{getattr(target_player, 'username', None)}" if getattr(target_player, 'username', None) else str(target_player.user_id)
                 await msg.reply_text(
-                    f"✅ Автопоиск буст на {count} дополнительных поисков на {days} дней добавлен пользователю @{target}.\n"
+                    f"✅ Автопоиск буст на {count} дополнительных поисков на {days} дней добавлен пользователю {shown}.\n"
                     f"Новый дневной лимит: {new_limit}\n"
                     f"Буст активен до: {boost_end_date}"
                 )
@@ -430,15 +802,18 @@ async def addvip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"❌ Ошибка: {e}")
     else:
         # Добавляем VIP конкретному пользователю
-        # Убираем @ если есть
-        if target.startswith('@'):
-            target = target[1:]
-        
-        # Ищем пользователя по username
-        target_player = db.get_player_by_username(target)
-        if not target_player:
-            await msg.reply_text(f"❌ Пользователь @{target} не найден в базе данных.")
+        res = db.find_player_by_identifier(target)
+        if res.get('reason') == 'multiple':
+            lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+            for c in (res.get('candidates') or []):
+                cu = c.get('username')
+                lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+            await msg.reply_text("\n".join(lines))
             return
+        if not (res.get('ok') and res.get('player')):
+            await msg.reply_text(f"❌ Пользователь {target} не найден в базе данных.")
+            return
+        target_player = res['player']
         
         # Добавляем VIP
         try:
@@ -452,7 +827,8 @@ async def addvip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Форматируем дату окончания VIP
             vip_end_date = datetime.fromtimestamp(new_vip_until).strftime('%Y-%m-%d %H:%M:%S')
-            await msg.reply_text(f"✅ VIP статус на {days} дней добавлен пользователю @{target}.\nVIP активен до: {vip_end_date}")
+            shown = f"@{getattr(target_player, 'username', None)}" if getattr(target_player, 'username', None) else str(target_player.user_id)
+            await msg.reply_text(f"✅ VIP статус на {days} дней добавлен пользователю {shown}.\nVIP активен до: {vip_end_date}")
             
         except Exception as e:
             await msg.reply_text(f"❌ Ошибка при добавлении VIP: {e}")
@@ -535,29 +911,25 @@ async def removeboost_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     target = args[0]
-    
-    # Определяем целевого пользователя
-    target_user_id = None
-    target_username = None
-    
-    if target.startswith('@'):
-        target_username = target[1:].lower()
-    else:
-        try:
-            target_user_id = int(target)
-        except ValueError:
-            await msg.reply_text("Неверный формат. Используйте @username или числовой ID.")
-            return
+    res = db.find_player_by_identifier(target)
+    if res.get('reason') == 'multiple':
+        lines = ["Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        await msg.reply_text("\n".join(lines))
+        return
+    if not (res.get('ok') and res.get('player')):
+        await msg.reply_text("Пользователь не найден.")
+        return
+    target_user_id = int(res['player'].user_id)
     
     from database import SessionLocal, Player
     
     dbs = SessionLocal()
     try:
         # Ищем пользователя
-        if target_user_id:
-            player = dbs.query(Player).filter(Player.user_id == target_user_id).first()
-        else:
-            player = dbs.query(Player).filter(Player.username.ilike(target_username)).first()
+        player = dbs.query(Player).filter(Player.user_id == target_user_id).first()
         
         if not player:
             await msg.reply_text("Пользователь не найден.")
@@ -697,29 +1069,25 @@ async def boosthistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     target = args[0]
-    
-    # Определяем целевого пользователя
-    target_user_id = None
-    target_username = None
-    
-    if target.startswith('@'):
-        target_username = target[1:].lower()
-    else:
-        try:
-            target_user_id = int(target)
-        except ValueError:
-            await msg.reply_text("Неверный формат. Используйте @username или числовой ID.")
-            return
+    res = db.find_player_by_identifier(target)
+    if res.get('reason') == 'multiple':
+        lines = ["Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        await msg.reply_text("\n".join(lines))
+        return
+    if not (res.get('ok') and res.get('player')):
+        await msg.reply_text("Пользователь не найден.")
+        return
+    target_user_id = int(res['player'].user_id)
     
     from database import SessionLocal, Player
     
     dbs = SessionLocal()
     try:
         # Ищем пользователя
-        if target_user_id:
-            player = dbs.query(Player).filter(Player.user_id == target_user_id).first()
-        else:
-            player = dbs.query(Player).filter(Player.username.ilike(target_username)).first()
+        player = dbs.query(Player).filter(Player.user_id == target_user_id).first()
         
         if not player:
             await msg.reply_text("Пользователь не найден.")

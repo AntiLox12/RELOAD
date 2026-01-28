@@ -61,11 +61,9 @@ def _resolve_user_identifier(text: str) -> int | None:
     t = (text or '').strip()
     if not t:
         return None
-    # Поддерживаем @username и username с цифрами/подчёркиваниями
-    uname = t[1:] if t.startswith('@') else t
-    if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
-        p = db.get_player_by_username(uname)
-        return int(getattr(p, 'user_id', 0)) if p else None
+    res = db.find_player_by_identifier(t)
+    if res.get('ok') and res.get('player'):
+        return int(getattr(res['player'], 'user_id', 0) or 0) or None
     try:
         return int(t)
     except Exception:

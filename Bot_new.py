@@ -9,8 +9,9 @@ import json
 import secrets
 import html
 import re
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ForceReply, Message, User
-from telegram.error import BadRequest, Forbidden
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ForceReply, Message, User, InputMediaPhoto
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -38,12 +39,19 @@ from admin2 import (
     stock_command,
     stockadd_command,
     stockset_command,
+    setrareemoji_command,
+    listrareemoji_command,
     addvip_command,
     addautosearch_command,
     listboosts_command,
     removeboost_command,
     booststats_command,
     boosthistory_command,
+    addexdrink_start,
+    addexdrink_photo,
+    addexdrink_skip,
+    addexdrink_cancel,
+    giveexdrink_command,
 )
 from vip_plus_handlers import (
     show_vip_plus_menu,
@@ -63,6 +71,7 @@ from constants import (
     COLOR_EMOJIS,
     RARITY_ORDER,
     ITEMS_PER_PAGE,
+    FAVORITE_DRINK_WEIGHT_MULT,
     VIP_EMOJI,
     VIP_COSTS,
     VIP_DURATIONS_SEC,
@@ -109,6 +118,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+async def _tg_call_with_retry(call, *, retries=3, base_delay=1.5, **kwargs):
+    last_exc = None
+    for attempt in range(int(retries)):
+        try:
+            return await call(**kwargs)
+        except RetryAfter as e:
+            last_exc = e
+            delay = float(getattr(e, 'retry_after', 1.0) or 1.0)
+            await asyncio.sleep(max(0.0, delay))
+        except (TimedOut, NetworkError, OSError) as e:
+            last_exc = e
+            if attempt >= int(retries) - 1:
+                break
+            await asyncio.sleep(float(base_delay) * (2 ** attempt))
+        except Exception as e:
+            last_exc = e
+            break
+    if last_exc:
+        raise last_exc
+
+
+async def _send_photo_long(call, **kwargs):
+    kwargs.setdefault('read_timeout', 60.0)
+    kwargs.setdefault('write_timeout', 60.0)
+    kwargs.setdefault('connect_timeout', 20.0)
+    kwargs.setdefault('pool_timeout', 20.0)
+    return await _tg_call_with_retry(call, retries=3, base_delay=1.5, **kwargs)
+
+
+async def _send_media_group_long(call, **kwargs):
+    kwargs.setdefault('read_timeout', 60.0)
+    kwargs.setdefault('write_timeout', 60.0)
+    kwargs.setdefault('connect_timeout', 20.0)
+    kwargs.setdefault('pool_timeout', 20.0)
+    return await _tg_call_with_retry(call, retries=3, base_delay=1.5, **kwargs)
+
 def safe_format_timestamp(timestamp, format_str='%d.%m.%Y %H:%M'):
     """Безопасное форматирование временной метки."""
     if not timestamp:
@@ -147,13 +192,14 @@ def create_progress_bar(percent: float, length: int = 10, filled: str = '█', e
 # ADMIN_USERNAMES импортируется из constants.py
 ADMIN_USER_IDS: set[int] = set()  # legacy, больше не используется для прав, оставлено для обратной совместимости
 
-ADD_NAME, ADD_DESCRIPTION, ADD_SPECIAL, ADD_PHOTO, ADDP_NAME, ADDP_DESCRIPTION, ADDP_PHOTO = range(7)
+ADD_NAME, ADD_DESCRIPTION, ADD_SPECIAL, ADD_PHOTO, ADDP_NAME, ADDP_DESCRIPTION, ADDP_PHOTO, ADDEX_PHOTO = range(8)
 
 # Константы для conversation handler казино
 CASINO_CUSTOM_BET = range(1)
 
 # Константы для conversation handler удобрений
 FERTILIZER_CUSTOM_QTY = range(1)
+SEED_CUSTOM_QTY = range(1)
 
 PENDING_ADDITIONS: dict[int, dict] = {}
 NEXT_PENDING_ID = 1
@@ -200,12 +246,14 @@ TEXTS = {
         'ru': '⚡ <b>Добро пожаловать, {user}!</b>\n\n'
               '💰 <b>Баланс:</b> {coins} септимов\n'
               '🔋 <b>Энергетиков:</b> {energy_count}\n'
+              '⭐ <b>Рейтинг:</b> {rating}\n'
               '{vip_status}\n'
               '━━━━━━━━━━━━━━━━\n'
               '<i>Выберите действие:</i>',
         'en': '⚡ <b>Welcome, {user}!</b>\n\n'
               '💰 <b>Balance:</b> {coins} septims\n'
               '🔋 <b>Energy drinks:</b> {energy_count}\n'
+              '⭐ <b>Rating:</b> {rating}\n'
               '{vip_status}\n'
               '━━━━━━━━━━━━━━━━\n'
               '<i>Choose an action:</i>'
@@ -213,6 +261,14 @@ TEXTS = {
     'search': {'ru': '🔎 Найти энергетик', 'en': '🔎 Find energy'},
     'inventory': {'ru': '📦 Инвентарь', 'en': '📦 Inventory'},
     'stats': {'ru': '📊 Статистика', 'en': '📊 Stats'},
+    'my_profile': {'ru': '👤 Мой профиль', 'en': '👤 My profile'},
+    'favorite_energy_drinks': {'ru': '⭐ Избранные энергетики', 'en': '⭐ Favorite Energy Drinks'},
+    'favorites_title': {'ru': '<b>⭐ Избранные энергетики</b>', 'en': '<b>⭐ Favorite Energy Drinks</b>'},
+    'favorites_slot': {'ru': 'Слот {n}: {value}', 'en': 'Slot {n}: {value}'},
+    'favorites_empty': {'ru': 'Пусто', 'en': 'Empty'},
+    'favorites_pick_title': {'ru': '<b>⭐ Выбор избранного — слот {n}</b>', 'en': '<b>⭐ Pick favorite — slot {n}</b>'},
+    'favorites_pick_empty_inventory': {'ru': '❌ Инвентарь пуст. Нечего добавить в избранное.', 'en': '❌ Inventory is empty. Nothing to add to favorites.'},
+    'favorites_back_profile': {'ru': '🔙 Назад', 'en': '🔙 Back'},
     'settings': {'ru': '⚙️ Настройки', 'en': '⚙️ Settings'},
     # --- Settings menu ---
     'settings_title': {'ru': '⚙️ Настройки', 'en': '⚙️ Settings'},
@@ -330,23 +386,23 @@ TEXTS = {
     # --- VIP+ submenu ---
     'vip_plus': {'ru': VIP_PLUS_EMOJI + ' V.I.P+', 'en': VIP_PLUS_EMOJI + ' V.I.P+'},
     'vip_plus_title': {
-        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)',
-        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)'
+        'ru': 'Выберите срок V.I.P+:\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск: x2 к дневному лимиту',
+        'en': 'Choose V.I.P+ duration:\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search: x2 daily limit'
     },
     'vip_plus_1d': {'ru': '1 День', 'en': '1 Day'},
     'vip_plus_7d': {'ru': '7 дней', 'en': '7 days'},
     'vip_plus_30d': {'ru': '30 дней', 'en': '30 days'},
     'vip_plus_details_1d': {
-        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 1 день</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск: x2 к дневному лимиту\n',
+        'en': '<b>V.I.P+ for 1 day</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search: x2 daily limit\n'
     },
     'vip_plus_details_7d': {
-        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 7 дней</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск: x2 к дневному лимиту\n',
+        'en': '<b>V.I.P+ for 7 days</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search: x2 daily limit\n'
     },
     'vip_plus_details_30d': {
-        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск в 2 раза больше (120 в день)\n',
-        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search 2x more (120 per day)\n'
+        'ru': '<b>V.I.P+ на 30 дней</b>\n\nПреимущества:\n• 💎 Значок в таблице лидеров\n• ⏱ Кулдаун поиска — x0.25 (в 4 раза быстрее!)\n• 🎁 Кулдаун ежедневного бонуса — x0.25 (в 4 раза быстрее!)\n• 💰 Награда монет за поиск — x2\n• 🔔 Напоминание о поиске срабатывает по сокращённому КД\n• 🚀 Автопоиск: x2 к дневному лимиту\n',
+        'en': '<b>V.I.P+ for 30 days</b>\n\nPerks:\n• 💎 Badge in the leaderboard\n• ⏱ Search cooldown — x0.25 (4x faster!)\n• 🎁 Daily bonus cooldown — x0.25 (4x faster!)\n• 💰 Coin reward from search — x2\n• 🔔 Search reminder respects reduced cooldown\n• 🚀 Auto-search: x2 daily limit\n'
     },
     'vip_plus_buy': {'ru': 'Купить', 'en': 'Buy'},
     'vip_plus_price': {'ru': 'Цена: {cost} септимов', 'en': 'Price: {cost} septims'},
@@ -419,12 +475,75 @@ TEXTS = {
 def t(lang: str, key: str) -> str:
     return TEXTS.get(key, {}).get(lang, TEXTS.get(key, {}).get('ru', key))
 
+def _rating_bonus_percent(rating_value: int, max_bonus: float) -> float:
+    try:
+        r = int(rating_value or 0)
+    except Exception:
+        r = 0
+    r = max(0, min(1000, r))
+    try:
+        mb = float(max_bonus or 0.0)
+    except Exception:
+        mb = 0.0
+    mb = max(0.0, mb)
+    return mb * (r / 1000.0)
+
+def _rarity_weights_with_rating(base_weights: dict, rating_value: int, max_bonus: float) -> dict:
+    bonus = _rating_bonus_percent(rating_value, max_bonus)
+    order = ['Basic', 'Medium', 'Elite', 'Absolute', 'Majestic']
+    out = {}
+    for k, v in (base_weights or {}).items():
+        try:
+            out[str(k)] = float(v)
+        except Exception:
+            out[str(k)] = 0.0
+    for i, rk in enumerate(order):
+        if rk not in out:
+            continue
+        w = float(out.get(rk, 0.0) or 0.0)
+        if rk == 'Basic':
+            factor = max(0.05, 1.0 - bonus)
+        else:
+            denom = max(1, (len(order) - 1))
+            tier = i / float(denom)
+            factor = 1.0 + (bonus * tier)
+        out[rk] = max(0.0, w * factor)
+    if sum(v for v in out.values() if v > 0) <= 0:
+        out = {'Basic': 1.0}
+    return out
+
+def _daily_bonus_weights_with_rating(rewards: dict, rating_value: int, max_bonus: float) -> dict:
+    bonus = _rating_bonus_percent(rating_value, max_bonus)
+    out = {}
+    weights_only = {}
+    for k, info in (rewards or {}).items():
+        try:
+            w = float((info or {}).get('weight', 0) or 0)
+        except Exception:
+            w = 0.0
+        weights_only[str(k)] = max(0.0, w)
+    non_coins = {k: w for k, w in weights_only.items() if k != 'coins'}
+    max_non_coins = max(non_coins.values()) if non_coins else 0.0
+    for k, w in weights_only.items():
+        if k == 'coins':
+            factor = max(0.05, 1.0 - bonus)
+        else:
+            if max_non_coins > 0:
+                rarity_score = 1.0 - min(1.0, (w / max_non_coins))
+            else:
+                rarity_score = 1.0
+            factor = 1.0 + (bonus * rarity_score)
+        out[k] = max(0.0, float(w) * float(factor))
+    if sum(v for v in out.values() if v > 0) <= 0:
+        out = {'coins': 1.0}
+    return out
+
 # --- Функции-обработчики для кнопок ---
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает главное меню. УМЕЕТ ОБРАБАТЫВАТЬ ВОЗВРАТ С ФОТО."""
     user = update.effective_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    player = db.get_or_create_player(user.id, username=getattr(user, 'username', None), display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)))
 
     # Проверка кулдауна поиска (VIP+ — x0.25, VIP — x0.5)
     vip_plus_active = db.is_vip_plus(user.id)
@@ -491,10 +610,14 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     energy_count = len(db.get_player_inventory_with_details(user.id))
 
     # Улучшенная структура кнопок
+    bonus_info_label = "ℹ️ Инфо" if lang != 'en' else "ℹ️ Info"
     keyboard = [
         # Основные действия
         [InlineKeyboardButton(search_status, callback_data='find_energy')],
-        [InlineKeyboardButton(bonus_status, callback_data='claim_bonus')],
+        [
+            InlineKeyboardButton(bonus_status, callback_data='claim_bonus'),
+            InlineKeyboardButton(bonus_info_label, callback_data='daily_bonus_info'),
+        ],
         # Бонусы и города в одной строке
         [
             InlineKeyboardButton("🎁 Бонусы", callback_data='extra_bonuses'),
@@ -503,8 +626,9 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Профиль в одной строке
         [
             InlineKeyboardButton(t(lang, 'inventory'), callback_data='inventory'),
-            InlineKeyboardButton(t(lang, 'stats'), callback_data='stats')
+            InlineKeyboardButton(t(lang, 'my_profile'), callback_data='my_profile')
         ],
+        [InlineKeyboardButton("🎟 Промокод", callback_data='promo_enter')],
         # Настройки
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
     ]
@@ -521,6 +645,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user=user.mention_html(),
         coins=player.coins,
         energy_count=energy_count,
+        rating=int(getattr(player, 'rating', 0) or 0),
         vip_status=vip_status_text
     )
     
@@ -620,6 +745,135 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"🛡️ Администраторов: <b>{total_admins}</b>\n\n"
         "Выберите раздел:"
     )
+    
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def show_admin_settings_autosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    base_limit = db.get_setting_int('auto_search_daily_limit_base', AUTO_SEARCH_DAILY_LIMIT)
+    vip_mult = db.get_setting_float('auto_search_vip_daily_mult', 1.0)
+    vip_plus_mult = db.get_setting_float('auto_search_vip_plus_daily_mult', 2.0)
+
+    text = (
+        "🤖 <b>Автопоиск — лимиты</b>\n\n"
+        f"Базовый дневной лимит: <b>{int(base_limit)}</b>\n"
+        f"VIP множитель: <b>{vip_mult}</b>\n"
+        f"VIP+ множитель: <b>{vip_plus_mult}</b>\n\n"
+        "Выберите, что изменить:"
+    )
+    kb = [
+        [InlineKeyboardButton("Изменить базовый лимит", callback_data='admin_settings_set_auto_base')],
+        [InlineKeyboardButton("Изменить VIP множитель", callback_data='admin_settings_set_auto_vip_mult')],
+        [InlineKeyboardButton("Изменить VIP+ множитель", callback_data='admin_settings_set_auto_vip_plus_mult')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
+    ]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_settings_set_auto_base_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_autosearch')]]
+    try:
+        await query.message.edit_text("Введите новый базовый дневной лимит автопоиска (целое число ≥ 0):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_auto_base'
+
+
+async def admin_settings_set_auto_vip_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_autosearch')]]
+    try:
+        await query.message.edit_text("Введите VIP множитель дневного лимита (число ≥ 0, например 1 или 1.5):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_auto_vip_mult'
+
+
+async def admin_settings_set_auto_vip_plus_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_autosearch')]]
+    try:
+        await query.message.edit_text("Введите VIP+ множитель дневного лимита (число ≥ 0, например 2):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_auto_vip_plus_mult'
+
+
+async def admin_player_rating_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    player_id = None
+    if query.data and ':' in query.data:
+        parts = query.data.split(':')
+        if len(parts) > 1:
+            try:
+                player_id = int(parts[1])
+            except ValueError:
+                pass
+    
+    if not player_id:
+        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
+        return
+    
+    context.user_data['admin_player_action'] = 'rating'
+    context.user_data['admin_player_id'] = player_id
+    
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if player:
+            username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+            current_rating = int(getattr(player, 'rating', 0) or 0)
+            text = (
+                f"⭐ <b>Изменение рейтинга</b>\n\n"
+                f"Игрок: {username_display}\n"
+                f"Текущий рейтинг: <b>{current_rating}</b> ⭐\n\n"
+                f"Отправьте новое значение рейтинга или изменение:\n"
+                f"• <code>100</code> - установить\n"
+                f"• <code>+10</code> - добавить\n"
+                f"• <code>-5</code> - убрать\n\n"
+                f"Диапазон: 0..1000\n\n"
+                f"Или нажмите Отмена"
+            )
+        else:
+            text = "❌ Игрок не найден!"
+    finally:
+        dbs.close()
+    
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data=f'admin_player_details:{player_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     try:
         await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
@@ -907,11 +1161,9 @@ def _resolve_user_identifier(text: str) -> int | None:
     t = (text or '').strip()
     if not t:
         return None
-    # Поддерживаем @username и username с цифрами/подчёркиваниями
-    uname = t[1:] if t.startswith('@') else t
-    if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
-        p = db.get_player_by_username(uname)
-        return int(getattr(p, 'user_id', 0)) if p else None
+    res = db.find_player_by_identifier(t)
+    if res.get('ok') and res.get('player'):
+        return int(getattr(res['player'], 'user_id', 0) or 0) or None
     try:
         return int(t)
     except Exception:
@@ -1145,6 +1397,7 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     action = context.user_data.get('awaiting_admin_action')
+    initial_action = action
     player_action = context.user_data.get('admin_player_action')
     
     if not action and not player_action:
@@ -1154,6 +1407,10 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if player_action == 'balance':
         await handle_player_balance(update, context, text_input)
+        context.user_data.pop('admin_player_action', None)
+        context.user_data.pop('admin_player_id', None)
+    elif player_action == 'rating':
+        await handle_player_rating(update, context, text_input)
         context.user_data.pop('admin_player_action', None)
         context.user_data.pop('admin_player_id', None)
     elif action:
@@ -1250,6 +1507,16 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await handle_promo_create(update, context, text_input)
         elif action == 'promo_deactivate':
             await handle_promo_deactivate(update, context, text_input)
+        elif action == 'promo_wiz_code':
+            await handle_promo_wiz_code(update, context, text_input)
+        elif action == 'promo_wiz_value':
+            await handle_promo_wiz_value(update, context, text_input)
+        elif action == 'promo_wiz_max_uses':
+            await handle_promo_wiz_max_uses(update, context, text_input)
+        elif action == 'promo_wiz_per_user':
+            await handle_promo_wiz_per_user(update, context, text_input)
+        elif action == 'promo_wiz_expires':
+            await handle_promo_wiz_expires(update, context, text_input)
         elif action == 'broadcast':
             if getattr(update.message, 'audio', None):
                 await handle_admin_broadcast_audio(update, context, text_input)
@@ -1281,6 +1548,45 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
                 await update.message.reply_html("❌ Введите целое число секунд (>0)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_auto_base':
+            kb = [[InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')]]
+            try:
+                new_val = int(text_input.strip())
+                if new_val < 0:
+                    raise ValueError
+                ok = db.set_setting_int('auto_search_daily_limit_base', new_val)
+                if ok:
+                    await update.message.reply_html(f"✅ Базовый дневной лимит автопоиска обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число (≥ 0)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_auto_vip_mult':
+            kb = [[InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')]]
+            try:
+                new_val = float(text_input.strip().replace(',', '.'))
+                if new_val < 0:
+                    raise ValueError
+                ok = db.set_setting_float('auto_search_vip_daily_mult', new_val)
+                if ok:
+                    await update.message.reply_html(f"✅ VIP множитель обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите число (≥ 0), например 1 или 1.5", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_auto_vip_plus_mult':
+            kb = [[InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')]]
+            try:
+                new_val = float(text_input.strip().replace(',', '.'))
+                if new_val < 0:
+                    raise ValueError
+                ok = db.set_setting_float('auto_search_vip_plus_daily_mult', new_val)
+                if ok:
+                    await update.message.reply_html(f"✅ VIP+ множитель обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите число (≥ 0), например 2", reply_markup=InlineKeyboardMarkup(kb))
         elif action == 'mod_ban':
             # Формат: <id|@username> [duration] [reason...]
             parts = text_input.split(maxsplit=2)
@@ -1414,8 +1720,10 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 count = db.clear_warnings(uid)
                 await update.message.reply_html(f"🗑️ Удалено предупреждений: <b>{count}</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
         
-        # Очищаем состояние
-        context.user_data.pop('awaiting_admin_action', None)
+        # Очищаем состояние только если обработчик не перевёл нас на следующий шаг.
+        # (Например, мастер промокодов выставляет новый awaiting_admin_action на каждом шаге.)
+        if context.user_data.get('awaiting_admin_action') == initial_action:
+            context.user_data.pop('awaiting_admin_action', None)
 
 
 async def handle_drink_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
@@ -1555,17 +1863,16 @@ async def handle_logs_player(update: Update, context: ContextTypes.DEFAULT_TYPE,
     keyboard = [[InlineKeyboardButton("📝 Логи системы", callback_data='admin_logs_menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Определяем, это username или user_id
     player = None
-    if text_input.startswith('@'):
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
+    res = db.find_player_by_identifier(text_input)
+    if res.get('ok') and res.get('player'):
+        player = res['player']
     else:
         try:
-            user_id = int(text_input)
+            user_id = int(str(text_input).strip().lstrip('@'))
             player = db.get_or_create_player(user_id, f"User{user_id}")
-        except ValueError:
-            pass
+        except Exception:
+            player = None
     
     if not player:
         response = f"❌ Пользователь {text_input} не найден!"
@@ -1604,15 +1911,22 @@ async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             logger.error(f"Ошибка сброса бонусов: {e}")
             response = f"❌ Ошибка: {e}"
-    elif text_input.startswith('@'):
-        # Сбрасываем бонус для конкретного пользователя
-        username = text_input[1:]  # Убираем @
-        player = db.get_player_by_username(username)
-        if player:
+    elif text_input.strip():
+        res = db.find_player_by_identifier(text_input)
+        if res.get('ok') and res.get('player'):
+            player = res['player']
             db.update_player(player.user_id, last_bonus_claim=0)
-            response = f"✅ Ежедневный бонус сброшен для @{username}!"
+            username = getattr(player, 'username', None)
+            shown = f"@{username}" if username else str(player.user_id)
+            response = f"✅ Ежедневный бонус сброшен для {shown}!"
+        elif res.get('reason') == 'multiple':
+            lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+            for c in (res.get('candidates') or []):
+                cu = c.get('username')
+                lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+            response = "\n".join(lines)
         else:
-            response = f"❌ Пользователь @{username} не найден!"
+            response = f"❌ Пользователь {text_input} не найден!"
     else:
         response = "❌ Неверный формат! Используйте @username или all"
     
@@ -1624,29 +1938,38 @@ async def handle_give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     keyboard = [[InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    parts = text_input.split()
-    if len(parts) != 2 or not parts[0].startswith('@'):
+    parts = (text_input or '').split()
+    if len(parts) != 2:
         response = "❌ Неверный формат! Используйте: @username количество"
     else:
-        username = parts[0][1:]
+        ident = parts[0]
         try:
             amount = int(parts[1])
-            player = db.get_player_by_username(username)
-            if player:
+            res = db.find_player_by_identifier(ident)
+            if res.get('ok') and res.get('player'):
+                player = res['player']
+                username = getattr(player, 'username', None)
                 new_balance = db.increment_coins(player.user_id, amount)
                 # Логируем транзакцию
                 admin_user = update.effective_user
                 db.log_action(
                     user_id=player.user_id,
-                    username=username,
+                    username=(username or str(player.user_id)),
                     action_type='transaction',
                     action_details=f'Админская выдача: выдано админом @{admin_user.username or admin_user.first_name}',
                     amount=amount,
                     success=True
                 )
-                response = f"✅ Выдано <b>{amount}</b> септимов пользователю @{username}\nНовый баланс: <b>{new_balance}</b>"
+                shown = f"@{username}" if username else str(player.user_id)
+                response = f"✅ Выдано <b>{amount}</b> септимов пользователю {shown}\nНовый баланс: <b>{new_balance}</b>"
+            elif res.get('reason') == 'multiple':
+                lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+                for c in (res.get('candidates') or []):
+                    cu = c.get('username')
+                    lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+                response = "\n".join(lines)
             else:
-                response = f"❌ Пользователь @{username} не найден!"
+                response = f"❌ Пользователь {ident} не найден!"
         except ValueError:
             response = "❌ Количество должно быть числом!"
         except Exception as e:
@@ -1661,11 +1984,10 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     keyboard = [[InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not text_input.startswith('@'):
-        response = "❌ Неверный формат! Используйте: @username"
-    else:
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
+    res = db.find_player_by_identifier(text_input)
+    if res.get('ok') and res.get('player'):
+        player = res['player']
+        username = getattr(player, 'username', None)
         if player:
             # Получаем дополнительную информацию
             inventory_count = len(db.get_player_inventory_with_details(player.user_id))
@@ -1682,7 +2004,7 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             last_search = safe_format_timestamp(player.last_search) if player.last_search else "Никогда"
             
             response = (
-                f"📊 <b>Статистика пользователя @{username}</b>\n\n"
+                f"📊 <b>Статистика пользователя @{username}</b>\n\n" if username else f"📊 <b>Статистика пользователя {player.user_id}</b>\n\n"
                 f"<b>ID:</b> {player.user_id}\n"
                 f"<b>Баланс:</b> {player.coins} 🪙\n"
                 f"<b>Инвентарь:</b> {inventory_count} предметов\n"
@@ -1692,59 +2014,40 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"<b>Язык:</b> {player.language}"
             )
         else:
-            response = f"❌ Пользователь @{username} не найден!"
+            response = f"❌ Пользователь {text_input} не найден!"
+    elif res.get('reason') == 'multiple':
+        lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        response = "\n".join(lines)
+    else:
+        response = "❌ Неверный формат! Используйте: @username"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
 
 async def handle_player_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
     """Обрабатывает поиск игрока."""
-    player_id = None
-    text_input = text_input.strip()
-    
-    # Убираем @ если есть
-    search_query = text_input.lstrip('@')
-    
-    # Сначала пробуем как ID (число)
-    try:
-        user_id = int(search_query)
-        dbs = SessionLocal()
-        try:
-            player = dbs.query(Player).filter(Player.user_id == user_id).first()
-            if player:
-                player_id = player.user_id
-        finally:
-            dbs.close()
-    except ValueError:
-        # Не число - ищем по username
-        pass
-    
-    # Если не нашли по ID, ищем по username
-    if not player_id:
-        player = db.get_player_by_username(search_query)
-        if player:
-            player_id = player.user_id
-    
-    # Если всё ещё не нашли, пробуем частичный поиск по username
-    if not player_id:
-        dbs = SessionLocal()
-        try:
-            # Поиск по частичному совпадению (без учёта регистра)
-            player = dbs.query(Player).filter(
-                func.lower(Player.username).contains(search_query.lower())
-            ).first()
-            if player:
-                player_id = player.user_id
-        finally:
-            dbs.close()
-    
-    if player_id:
-        await show_player_details(update, context, player_id)
-    else:
+    text_input = (text_input or '').strip()
+    res = db.find_player_by_identifier(text_input)
+    if res.get('ok') and res.get('player'):
+        await show_player_details(update, context, int(res['player'].user_id))
+        return
+    if res.get('reason') == 'multiple':
         keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        response = f"❌ Игрок не найден!\n\nВы искали: <code>{text_input}</code>\n\nИспользуйте:\n• <code>@username</code> или просто <code>username</code>\n• <code>user_id</code> (число)"
-        await update.message.reply_html(response, reply_markup=reply_markup)
+        lines = [f"❌ Найдено несколько игроков по запросу: <code>{text_input}</code>", "", "Уточните запрос. Кандидаты:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"• @{cu} (ID: {c.get('user_id')})" if cu else f"• ID: {c.get('user_id')}")
+        await update.message.reply_html("\n".join(lines), reply_markup=reply_markup)
+        return
+
+    keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    response = f"❌ Игрок не найден!\n\nВы искали: <code>{text_input}</code>\n\nИспользуйте:\n• <code>@username</code> или просто <code>username</code>\n• <code>user_id</code> (число)"
+    await update.message.reply_html(response, reply_markup=reply_markup)
 
 
 async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
@@ -1831,30 +2134,127 @@ async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TY
         dbs.close()
 
 
+async def handle_player_rating(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    player_id = context.user_data.get('admin_player_id')
+    if not player_id:
+        response = "❌ Ошибка: ID игрока не найден!"
+        keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_html(response, reply_markup=reply_markup)
+        return
+
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == player_id).first()
+        if not player:
+            response = "❌ Игрок не найден!"
+            keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_html(response, reply_markup=reply_markup)
+            return
+
+        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        current_rating = int(getattr(player, 'rating', 0) or 0)
+        text_input = (text_input or '').strip()
+
+        admin_user = update.effective_user
+        new_rating = None
+
+        if text_input.startswith('+'):
+            try:
+                delta = int(text_input[1:])
+                new_rating = db.change_player_rating(player_id, delta)
+                if new_rating is None:
+                    response = "❌ Ошибка при изменении рейтинга"
+                else:
+                    db.log_action(
+                        user_id=player_id,
+                        username=username_display,
+                        action_type='admin_action',
+                        action_details=f'Админское изменение рейтинга: +{delta} (админ @{admin_user.username or admin_user.first_name})',
+                        amount=delta,
+                        success=True
+                    )
+                    response = f"✅ Рейтинг игрока {username_display}: <b>{current_rating}</b> → <b>{new_rating}</b> ⭐"
+            except ValueError:
+                response = "❌ Неверный формат! Используйте число после +"
+        elif text_input.startswith('-'):
+            try:
+                delta = int(text_input[1:])
+                new_rating = db.change_player_rating(player_id, -delta)
+                if new_rating is None:
+                    response = "❌ Ошибка при изменении рейтинга"
+                else:
+                    db.log_action(
+                        user_id=player_id,
+                        username=username_display,
+                        action_type='admin_action',
+                        action_details=f'Админское изменение рейтинга: -{delta} (админ @{admin_user.username or admin_user.first_name})',
+                        amount=-delta,
+                        success=True
+                    )
+                    response = f"✅ Рейтинг игрока {username_display}: <b>{current_rating}</b> → <b>{new_rating}</b> ⭐"
+            except ValueError:
+                response = "❌ Неверный формат! Используйте число после -"
+        else:
+            try:
+                value = int(text_input)
+                new_rating = db.set_player_rating(player_id, value)
+                if new_rating is None:
+                    response = "❌ Ошибка при установке рейтинга"
+                else:
+                    db.log_action(
+                        user_id=player_id,
+                        username=username_display,
+                        action_type='admin_action',
+                        action_details=f'Админская установка рейтинга: {current_rating} -> {new_rating} (админ @{admin_user.username or admin_user.first_name})',
+                        amount=new_rating,
+                        success=True
+                    )
+                    response = f"✅ Рейтинг игрока {username_display} установлен: <b>{new_rating}</b> ⭐"
+            except ValueError:
+                response = "❌ Неверный формат! Используйте число для установки рейтинга"
+
+        keyboard = [[InlineKeyboardButton("🔙 К игроку", callback_data=f'admin_player_details:{player_id}')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_html(response, reply_markup=reply_markup)
+    finally:
+        dbs.close()
+
+
 async def handle_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
     """Обрабатывает добавление админа."""
     keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     parts = text_input.split()
-    if len(parts) != 2 or not parts[0].startswith('@'):
+    if len(parts) != 2:
         response = "❌ Неверный формат! Используйте: @username уровень (1-3)"
     else:
-        username = parts[0][1:]
+        ident = parts[0]
         try:
             level = int(parts[1])
             if level not in (1, 2, 3):
                 response = "❌ Уровень должен быть 1, 2 или 3!"
             else:
-                player = db.get_player_by_username(username)
-                if not player:
-                    response = f"❌ Пользователь @{username} не найден в базе!"
+                res = db.find_player_by_identifier(ident)
+                if res.get('reason') == 'multiple':
+                    lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+                    for c in (res.get('candidates') or []):
+                        cu = c.get('username')
+                        lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+                    response = "\n".join(lines)
+                elif not (res.get('ok') and res.get('player')):
+                    response = f"❌ Пользователь {ident} не найден в базе!"
                 else:
+                    player = res['player']
+                    username = getattr(player, 'username', None)
                     success = db.add_admin_user(player.user_id, username, level)
+                    shown = f"@{username}" if username else str(player.user_id)
                     if success:
-                        response = f"✅ Админ @{username} добавлен с уровнем {level}!"
+                        response = f"✅ Админ {shown} добавлен с уровнем {level}!"
                     else:
-                        response = f"⚠️ @{username} уже является админом. Используйте повышение/понижение уровня."
+                        response = f"⚠️ {shown} уже является админом. Используйте повышение/понижение уровня."
         except ValueError:
             response = "❌ Уровень должен быть числом (1, 2 или 3)!"
         except Exception as e:
@@ -1869,26 +2269,31 @@ async def handle_admin_promote(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not text_input.startswith('@'):
+    res = db.find_player_by_identifier(text_input)
+    if res.get('reason') == 'multiple':
+        lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        response = "\n".join(lines)
+    elif not (res.get('ok') and res.get('player')):
         response = "❌ Неверный формат! Используйте: @username"
     else:
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
-        if not player:
-            response = f"❌ Пользователь @{username} не найден!"
+        player = res['player']
+        username = getattr(player, 'username', None)
+        shown = f"@{username}" if username else str(player.user_id)
+        current_level = db.get_admin_level(player.user_id)
+        if current_level == 0:
+            response = f"❌ {shown} не является админом!"
+        elif current_level >= 3:
+            response = f"⚠️ {shown} уже имеет максимальный уровень (3)!"
         else:
-            current_level = db.get_admin_level(player.user_id)
-            if current_level == 0:
-                response = f"❌ @{username} не является админом!"
-            elif current_level >= 3:
-                response = f"⚠️ @{username} уже имеет максимальный уровень (3)!"
+            new_level = current_level + 1
+            success = db.set_admin_level(player.user_id, new_level)
+            if success:
+                response = f"✅ Уровень админа {shown} повышен: {current_level} → {new_level}"
             else:
-                new_level = current_level + 1
-                success = db.set_admin_level(player.user_id, new_level)
-                if success:
-                    response = f"✅ Уровень админа @{username} повышен: {current_level} → {new_level}"
-                else:
-                    response = "❌ Ошибка при повышении уровня!"
+                response = "❌ Ошибка при повышении уровня!"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -1898,26 +2303,31 @@ async def handle_admin_demote(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not text_input.startswith('@'):
+    res = db.find_player_by_identifier(text_input)
+    if res.get('reason') == 'multiple':
+        lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        response = "\n".join(lines)
+    elif not (res.get('ok') and res.get('player')):
         response = "❌ Неверный формат! Используйте: @username"
     else:
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
-        if not player:
-            response = f"❌ Пользователь @{username} не найден!"
+        player = res['player']
+        username = getattr(player, 'username', None)
+        shown = f"@{username}" if username else str(player.user_id)
+        current_level = db.get_admin_level(player.user_id)
+        if current_level == 0:
+            response = f"❌ {shown} не является админом!"
+        elif current_level <= 1:
+            response = f"⚠️ {shown} имеет минимальный уровень (1). Используйте 'Уволить' для удаления."
         else:
-            current_level = db.get_admin_level(player.user_id)
-            if current_level == 0:
-                response = f"❌ @{username} не является админом!"
-            elif current_level <= 1:
-                response = f"⚠️ @{username} имеет минимальный уровень (1). Используйте 'Уволить' для удаления."
+            new_level = current_level - 1
+            success = db.set_admin_level(player.user_id, new_level)
+            if success:
+                response = f"✅ Уровень админа {shown} понижен: {current_level} → {new_level}"
             else:
-                new_level = current_level - 1
-                success = db.set_admin_level(player.user_id, new_level)
-                if success:
-                    response = f"✅ Уровень админа @{username} понижен: {current_level} → {new_level}"
-                else:
-                    response = "❌ Ошибка при понижении уровня!"
+                response = "❌ Ошибка при понижении уровня!"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -1927,23 +2337,28 @@ async def handle_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = [[InlineKeyboardButton("👥 Админы", callback_data='creator_admins')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not text_input.startswith('@'):
+    res = db.find_player_by_identifier(text_input)
+    if res.get('reason') == 'multiple':
+        lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        response = "\n".join(lines)
+    elif not (res.get('ok') and res.get('player')):
         response = "❌ Неверный формат! Используйте: @username"
     else:
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
-        if not player:
-            response = f"❌ Пользователь @{username} не найден!"
+        player = res['player']
+        username = getattr(player, 'username', None)
+        shown = f"@{username}" if username else str(player.user_id)
+        current_level = db.get_admin_level(player.user_id)
+        if current_level == 0:
+            response = f"❌ {shown} не является админом!"
         else:
-            current_level = db.get_admin_level(player.user_id)
-            if current_level == 0:
-                response = f"❌ @{username} не является админом!"
+            success = db.remove_admin_user(player.user_id)
+            if success:
+                response = f"✅ Админ {shown} (уровень {current_level}) уволен!"
             else:
-                success = db.remove_admin_user(player.user_id)
-                if success:
-                    response = f"✅ Админ @{username} (уровень {current_level}) уволен!"
-                else:
-                    response = "❌ Ошибка при увольнении админа!"
+                response = "❌ Ошибка при увольнении админа!"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -1954,22 +2369,31 @@ async def handle_vip_give(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     parts = text_input.split()
-    if len(parts) != 2 or not parts[0].startswith('@'):
+    if len(parts) != 2:
         response = "❌ Неверный формат! Используйте: @username дни"
     else:
-        username = parts[0][1:]
+        ident = parts[0]
         try:
             days = int(parts[1])
-            player = db.get_player_by_username(username)
-            if player:
+            res = db.find_player_by_identifier(ident)
+            if res.get('reason') == 'multiple':
+                lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+                for c in (res.get('candidates') or []):
+                    cu = c.get('username')
+                    lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+                response = "\n".join(lines)
+            elif not (res.get('ok') and res.get('player')):
+                response = f"❌ Пользователь {ident} не найден!"
+            else:
+                player = res['player']
                 duration_seconds = days * 86400
                 success = db.set_vip_for_user(player.user_id, duration_seconds)
+                username = getattr(player, 'username', None)
+                shown = f"@{username}" if username else str(player.user_id)
                 if success:
-                    response = f"✅ VIP выдан пользователю @{username} на <b>{days}</b> дней!"
+                    response = f"✅ VIP выдан пользователю {shown} на <b>{days}</b> дней!"
                 else:
                     response = "❌ Ошибка при выдаче VIP!"
-            else:
-                response = f"❌ Пользователь @{username} не найден!"
         except ValueError:
             response = "❌ Количество дней должно быть числом!"
         except Exception as e:
@@ -1985,22 +2409,31 @@ async def handle_vip_plus_give(update: Update, context: ContextTypes.DEFAULT_TYP
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     parts = text_input.split()
-    if len(parts) != 2 or not parts[0].startswith('@'):
+    if len(parts) != 2:
         response = "❌ Неверный формат! Используйте: @username дни"
     else:
-        username = parts[0][1:]
+        ident = parts[0]
         try:
             days = int(parts[1])
-            player = db.get_player_by_username(username)
-            if player:
+            res = db.find_player_by_identifier(ident)
+            if res.get('reason') == 'multiple':
+                lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+                for c in (res.get('candidates') or []):
+                    cu = c.get('username')
+                    lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+                response = "\n".join(lines)
+            elif not (res.get('ok') and res.get('player')):
+                response = f"❌ Пользователь {ident} не найден!"
+            else:
+                player = res['player']
                 duration_seconds = days * 86400
                 success = db.set_vip_plus_for_user(player.user_id, duration_seconds)
+                username = getattr(player, 'username', None)
+                shown = f"@{username}" if username else str(player.user_id)
                 if success:
-                    response = f"✅ VIP+ выдан пользователю @{username} на <b>{days}</b> дней!"
+                    response = f"✅ VIP+ выдан пользователю {shown} на <b>{days}</b> дней!"
                 else:
                     response = "❌ Ошибка при выдаче VIP+!"
-            else:
-                response = f"❌ Пользователь @{username} не найден!"
         except ValueError:
             response = "❌ Количество дней должно быть числом!"
         except Exception as e:
@@ -2015,19 +2448,24 @@ async def handle_vip_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     keyboard = [[InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not text_input.startswith('@'):
+    res = db.find_player_by_identifier(text_input)
+    if res.get('reason') == 'multiple':
+        lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        response = "\n".join(lines)
+    elif not (res.get('ok') and res.get('player')):
         response = "❌ Неверный формат! Используйте: @username"
     else:
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
-        if player:
-            success = db.remove_vip_from_user(player.user_id)
-            if success:
-                response = f"✅ VIP отозван у пользователя @{username}!"
-            else:
-                response = "❌ Ошибка при отзыве VIP!"
+        player = res['player']
+        username = getattr(player, 'username', None)
+        shown = f"@{username}" if username else str(player.user_id)
+        success = db.remove_vip_from_user(player.user_id)
+        if success:
+            response = f"✅ VIP отозван у пользователя {shown}!"
         else:
-            response = f"❌ Пользователь @{username} не найден!"
+            response = "❌ Ошибка при отзыве VIP!"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -2037,19 +2475,24 @@ async def handle_vip_plus_remove(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = [[InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    if not text_input.startswith('@'):
+    res = db.find_player_by_identifier(text_input)
+    if res.get('reason') == 'multiple':
+        lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+        for c in (res.get('candidates') or []):
+            cu = c.get('username')
+            lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+        response = "\n".join(lines)
+    elif not (res.get('ok') and res.get('player')):
         response = "❌ Неверный формат! Используйте: @username"
     else:
-        username = text_input[1:]
-        player = db.get_player_by_username(username)
-        if player:
-            success = db.remove_vip_plus_from_user(player.user_id)
-            if success:
-                response = f"✅ VIP+ отозван у пользователя @{username}!"
-            else:
-                response = "❌ Ошибка при отзыве VIP+!"
+        player = res['player']
+        username = getattr(player, 'username', None)
+        shown = f"@{username}" if username else str(player.user_id)
+        success = db.remove_vip_plus_from_user(player.user_id)
+        if success:
+            response = f"✅ VIP+ отозван у пользователя {shown}!"
         else:
-            response = f"❌ Пользователь @{username} не найден!"
+            response = "❌ Ошибка при отзыве VIP+!"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -2567,6 +3010,7 @@ async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"<b>Username:</b> {username_display}\n"
             f"<b>ID:</b> <code>{player.user_id}</code>\n"
             f"<b>Баланс:</b> <b>{player.coins:,}</b> 🪙\n"
+            f"<b>Рейтинг:</b> <b>{int(getattr(player, 'rating', 0) or 0)}</b> ⭐\n"
             f"<b>Инвентарь:</b> {inventory_count} предметов\n"
             f"<b>VIP статус:</b> {vip_status}\n"
             f"<b>Админ:</b> {admin_status}\n"
@@ -2578,6 +3022,7 @@ async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         keyboard = [
             [InlineKeyboardButton("💰 Изменить баланс", callback_data=f'admin_player_balance:{player_id}')],
+            [InlineKeyboardButton("⭐ Изменить рейтинг", callback_data=f'admin_player_rating:{player_id}')],
             [InlineKeyboardButton("💎 Управление VIP", callback_data=f'admin_player_vip:{player_id}')],
             [InlineKeyboardButton("👥 Селюки игрока", callback_data=f'admin_player_selyuki:{player_id}')],
             [InlineKeyboardButton("📝 Логи игрока", callback_data=f'admin_player_logs:{player_id}')],
@@ -3786,7 +4231,8 @@ async def admin_promo_create_start(update: Update, context: ContextTypes.DEFAULT
         "<code>CODE | kind | value | max_uses | per_user_limit | expires(YYYY-MM-DD HH:MM или -) | active(да/нет)</code>\n\n"
         "Для kind = <b>drink</b> используйте <b>8 полей</b> (value = DRINK_ID):\n"
         "<code>CODE | drink | DRINK_ID | max_uses | per_user_limit | expires | active | rarity</code>\n\n"
-        "Доступные rarity: Basic, Uncommon, Rare, Epic, Legendary"
+        "rarity можно указать как <code>-</code>, чтобы использовать встроенную редкость энергетика (default_rarity).\n"
+        "Иначе: " + ", ".join(list(RARITIES.keys()))
     )
     keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_promo_menu')]]
     try:
@@ -3920,16 +4366,19 @@ async def handle_promo_create(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Разрешённые значения — ключи RARITIES (без учёта регистра)
             valid = list(RARITIES.keys())
             if not rarity_s:
-                await update.message.reply_html("❌ Укажите rarity для drink. Доступно: " + ", ".join(valid), reply_markup=InlineKeyboardMarkup(keyboard))
+                await update.message.reply_html("❌ Укажите rarity для drink. Доступно: " + ", ".join(valid) + " или <code>-</code> (встроенная)", reply_markup=InlineKeyboardMarkup(keyboard))
                 return
-            rarity_map = {r.lower(): r for r in valid}
-            rarity_final = rarity_map.get(rarity_s.strip().lower())
-            if not rarity_final:
-                await update.message.reply_html("❌ Неверная rarity. Доступно: " + ", ".join(valid), reply_markup=InlineKeyboardMarkup(keyboard))
-                return
+            if rarity_s.strip() == '-':
+                rarity_final = None
+            else:
+                rarity_map = {r.lower(): r for r in valid}
+                rarity_final = rarity_map.get(rarity_s.strip().lower())
+                if not rarity_final:
+                    await update.message.reply_html("❌ Неверная rarity. Доступно: " + ", ".join(valid) + " или <code>-</code>", reply_markup=InlineKeyboardMarkup(keyboard))
+                    return
         res = db.create_promo(code, kind, value, max_uses, per_user, expires, active, rarity=rarity_final)
         if res.get('ok'):
-            ok_suffix = f" (rarity: {rarity_final})" if rarity_final else ""
+            ok_suffix = f" (rarity: {rarity_final})" if rarity_final else (" (rarity: встроенная)" if kind_l == 'drink' else "")
             await update.message.reply_html(f"✅ Создан промокод <b>{code}</b>{ok_suffix}", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             reason = res.get('reason')
@@ -3948,6 +4397,448 @@ async def handle_promo_deactivate(update: Update, context: ContextTypes.DEFAULT_
     except Exception:
         ok = db.deactivate_promo_by_code(s)
     await update.message.reply_html("✅ Деактивирован" if ok else "❌ Не найден", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+def _gen_promo_code(length: int = 10) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(int(length)))
+
+
+async def admin_promo_wizard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    context.user_data['promo_wiz'] = {}
+    context.user_data['awaiting_admin_action'] = 'promo_wiz_code'
+    text = (
+        "🧙 <b>Мастер создания промокода</b>\n\n"
+        "Шаг 1/6: отправьте <b>код</b> промокода\n"
+        "• Можно написать <code>-</code>, чтобы я сгенерировал код автоматически"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+        [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def handle_promo_wiz_code(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+        [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
+    ])
+    code = (text_input or '').strip()
+    if code == '-':
+        code = _gen_promo_code(10)
+    if not code or len(code) < 3:
+        await update.message.reply_html("❌ Код слишком короткий. Отправьте другой код (минимум 3 символа) или <code>-</code> для генерации.", reply_markup=keyboard)
+        return
+    wiz = context.user_data.get('promo_wiz') or {}
+    wiz['code'] = code
+    context.user_data['promo_wiz'] = wiz
+    context.user_data.pop('awaiting_admin_action', None)
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💰 Монеты", callback_data='promo_wiz_kind:coins'),
+            InlineKeyboardButton("👑 VIP", callback_data='promo_wiz_kind:vip'),
+        ],
+        [
+            InlineKeyboardButton("💎 VIP+", callback_data='promo_wiz_kind:vip_plus'),
+            InlineKeyboardButton("🥤 Энергетик", callback_data='promo_wiz_kind:drink'),
+        ],
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    text = (
+        "🧙 <b>Мастер создания промокода</b>\n\n"
+        f"Код: <code>{html.escape(code)}</code>\n\n"
+        "Шаг 2/6: выберите тип награды (kind)"
+    )
+    await update.message.reply_html(text, reply_markup=kb)
+
+
+async def promo_wiz_kind_select(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    wiz = context.user_data.get('promo_wiz') or {}
+    wiz['kind'] = str(kind).strip().lower()
+    wiz.pop('rarity', None)
+    context.user_data['promo_wiz'] = wiz
+    context.user_data['awaiting_admin_action'] = 'promo_wiz_value'
+    hint = "монеты" if wiz['kind'] == 'coins' else ("дни VIP" if wiz['kind'] == 'vip' else ("дни VIP+" if wiz['kind'] == 'vip_plus' else "ID энергетика"))
+    text = (
+        "🧙 <b>Мастер создания промокода</b>\n\n"
+        f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
+        f"Тип: <b>{html.escape(wiz['kind'])}</b>\n\n"
+        f"Шаг 3/6: отправьте значение (value) — <b>{hint}</b>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def handle_promo_wiz_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    wiz = context.user_data.get('promo_wiz') or {}
+    kind = str(wiz.get('kind') or '').strip().lower()
+    try:
+        value = int(str(text_input).strip())
+    except Exception:
+        await update.message.reply_html("❌ Значение должно быть числом.", reply_markup=keyboard)
+        return
+    if kind == 'coins' and value <= 0:
+        await update.message.reply_html("❌ Монеты должны быть > 0.", reply_markup=keyboard)
+        return
+    if kind in ('vip', 'vip_plus') and value <= 0:
+        await update.message.reply_html("❌ Дни должны быть > 0.", reply_markup=keyboard)
+        return
+    if kind == 'drink':
+        d = db.get_drink_by_id(value)
+        if not d:
+            await update.message.reply_html("❌ Энергетик с таким ID не найден.", reply_markup=keyboard)
+            return
+    wiz['value'] = value
+    context.user_data['promo_wiz'] = wiz
+    if kind == 'drink':
+        context.user_data.pop('awaiting_admin_action', None)
+        # Реальные редкости берём из констант. "Встроенная" означает: rarity=None (будет использована default_rarity напитка)
+        rarity_list = [r for r in RARITY_ORDER if r in COLOR_EMOJIS]
+        kb_rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton("🏷️ Встроенная", callback_data='promo_wiz_rarity:__default__')]
+        ]
+        row: list[InlineKeyboardButton] = []
+        for r in rarity_list:
+            label = f"{COLOR_EMOJIS.get(r, '')} {r}".strip()
+            row.append(InlineKeyboardButton(label, callback_data=f'promo_wiz_rarity:{r}'))
+            if len(row) == 2:
+                kb_rows.append(row)
+                row = []
+        if row:
+            kb_rows.append(row)
+        kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')])
+        kb = InlineKeyboardMarkup(kb_rows)
+        text = (
+            "🧙 <b>Мастер создания промокода</b>\n\n"
+            f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
+            f"Тип: <b>{html.escape(kind)}</b>\n"
+            f"Drink ID: <b>{value}</b>\n\n"
+            "Шаг 4/6: выберите редкость (rarity)"
+        )
+        await update.message.reply_html(text, reply_markup=kb)
+        return
+    context.user_data['awaiting_admin_action'] = 'promo_wiz_max_uses'
+    await update.message.reply_html(
+        "Шаг 4/6: отправьте <b>max_uses</b> (0 = без лимита)",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')]])
+    )
+
+
+async def promo_wiz_rarity_select(update: Update, context: ContextTypes.DEFAULT_TYPE, rarity: str):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    wiz = context.user_data.get('promo_wiz') or {}
+    r_in = str(rarity).strip()
+    # Спец-значение: используем встроенную редкость напитка (default_rarity)
+    if r_in == '__default__':
+        wiz.pop('rarity', None)
+        rarity_final = None
+    else:
+        valid = [r for r in RARITY_ORDER if r in COLOR_EMOJIS]
+        rarity_map = {r.lower(): r for r in valid}
+        rarity_final = rarity_map.get(r_in.lower())
+        if not rarity_final:
+            await query.answer("Неверная редкость", show_alert=True)
+            return
+        wiz['rarity'] = rarity_final
+    context.user_data['promo_wiz'] = wiz
+    context.user_data['awaiting_admin_action'] = 'promo_wiz_max_uses'
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    rarity_text = "встроенная" if rarity_final is None else str(rarity_final)
+    text = (
+        "🧙 <b>Мастер создания промокода</b>\n\n"
+        f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
+        f"Тип: <b>{html.escape(str(wiz.get('kind','')))}</b>\n"
+        f"Значение: <b>{html.escape(str(wiz.get('value','')))}</b>\n"
+        f"Редкость: <b>{html.escape(rarity_text)}</b>\n\n"
+        "Шаг 5/6: отправьте <b>max_uses</b> (0 = без лимита)"
+    )
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def handle_promo_wiz_max_uses(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    wiz = context.user_data.get('promo_wiz') or {}
+    try:
+        v = int(str(text_input).strip())
+        if v < 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_html("❌ max_uses должен быть целым числом (0 или больше).", reply_markup=keyboard)
+        return
+    wiz['max_uses'] = v
+    context.user_data['promo_wiz'] = wiz
+    context.user_data['awaiting_admin_action'] = 'promo_wiz_per_user'
+    await update.message.reply_html(
+        "Шаг 6/6: отправьте <b>per_user_limit</b> (0 = без лимита на пользователя)",
+        reply_markup=keyboard
+    )
+
+
+async def handle_promo_wiz_per_user(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    wiz = context.user_data.get('promo_wiz') or {}
+    try:
+        v = int(str(text_input).strip())
+        if v < 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_html("❌ per_user_limit должен быть целым числом (0 или больше).", reply_markup=keyboard)
+        return
+    wiz['per_user_limit'] = v
+    context.user_data['promo_wiz'] = wiz
+    context.user_data['awaiting_admin_action'] = 'promo_wiz_expires'
+    await update.message.reply_html(
+        "Отправьте срок действия: <code>YYYY-MM-DD HH:MM</code> или <code>-</code> (без срока)",
+        reply_markup=keyboard
+    )
+
+
+async def handle_promo_wiz_expires(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    wiz = context.user_data.get('promo_wiz') or {}
+    expires_s = (text_input or '').strip()
+    expires = None
+    if expires_s and expires_s != '-':
+        try:
+            from datetime import datetime
+            expires = int(datetime.strptime(expires_s, "%Y-%m-%d %H:%M").timestamp())
+        except Exception:
+            await update.message.reply_html("❌ Неверная дата. Формат: <code>YYYY-MM-DD HH:MM</code> или <code>-</code>.", reply_markup=keyboard)
+            return
+    wiz['expires_at'] = expires
+    context.user_data['promo_wiz'] = wiz
+    context.user_data.pop('awaiting_admin_action', None)
+    exp_str = safe_format_timestamp(expires) if expires else '—'
+    rarity = wiz.get('rarity')
+    rarity_line = f"Рarity: <b>{html.escape(str(rarity))}</b>\n" if rarity else ""
+    text = (
+        "🧾 <b>Проверьте промокод</b>\n\n"
+        f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
+        f"Kind: <b>{html.escape(str(wiz.get('kind','')))}</b>\n"
+        f"Value: <b>{html.escape(str(wiz.get('value','')))}</b>\n"
+        + rarity_line +
+        f"max_uses: <b>{html.escape(str(wiz.get('max_uses', 0)))}</b>\n"
+        f"per_user_limit: <b>{html.escape(str(wiz.get('per_user_limit', 0)))}</b>\n"
+        f"expires: <b>{html.escape(exp_str)}</b>\n\n"
+        "Активировать сразу?"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да", callback_data='promo_wiz_active:1'), InlineKeyboardButton("❌ Нет", callback_data='promo_wiz_active:0')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    await update.message.reply_html(text, reply_markup=kb)
+
+
+async def promo_wiz_active_select(update: Update, context: ContextTypes.DEFAULT_TYPE, active: bool):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    wiz = context.user_data.get('promo_wiz') or {}
+    wiz['active'] = bool(active)
+    context.user_data['promo_wiz'] = wiz
+    exp_str = safe_format_timestamp(wiz.get('expires_at')) if wiz.get('expires_at') else '—'
+    rarity = wiz.get('rarity')
+    rarity_line = f"Rarity: <b>{html.escape(str(rarity))}</b>\n" if rarity else ""
+    text = (
+        "✅ <b>Готово к созданию</b>\n\n"
+        f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
+        f"Kind: <b>{html.escape(str(wiz.get('kind','')))}</b>\n"
+        f"Value: <b>{html.escape(str(wiz.get('value','')))}</b>\n"
+        + rarity_line +
+        f"max_uses: <b>{html.escape(str(wiz.get('max_uses', 0)))}</b>\n"
+        f"per_user_limit: <b>{html.escape(str(wiz.get('per_user_limit', 0)))}</b>\n"
+        f"expires: <b>{html.escape(exp_str)}</b>\n"
+        f"active: <b>{'да' if wiz.get('active') else 'нет'}</b>\n\n"
+        "Создать промокод?"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Создать", callback_data='promo_wiz_confirm')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def promo_wiz_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    wiz = context.user_data.get('promo_wiz') or {}
+    code = wiz.get('code')
+    kind = wiz.get('kind')
+    value = int(wiz.get('value') or 0)
+    max_uses = int(wiz.get('max_uses') or 0)
+    per_user = int(wiz.get('per_user_limit') or 0)
+    expires = wiz.get('expires_at')
+    active = bool(wiz.get('active', True))
+    rarity = wiz.get('rarity')
+    res = db.create_promo(str(code), str(kind), int(value), int(max_uses), int(per_user), expires, active, rarity=rarity)
+    context.user_data.pop('promo_wiz', None)
+    context.user_data.pop('awaiting_admin_action', None)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')]])
+    if res.get('ok'):
+        suffix = f" (rarity: {html.escape(str(rarity))})" if rarity else ""
+        try:
+            await query.message.edit_text(f"✅ Создан промокод <b>{html.escape(str(code))}</b>{suffix}", reply_markup=kb, parse_mode='HTML')
+        except BadRequest:
+            pass
+    else:
+        reason = html.escape(str(res.get('reason')))
+        try:
+            await query.message.edit_text(f"❌ Ошибка создания: {reason}", reply_markup=kb, parse_mode='HTML')
+        except BadRequest:
+            pass
+
+
+async def promo_wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    context.user_data.pop('promo_wiz', None)
+    context.user_data.pop('awaiting_admin_action', None)
+    await show_admin_promo_menu(update, context)
+
+
+async def admin_promo_deactivate_pick_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    data = query.data or ''
+    page = 1
+    if ':' in data:
+        try:
+            page = int(data.split(':', 1)[1])
+        except Exception:
+            page = 1
+    promos = db.list_promos(active_only=True)
+    per_page = 10
+    total = len(promos)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, pages))
+    start = (page - 1) * per_page
+    chunk = promos[start:start + per_page]
+    lines = ["❌ <b>Деактивация (выбор)</b>\n"]
+    if not chunk:
+        lines.append("<i>Нет активных промокодов</i>")
+    else:
+        for p in chunk:
+            extra = f" rarity={p.get('rarity') or '-'}" if str(p.get('kind','')).lower() == 'drink' else ''
+            lines.append(f"• <b>{html.escape(p['code'])}</b> [{html.escape(str(p['kind']))}] val={p['value']}{extra} used={p['used']}/{p['max_uses'] or '∞'}")
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for p in chunk:
+        kb_rows.append([InlineKeyboardButton(f"⛔ {p['code']}", callback_data=f"promo_deact:{p['id']}")])
+    nav: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"admin_promo_deactivate_pick:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data='noop'))
+    if page < pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"admin_promo_deactivate_pick:{page+1}"))
+    if nav:
+        kb_rows.append(nav)
+    kb_rows.append([InlineKeyboardButton("🔙 Промокоды", callback_data='admin_promo_menu')])
+    try:
+        await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_promo_deactivate_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, promo_id: int):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    promos = db.list_promos(active_only=False)
+    p = next((x for x in promos if int(x.get('id')) == int(promo_id)), None)
+    if not p:
+        await query.answer("Не найден", show_alert=True)
+        return
+    exp = p.get('expires_at')
+    exp_str = safe_format_timestamp(exp) if exp else '—'
+    extra = f"\nrarity: <b>{html.escape(str(p.get('rarity') or '-'))}</b>" if str(p.get('kind','')).lower() == 'drink' else ""
+    text = (
+        "❌ <b>Подтверждение деактивации</b>\n\n"
+        f"ID: <b>{p['id']}</b>\n"
+        f"CODE: <code>{html.escape(p['code'])}</code>\n"
+        f"kind: <b>{html.escape(str(p['kind']))}</b>\n"
+        f"value: <b>{html.escape(str(p['value']))}</b>\n"
+        + extra +
+        f"\nused: <b>{p.get('used', 0)}</b>\n"
+        f"expires: <b>{html.escape(exp_str)}</b>\n\n"
+        "Деактивировать?"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⛔ Деактивировать", callback_data=f"promo_deact_do:{p['id']}")],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_promo_deactivate_pick')],
+        [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_promo_deactivate_do(update: Update, context: ContextTypes.DEFAULT_TYPE, promo_id: int):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    ok = db.deactivate_promo_by_id(int(promo_id))
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Деактивация (выбор)", callback_data='admin_promo_deactivate_pick')],
+        [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
+    ])
+    text = "✅ Деактивирован" if ok else "❌ Не найден"
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
 
 
 async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
@@ -4015,10 +4906,12 @@ async def show_admin_promo_menu(update: Update, context: ContextTypes.DEFAULT_TY
     active_promos = db.get_active_promo_count()
     
     keyboard = [
-        [InlineKeyboardButton("➕ Создать промокод", callback_data='admin_promo_create')],
+        [InlineKeyboardButton("🧙 Мастер создания", callback_data='admin_promo_wizard')],
+        [InlineKeyboardButton("➕ Быстро создать (строка)", callback_data='admin_promo_create')],
         [InlineKeyboardButton("📋 Активные промокоды", callback_data='admin_promo_list_active')],
         [InlineKeyboardButton("🗂️ Все промокоды", callback_data='admin_promo_list_all')],
-        [InlineKeyboardButton("❌ Деактивировать", callback_data='admin_promo_deactivate')],
+        [InlineKeyboardButton("❌ Деактивировать (выбор)", callback_data='admin_promo_deactivate_pick')],
+        [InlineKeyboardButton("❌ Деактивировать (ID/CODE)", callback_data='admin_promo_deactivate')],
         [InlineKeyboardButton("📊 Статистика использования", callback_data='admin_promo_stats')],
         [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
     ]
@@ -4055,6 +4948,7 @@ async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT
     
     keyboard = [
         [InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')],
+        [InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')],
         [InlineKeyboardButton("💰 Лимиты монет", callback_data='admin_settings_limits')],
         [InlineKeyboardButton("🎰 Настройки казино", callback_data='admin_settings_casino')],
         [InlineKeyboardButton("🏪 Настройки магазина", callback_data='admin_settings_shop')],
@@ -4068,10 +4962,11 @@ async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT
         "⚙️ <b>Настройки бота</b>\n\n"
         "Управление параметрами работы бота:\n\n"
         "⏱️ <b>Кулдауны</b> - время ожидания между действиями\n"
+        "🤖 <b>Автопоиск</b> - лимиты и коэффициенты VIP/VIP+\n"
         "💰 <b>Лимиты</b> - ограничения на операции\n"
         "🎰 <b>Казино</b> - настройки игр и шансов\n"
         "🏪 <b>Магазин</b> - цены и ассортимент\n"
-        "🔔 <b>Уведомления</b> - напоминания пользователям\n"
+        "🔔 <b>Уведомления</b> - настройки уведомлений\n"
         "🌐 <b>Локализация</b> - языки интерфейса\n\n"
         "Выберите раздел:"
     )
@@ -4521,6 +5416,12 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         bed_index = context.job.data.get('bed_index', 0)
 
         auto_res = db.try_farmer_autowater(user_id, bed_index)
+        player = None
+        try:
+            player = db.get_player(user_id)
+        except Exception:
+            player = None
+        silent_farmer = bool(getattr(player, 'farmer_silent', False)) if player else False
 
         keyboard = [
             [InlineKeyboardButton("🌱 Перейти к плантациям", callback_data='market_plantation')],
@@ -4529,11 +5430,16 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         if auto_res.get('ok'):
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"👨‍🌾 Селюк фермер полил грядку {bed_index} (−{auto_res.get('cost', 50)} септимов с его баланса).",
-                reply_markup=reply_markup
-            )
+            try:
+                db.try_farmer_auto_fertilize(user_id)
+            except Exception:
+                pass
+            if not silent_farmer:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"👨‍🌾 Селюк фермер полил грядку {bed_index} (−{auto_res.get('cost', 50)} септимов с его баланса).",
+                    reply_markup=reply_markup
+                )
             # Планируем следующий полив
             water_interval = auto_res.get('water_interval_sec', 1800)
             context.job_queue.run_once(
@@ -4546,10 +5452,32 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         reason = auto_res.get('reason') if isinstance(auto_res, dict) else None
+        # Если job сработал слишком рано (например, пользователь полил вручную раньше), перепланируем
+        if reason == 'too_early_to_water':
+            nxt = int(auto_res.get('next_water_in') or 0)
+            if nxt > 0:
+                try:
+                    context.job_queue.run_once(
+                        plantation_water_reminder_job,
+                        when=nxt,
+                        chat_id=user_id,
+                        data={'bed_index': bed_index},
+                        name=f"plantation_water_reminder_{user_id}_{bed_index}"
+                    )
+                except Exception:
+                    pass
+            return
         
         # Если грядка пустая или удалена - прекращаем напоминания
-        if reason in ('no_seed', 'no_bed'):
+        if reason in ('no_seed', 'no_bed', 'no_such_bed'):
             return
+        if reason == 'not_growing':
+            try:
+                bed_state = str(auto_res.get('bed_state') or '')
+            except Exception:
+                bed_state = ''
+            if bed_state in ('empty', 'withered', 'ready'):
+                return
 
         if reason == 'remind_disabled':
             text = (
@@ -4561,6 +5489,23 @@ async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
             text = (
                 f"💧 Грядка {bed_index} готова к поливу!\n\n"
                 "👨‍🌾 Селюку фермеру не хватает септимов на балансе, полей грядку вручную или пополни баланс селюка."
+            )
+        elif reason == 'min_balance_guard':
+            mb = int(auto_res.get('min_balance') or 0)
+            text = (
+                f"💧 Грядка {bed_index} готова к поливу!\n\n"
+                f"👨‍🌾 Фермер не поливает, потому что включена защита минимального остатка ({mb} 💎)."
+            )
+        elif reason == 'daily_limit_reached':
+            dl = int(auto_res.get('daily_limit') or 0)
+            text = (
+                f"💧 Грядка {bed_index} готова к поливу!\n\n"
+                f"👨‍🌾 Фермер не поливает, потому что достигнут дневной лимит расходов ({dl} 💎)."
+            )
+        elif reason == 'disabled_by_settings':
+            text = (
+                f"💧 Грядка {bed_index} готова к поливу!\n\n"
+                "👨‍🌾 Автополив у фермера выключен в настройках."
             )
         elif reason == 'not_growing':
              # Если уже не growing, значит, возможно, уже выросло или удалено
@@ -4587,44 +5532,106 @@ async def global_farmer_harvest_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         user_ids = db.get_users_with_level2_farmers()
         for user_id in user_ids:
-            try:
-                res = db.try_farmer_auto_harvest(user_id)
-                if res.get('ok') and res.get('harvested'):
-                    items = res['harvested']
-                    
-                    text = "👨‍🌾 <b>Селюк фермер собрал урожай!</b>\n\n"
-                    for item in items:
-                        bed_idx = item.get('bed_index')
-                        amount = item.get('items_added')
-                        drink_name = item.get('drink_name', "Неизвестный")
-                        text += f"• Грядка {bed_idx}: {amount} шт. ({drink_name})\n"
-                    
-                    text += "\nУрожай добавлен в инвентарь."
-                    
+            silent_farmer = False
+            lock = _get_lock(f"user:{user_id}:farmer_global")
+            if lock.locked():
+                continue
+            async with lock:
+                try:
+                    player = None
                     try:
-                        await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+                        player = db.get_player(int(user_id))
                     except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"Ошибка автосбора для user {user_id}: {e}")
+                        player = None
+                    silent_farmer = bool(getattr(player, 'farmer_silent', False)) if player else False
 
-            # После сбора урожая пытаемся посадить новые семена (для 3 уровня)
-            try:
-                plant_res = db.try_farmer_auto_plant(user_id)
-                if plant_res.get('ok') and plant_res.get('planted'):
-                    planted = plant_res['planted']
-                    plant_text = "🌱 <b>Селюк фермер посадил новые семена!</b>\n\n"
-                    for p in planted:
-                        plant_text += f"• Грядка {p['bed_index']}: {p['seed_name']}\n"
-                    
-                    try:
-                        await context.bot.send_message(chat_id=user_id, text=plant_text, parse_mode='HTML')
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"Ошибка автопосадки для user {user_id}: {e}")
+                    res = db.try_farmer_auto_harvest(user_id)
+                    if res.get('ok') and res.get('harvested'):
+                        items = res['harvested']
+                        if not silent_farmer:
+                            text = "👨‍🌾 <b>Селюк фермер собрал урожай!</b>\n\n"
+                            for item in items:
+                                bed_idx = item.get('bed_index')
+                                amount = item.get('items_added')
+                                drink_name = item.get('drink_name', "Неизвестный")
+                                text += f"• Грядка {bed_idx}: {amount} шт. ({drink_name})\n"
+                            
+                            text += "\nУрожай добавлен в инвентарь."
+                            
+                            try:
+                                await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"Ошибка автосбора для user {user_id}: {e}")
+
+                # После сбора урожая пытаемся посадить новые семена (для 3 уровня)
+                try:
+                    plant_res = db.try_farmer_auto_plant(user_id)
+                    if plant_res.get('ok') and plant_res.get('planted'):
+                        planted = plant_res['planted']
+                        if not silent_farmer:
+                            plant_text = "🌱 <b>Селюк фермер посадил новые семена!</b>\n\n"
+                            for p in planted:
+                                plant_text += f"• Грядка {p['bed_index']}: {p['seed_name']}\n"
+                            
+                            try:
+                                await context.bot.send_message(chat_id=user_id, text=plant_text, parse_mode='HTML')
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"Ошибка автопосадки для user {user_id}: {e}")
     except Exception as ex:
         logger.warning(f"Ошибка в global_farmer_harvest_job: {ex}")
+
+
+async def global_farmer_fertilize_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_ids = db.get_users_with_level4_farmers()
+        for user_id in user_ids:
+            lock = _get_lock(f"user:{user_id}:farmer_global")
+            if lock.locked():
+                continue
+            async with lock:
+                try:
+                    db.try_farmer_auto_fertilize(user_id)
+                except Exception as e:
+                    logger.warning(f"Ошибка автоудобрения для user {user_id}: {e}")
+    except Exception as ex:
+        logger.warning(f"Ошибка в global_farmer_fertilize_job: {ex}")
+
+
+async def farmer_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        due = db.get_players_with_farmer_summaries_due()
+        for row in due:
+            user_id = int(row.get('user_id') or 0)
+            if user_id <= 0:
+                continue
+            stats = row.get('stats') or {}
+            wc = int(stats.get('water_count') or 0)
+            wsp = int(stats.get('water_spent') or 0)
+            hc = int(stats.get('harvest_count') or 0)
+            hi = int(stats.get('harvest_items') or 0)
+            pc = int(stats.get('plant_count') or 0)
+
+            lines = ["👨‍🌾 <b>Сводка фермера</b>", ""]
+            if wc:
+                lines.append(f"💧 Поливов: <b>{wc}</b> (потрачено: <b>{wsp}</b> 💎)")
+            if hc:
+                lines.append(f"🥕 Сборов: <b>{hc}</b> (предметов: <b>{hi}</b>)")
+            if pc:
+                lines.append(f"🌱 Посадок: <b>{pc}</b>")
+            if len(lines) <= 2:
+                continue
+
+            try:
+                await context.bot.send_message(chat_id=user_id, text="\n".join(lines), parse_mode='HTML')
+                db.clear_farmer_stats_after_summary(user_id)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Ошибка в farmer_summary_job: {e}")
 
 async def plantation_harvest_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: автоматический сбор урожая (для селюка 2 уровня)."""
@@ -4872,7 +5879,8 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                         stats = {}
                     
                     # Обновляем данные
-                    stats['total_found'] = stats.get('total_found', 0) + 1
+                    found_count = int(result.get('found_count', 1) or 1)
+                    stats['total_found'] = stats.get('total_found', 0) + found_count
                     
                     # Извлекаем награду из лога или результата (в result нет точной суммы, но мы можем примерно восстановить или передать из _perform_energy_search)
                     # В _perform_energy_search мы не возвращаем точную сумму монет, добавим это.
@@ -4880,10 +5888,16 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     earned_coins = result.get('earned_coins', 0) # Нужно добавить в _perform_energy_search
                     stats['total_coins'] = stats.get('total_coins', 0) + earned_coins
                     
-                    rarity = result.get('rarity', 'Common') # Нужно добавить в _perform_energy_search
+                    rarities = result.get('rarities')
+                    if not rarities:
+                        rarity_one = result.get('rarity')
+                        rarities = [rarity_one] if rarity_one else []
                     if 'rarities' not in stats:
                         stats['rarities'] = {}
-                    stats['rarities'][rarity] = stats['rarities'].get(rarity, 0) + 1
+                    for rarity in rarities:
+                        if not rarity:
+                            continue
+                        stats['rarities'][rarity] = stats['rarities'].get(rarity, 0) + 1
                     
                     db.update_player(user_id, auto_search_session_stats=json.dumps(stats))
                     logger.debug(f"[AUTO] Silent search stats updated for {user_id}")
@@ -4892,10 +5906,35 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
             else:
                 # Отправим пользователю уведомление с найденным предметом (как раньше)
                 try:
-                    img_path = result.get("image_path")
-                    if img_path and os.path.exists(img_path):
-                        with open(img_path, 'rb') as photo:
-                            await context.bot.send_photo(
+                    img_paths = result.get("image_paths") or []
+                    existing = [p for p in img_paths if p and os.path.exists(p)]
+                    found_count = int(result.get('found_count', 1) or 1)
+                    if found_count >= 2 and len(existing) >= 2:
+                        f1 = None
+                        f2 = None
+                        try:
+                            f1 = open(existing[0], 'rb')
+                            f2 = open(existing[1], 'rb')
+                            media = [
+                                InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
+                                InputMediaPhoto(media=f2),
+                            ]
+                            await _send_media_group_long(context.bot.send_media_group, chat_id=user_id, media=media)
+                        finally:
+                            try:
+                                if f1:
+                                    f1.close()
+                            except Exception:
+                                pass
+                            try:
+                                if f2:
+                                    f2.close()
+                            except Exception:
+                                pass
+                    elif existing:
+                        with open(existing[0], 'rb') as photo:
+                            await _send_photo_long(
+                                context.bot.send_photo,
                                 chat_id=user_id,
                                 photo=photo,
                                 caption=result.get("caption"),
@@ -5060,6 +6099,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     обновляет БД и возвращает результат в виде словаря.
     """
     player = db.get_or_create_player(user_id, username)
+    rating_value = int(getattr(player, 'rating', 0) or 0)
 
     # Проверка кулдауна (VIP — x0.5, VIP+ — x0.25)
     current_time = time.time()
@@ -5082,21 +6122,28 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     if not weighted_drinks:
         return {"status": "no_drinks"}
 
-    found_drink = random.choice(weighted_drinks)
-    
-    # Определяем "температуру" найденного напитка ДО записи находки
-    drink_temp = db.get_drink_temperature(found_drink.id)
-    
-    # Записываем находку в статистику (ПОСЛЕ определения температуры)
-    db.record_drink_discovery(found_drink.id)
+    favorite_drink_ids: set[int] = set()
+    try:
+        favorite_drink_ids = db.get_player_favorite_drink_ids(user_id)
+    except Exception:
+        favorite_drink_ids = set()
 
-    # Определяем редкость
-    if found_drink.is_special:
-        rarity = 'Special'
-    else:
-        rarity = random.choices(list(RARITIES.keys()), weights=list(RARITIES.values()), k=1)[0]
+    luck_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+    used_luck_coupon = False
+    double_drop_chance = 0.50 if luck_charges > 0 else 0.10
+    found_count = 2 if (random.random() < double_drop_chance) else 1
+    if found_count == 2 and luck_charges > 0:
+        used_luck_coupon = True
+        try:
+            db.update_player(user_id, luck_coupon_charges=max(0, luck_charges - 1))
+            luck_charges = max(0, luck_charges - 1)
+        except Exception:
+            pass
 
-    # Базовая награда монет за факт поиска
+    drops: list[dict] = []
+    rarities_found: list[str] = []
+
+    # Базовая награда монет за факт поиска (один раз за поиск)
     septims_reward = random.randint(5, 10)
     if vip_active:
         septims_reward *= 2
@@ -5104,33 +6151,70 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     coins_before = int(player.coins or 0)
     coins_after = coins_before + septims_reward
 
-    # Автопродажа: если включена для данной редкости и такой напиток уже есть в инвентаре,
-    # не кладём новый экземпляр в инвентарь, а сразу продаём по цене Приёмника.
-    autosell_enabled = False
-    autosell_payout = 0
-    try:
-        # Эксклюзивность: если в инвентаре ещё нет такого drink_id+rarity, НЕ автопродаём
-        already_have = db.has_inventory_item(user_id, found_drink.id, rarity)
-        if already_have and db.is_autosell_enabled(user_id, rarity):
-            autosell_enabled = True
-            try:
-                unit_payout = int(db.get_receiver_unit_payout(rarity) or 0)
-            except Exception:
-                unit_payout = 0
-            if unit_payout > 0:
-                autosell_payout = unit_payout
-                coins_after += autosell_payout
-    except Exception:
+    total_autosell_payout = 0
+
+    for _ in range(found_count):
+        if favorite_drink_ids:
+            weights = [FAVORITE_DRINK_WEIGHT_MULT if int(getattr(d, 'id', 0) or 0) in favorite_drink_ids else 1.0 for d in weighted_drinks]
+            found_drink = random.choices(weighted_drinks, weights=weights, k=1)[0]
+        else:
+            found_drink = random.choice(weighted_drinks)
+
+        # Определяем "температуру" найденного напитка ДО записи находки
+        drink_temp = db.get_drink_temperature(found_drink.id)
+
+        # Записываем находку в статистику (ПОСЛЕ определения температуры)
+        db.record_drink_discovery(found_drink.id)
+
+        # Определяем редкость
+        if found_drink.is_special:
+            rarity = 'Special'
+        else:
+            rw = _rarity_weights_with_rating(RARITIES, rating_value, 0.10)
+            rarity = random.choices(list(rw.keys()), weights=list(rw.values()), k=1)[0]
+        rarities_found.append(rarity)
+
+        # Автопродажа: если включена для данной редкости и такой напиток уже есть в инвентаре,
+        # не кладём новый экземпляр в инвентарь, а сразу продаём по цене Приёмника.
         autosell_enabled = False
+        autosell_payout = 0
+        try:
+            # Эксклюзивность: если в инвентаре ещё нет такого drink_id+rarity, НЕ автопродаём
+            already_have = db.has_inventory_item(user_id, found_drink.id, rarity)
+            if already_have and db.is_autosell_enabled(user_id, rarity):
+                autosell_enabled = True
+                try:
+                    unit_payout = int(db.get_receiver_unit_payout_with_rating(rarity, rating_value) or 0)
+                except Exception:
+                    unit_payout = 0
+                if unit_payout > 0:
+                    autosell_payout = unit_payout
+                    coins_after += autosell_payout
+                    total_autosell_payout += autosell_payout
+        except Exception:
+            autosell_enabled = False
 
-    # Если автопродажа не сработала (отключена или цена 0) — добавляем напиток в инвентарь
-    if not autosell_enabled or autosell_payout <= 0:
-        db.add_drink_to_inventory(user_id=user_id, drink_id=found_drink.id, rarity=rarity)
+        # Если автопродажа не сработала (отключена или цена 0) — добавляем напиток в инвентарь
+        if (not autosell_enabled) or autosell_payout <= 0:
+            db.add_drink_to_inventory(user_id=user_id, drink_id=found_drink.id, rarity=rarity)
 
-    # Обновляем игрока: фиксируем время поиска и новый баланс
+        drops.append({
+            'drink': found_drink,
+            'rarity': rarity,
+            'temp': drink_temp,
+            'autosell_enabled': autosell_enabled,
+            'autosell_payout': autosell_payout,
+        })
+
+    # Обновляем игрока: фиксируем время поиска, новый баланс и рейтинг
+    new_rating = db.increment_rating(user_id, 1)
     db.update_player(user_id, last_search=current_time, coins=coins_after)
+    try:
+        names = ", ".join([d['drink'].name for d in drops])
+    except Exception:
+        names = "?"
     logger.info(
-        f"[SEARCH] User {username} ({user_id}) found {found_drink.name} | rarity={rarity} | +{septims_reward} coins, autosell={autosell_payout} -> {coins_after}"
+        f"[SEARCH] User {username} ({user_id}) found x{found_count}: {names} | +{septims_reward} coins, autosell_total={total_autosell_payout} -> {coins_after}"
     )
 
     # Планируем автонапоминание через JobQueue, если включено (учёт VIP-кулдауна)
@@ -5146,18 +6230,6 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             logger.warning(f"Не удалось запланировать напоминание: {ex}")
 
     # Формируем сообщение
-    rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
-    
-    # Определяем эмодзи и текст температуры напитка
-    if drink_temp == 'hot':
-        temp_emoji = '🔥'
-        temp_text = 'Горячий напиток! (давно не попадался)'
-    elif drink_temp == 'cold':
-        temp_emoji = '❄️'
-        temp_text = 'Холодный напиток (недавно находили)'
-    else:
-        temp_emoji = '🌡️'
-        temp_text = 'Нейтральный'
     
     # Проверяем VIP статус с приоритетом VIP+
     vip_plus_ts = db.get_vip_plus_until(user_id)
@@ -5171,32 +6243,106 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     else:
         vip_line = ''
     
-    caption_lines = [
-        f"🎉 Ты нашел энергетик!{vip_line}",
-        "",
-        f"<b>Название:</b> {found_drink.name}",
-        f"<b>Редкость:</b> {rarity_emoji} {rarity}",
-        f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>",
-        f"💰 <b>Награда:</b> +{septims_reward} септимов",
-    ]
+    if found_count == 1 and drops:
+        d0 = drops[0]
+        found_drink = d0['drink']
+        rarity = d0['rarity']
+        drink_temp = d0['temp']
+        autosell_enabled = d0['autosell_enabled']
+        autosell_payout = d0['autosell_payout']
 
-    if autosell_enabled and autosell_payout > 0:
-        caption_lines.append(f"🧾 <b>Автопродажа:</b> +{autosell_payout} септимов (энергетик сразу продан через Приёмник)")
+        rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
+        if drink_temp == 'hot':
+            temp_emoji = '🔥'
+            temp_text = 'Горячий напиток! (давно не попадался)'
+        elif drink_temp == 'cold':
+            temp_emoji = '❄️'
+            temp_text = 'Холодный напиток (недавно находили)'
+        else:
+            temp_emoji = '🌡️'
+            temp_text = 'Нейтральный'
 
-    caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
-    caption_lines.append("")
-    caption_lines.append(f"<i>{found_drink.description}</i>")
+        caption_lines = [
+            f"🎉 Ты нашел энергетик!{vip_line}",
+            "",
+            f"<b>Название:</b> {found_drink.name}",
+            f"<b>Редкость:</b> {rarity_emoji} {rarity}",
+            f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>",
+            f"💰 <b>Награда:</b> +{septims_reward} септимов",
+        ]
+
+        if autosell_enabled and autosell_payout > 0:
+            caption_lines.append(f"🧾 <b>Автопродажа:</b> +{autosell_payout} септимов (энергетик сразу продан через Приёмник)")
+
+        caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
+        if new_rating is not None:
+            caption_lines.append(f"⭐ <b>Рейтинг:</b> {new_rating}")
+        caption_lines.append("")
+        caption_lines.append(f"<i>{found_drink.description}</i>")
+    else:
+        caption_lines = [
+            f"🎉 Джекпот! Ты нашел 2 энергетика!{vip_line}",
+            "",
+        ]
+
+        if used_luck_coupon:
+            caption_lines.append(f"🎲 <b>Купон удачи:</b> использован (осталось {luck_charges})")
+            caption_lines.append("")
+
+        for idx, d in enumerate(drops, start=1):
+            found_drink = d['drink']
+            rarity = d['rarity']
+            drink_temp = d['temp']
+            autosell_enabled = d['autosell_enabled']
+            autosell_payout = d['autosell_payout']
+
+            rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
+            if drink_temp == 'hot':
+                temp_emoji = '🔥'
+                temp_text = 'Горячий напиток! (давно не попадался)'
+            elif drink_temp == 'cold':
+                temp_emoji = '❄️'
+                temp_text = 'Холодный напиток (недавно находили)'
+            else:
+                temp_emoji = '🌡️'
+                temp_text = 'Нейтральный'
+
+            caption_lines.append(f"<b>{idx}) {found_drink.name}</b>")
+            caption_lines.append(f"<b>Редкость:</b> {rarity_emoji} {rarity}")
+            caption_lines.append(f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>")
+            if autosell_enabled and autosell_payout > 0:
+                caption_lines.append(f"🧾 <b>Автопродажа:</b> +{autosell_payout} септимов (энергетик сразу продан через Приёмник)")
+            caption_lines.append("")
+            caption_lines.append(f"<i>{found_drink.description}</i>")
+            caption_lines.append("")
+
+        caption_lines.append(f"💰 <b>Награда за поиск:</b> +{septims_reward} септимов")
+        if total_autosell_payout > 0:
+            caption_lines.append(f"🧾 <b>Автопродажа всего:</b> +{total_autosell_payout} септимов")
+        caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
+        if new_rating is not None:
+            caption_lines.append(f"⭐ <b>Рейтинг:</b> {new_rating}")
 
     caption = "\n".join(caption_lines)
-    image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path) if found_drink.image_path else None
+    image_paths: list[str | None] = []
+    try:
+        for d in drops:
+            p = getattr(d['drink'], 'image_path', None)
+            image_paths.append(os.path.join(ENERGY_IMAGES_DIR, p) if p else None)
+    except Exception:
+        image_paths = []
+    image_full_path = image_paths[0] if (found_count == 1 and image_paths) else None
     
     return {
         "status": "ok",
         "caption": caption,
         "image_path": image_full_path,
+        "image_paths": image_paths,
         "reply_markup": InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]),
-        "earned_coins": septims_reward + autosell_payout,
-        "rarity": rarity
+        "earned_coins": septims_reward + total_autosell_payout,
+        "found_count": found_count,
+        "rarities": rarities_found,
+        "rarity": (rarities_found[0] if rarities_found else 'Basic')
     }
 
 
@@ -5254,9 +6400,35 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
         
         if result["status"] == "ok":
-            if result["image_path"] and os.path.exists(result["image_path"]):
-                with open(result["image_path"], 'rb') as photo:
-                    await context.bot.send_photo(
+            img_paths = result.get("image_paths") or []
+            existing = [p for p in img_paths if p and os.path.exists(p)]
+            found_count = int(result.get('found_count', 1) or 1)
+            if found_count >= 2 and len(existing) >= 2:
+                f1 = None
+                f2 = None
+                try:
+                    f1 = open(existing[0], 'rb')
+                    f2 = open(existing[1], 'rb')
+                    media = [
+                        InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
+                        InputMediaPhoto(media=f2),
+                    ]
+                    await _send_media_group_long(context.bot.send_media_group, chat_id=query.message.chat_id, media=media)
+                finally:
+                    try:
+                        if f1:
+                            f1.close()
+                    except Exception:
+                        pass
+                    try:
+                        if f2:
+                            f2.close()
+                    except Exception:
+                        pass
+            elif existing:
+                with open(existing[0], 'rb') as photo:
+                    await _send_photo_long(
+                        context.bot.send_photo,
                         chat_id=query.message.chat_id,
                         photo=photo,
                         caption=result["caption"],
@@ -5298,8 +6470,8 @@ async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: i
     )
     
     # Анимация: прокручиваем рулетку 3 секунды
-    duration = 1.2  # секунд
-    frames = 8  # количество кадров анимации
+    duration = 3.0  # секунд
+    frames = 12  # количество кадров анимации
     frame_delay = duration / frames  # задержка между кадрами
     
     # Создаём случайную последовательность для эффекта прокрутки
@@ -5336,6 +6508,11 @@ async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                     parse_mode='HTML'
                 )
                 prev_pos = current_pos
+            except RetryAfter as e:
+                try:
+                    await asyncio.sleep(float(getattr(e, 'retry_after', 1)))
+                except Exception:
+                    await asyncio.sleep(1)
             except Exception as e:
                 # Игнорируем ошибки редактирования
                 pass
@@ -5348,6 +6525,93 @@ async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         await roulette_message.delete()
     except Exception as e:
         logger.warning(f"Не удалось удалить сообщение рулетки: {e}")
+
+
+async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TYPE, already_answered: bool = False) -> None:
+    query = update.callback_query
+    if not already_answered:
+        await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    rating_value = int(getattr(player, 'rating', 0) or 0)
+
+    vip_plus_active = db.is_vip_plus(user.id)
+    vip_active = db.is_vip(user.id)
+    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
+    if vip_plus_active:
+        eff_bonus_cd = base_bonus_cd / 4
+    elif vip_active:
+        eff_bonus_cd = base_bonus_cd / 2
+    else:
+        eff_bonus_cd = base_bonus_cd
+
+    now = time.time()
+    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
+    time_left = max(0, eff_bonus_cd - (now - last_bonus_claim_val))
+    hours, remainder = divmod(int(time_left), 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    reward_labels = {
+        'coins': '💰 400 септимов' if lang != 'en' else '💰 400 coins',
+        'absolute_drink': '🟣 Энергетик Absolute' if lang != 'en' else '🟣 Absolute energy drink',
+        'vip_3d': '👑 VIP на 3 дня' if lang != 'en' else '👑 VIP for 3 days',
+        'vip_plus_7d': '💎 VIP+ на 7 дней' if lang != 'en' else '💎 VIP+ for 7 days',
+        'vip_plus_30d': '🎊 VIP+ на 30 дней' if lang != 'en' else '🎊 VIP+ for 30 days',
+        'selyuk_fragment': '🧩 Фрагмент Селюка' if lang != 'en' else '🧩 Selyuk fragment',
+    }
+
+    adjusted = _daily_bonus_weights_with_rating(DAILY_BONUS_REWARDS, rating_value, 0.05)
+    total_weight = sum(float(w or 0) for w in adjusted.values())
+    if total_weight <= 0:
+        total_weight = 1.0
+
+    lines = []
+    for key, info in DAILY_BONUS_REWARDS.items():
+        try:
+            w = float(adjusted.get(key, 0) or 0)
+        except Exception:
+            w = 0.0
+        pct = (w / total_weight) * 100.0
+        lines.append(f"- {reward_labels.get(key, key)} — <b>{pct:.2f}%</b>")
+
+    if lang != 'en':
+        title = "🎁 <b>Ежедневный бонус</b>"
+        timer_line = f"⏳ До следующего: <b>{hours:02d}:{minutes:02d}:{seconds:02d}</b>" if time_left > 0 else "✅ <b>Бонус доступен прямо сейчас!</b>"
+        vip_line = "⚡ VIP ускоряет в 2 раза, VIP+ — в 4 раза."
+        bonus_line = f"⭐ Бонус рейтинга к редким наградам: <b>до +5%</b> (сейчас: <b>+{_rating_bonus_percent(rating_value, 0.05) * 100:.2f}%</b>)."
+        rewards_title = "🎰 <b>Награды и шансы:</b>"
+        claim_label = "🎁 Забрать бонус"
+    else:
+        title = "🎁 <b>Daily Bonus</b>"
+        timer_line = f"⏳ Next in: <b>{hours:02d}:{minutes:02d}:{seconds:02d}</b>" if time_left > 0 else "✅ <b>Bonus is available now!</b>"
+        vip_line = "⚡ VIP is 2x faster, VIP+ is 4x faster."
+        bonus_line = f"⭐ Rating bonus to rare rewards: <b>up to +5%</b> (now: <b>+{_rating_bonus_percent(rating_value, 0.05) * 100:.2f}%</b>)."
+        rewards_title = "🎰 <b>Rewards & odds:</b>"
+        claim_label = "🎁 Claim bonus"
+
+    text = "\n".join([
+        title,
+        "",
+        timer_line,
+        vip_line,
+        bonus_line,
+        "",
+        rewards_title,
+        *lines,
+    ])
+
+    keyboard = [
+        [InlineKeyboardButton(claim_label, callback_data='claim_bonus')],
+        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.message.edit_text(text=text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5364,6 +6628,8 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     async with lock:
         player = db.get_or_create_player(user.id, user.username or user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+        rating_value = int(getattr(player, 'rating', 0) or 0)
 
         # Проверка кулдауна
         current_time = time.time()
@@ -5380,55 +6646,80 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_left = int(eff_bonus_cd - (current_time - player.last_bonus_claim))
             hours, remainder = divmod(time_left, 3600)
             minutes, seconds = divmod(remainder, 60)
-            await query.answer(f"Ещё рано! До бонуса: {hours:02d}:{minutes:02d}:{seconds:02d}", show_alert=True)
+            try:
+                await query.answer(f"Ещё рано! До бонуса: {hours:02d}:{minutes:02d}:{seconds:02d}")
+            except Exception:
+                pass
+            await show_daily_bonus_info(update, context, already_answered=True)
             return
 
-    # Выбираем награду по весам из рулетки
-    reward_types = list(DAILY_BONUS_REWARDS.keys())
-    reward_weights = [DAILY_BONUS_REWARDS[r]['weight'] for r in reward_types]
-    selected_reward = random.choices(reward_types, weights=reward_weights, k=1)[0]
-    
-    reward_info = DAILY_BONUS_REWARDS[selected_reward]
-    
-    # Удаляем старое сообщение
-    await query.message.delete()
-    
-    # Показываем текстовую анимацию рулетки
-    await show_roulette_animation(context, query.message.chat_id, selected_reward)
-    
-    # Обрабатываем награду в зависимости от типа
-    caption = ""
-    reward_log = ""
-    found_drink = None  # Для хранения энергетика если выпадет
-    
-    if selected_reward == 'coins':
-        # Награда 1: 400 септимов
-        coins_amount = reward_info['amount']
-        new_coins = db.increment_coins(user.id, coins_amount)
-        db.update_player(user.id, last_bonus_claim=current_time)
-        
-        caption = (
-            f"🎉 <b>Поздравляем!</b>\n\n"
-            f"💰 Вы выиграли <b>{coins_amount} септимов</b>!\n\n"
-            f"Текущий баланс: <b>{new_coins}</b> 🪙"
-        )
-        reward_log = f"+{coins_amount} coins -> {new_coins}"
-        
-    elif selected_reward == 'absolute_drink':
-        # Награда 2: Случайный энергетик Absolute (не Special)
-        all_drinks = db.get_all_drinks()
-        non_special_drinks = [d for d in all_drinks if not d.is_special]
-        
-        if not non_special_drinks:
-            caption = "❌ В базе нет доступных энергетиков для награды."
-        else:
-            found_drink = random.choice(non_special_drinks)
+        chat_id = query.message.chat_id
+
+        # Выбираем награду по весам из рулетки
+        reward_types = list(DAILY_BONUS_REWARDS.keys())
+        adjusted = _daily_bonus_weights_with_rating(DAILY_BONUS_REWARDS, rating_value, 0.05)
+        reward_weights = [float(adjusted.get(r, 0) or 0) for r in reward_types]
+        selected_reward = random.choices(reward_types, weights=reward_weights, k=1)[0]
+        reward_info = DAILY_BONUS_REWARDS[selected_reward]
+
+        found_drink = None
+        if selected_reward == 'absolute_drink':
+            all_drinks = db.get_all_drinks()
+            non_special_drinks = [d for d in all_drinks if not d.is_special]
+            if non_special_drinks:
+                found_drink = random.choice(non_special_drinks)
+            else:
+                selected_reward = 'coins'
+                reward_info = DAILY_BONUS_REWARDS[selected_reward]
+
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        # Показываем текстовую анимацию рулетки
+        await show_roulette_animation(context, chat_id, selected_reward)
+
+        # Обрабатываем награду в зависимости от типа
+        caption = ""
+        reward_log = ""
+        new_rating = db.increment_rating(user.id, 1)
+
+        if selected_reward == 'coins':
+            # Награда 1: 400 септимов
+            coins_amount = reward_info['amount']
+            new_coins = db.increment_coins(user.id, coins_amount)
+            if new_coins is None:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Не удалось выдать бонус. Попробуй ещё раз позже.",
+                )
+                return
+            db.update_player(user.id, last_bonus_claim=current_time)
+
+            caption = (
+                f"🎉 <b>Поздравляем!</b>\n\n"
+                f"💰 Вы выиграли <b>{coins_amount} септимов</b>!\n\n"
+                f"Текущий баланс: <b>{new_coins}</b> 🪙"
+            )
+            if new_rating is not None:
+                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
+            reward_log = f"+{coins_amount} coins -> {new_coins}"
+
+        elif selected_reward == 'absolute_drink':
+            # Награда 2: Случайный энергетик Absolute (не Special)
             rarity = 'Absolute'
             rarity_emoji = COLOR_EMOJIS.get(rarity, '🟣')
-            
-            db.add_drink_to_inventory(user_id=user.id, drink_id=found_drink.id, rarity=rarity)
+            try:
+                db.add_drink_to_inventory(user_id=user.id, drink_id=found_drink.id, rarity=rarity)
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Не удалось выдать бонус. Попробуй ещё раз позже.",
+                )
+                return
             db.update_player(user.id, last_bonus_claim=current_time)
-            
+
             caption = (
                 f"🎉 <b>Невероятная удача!</b>\n\n"
                 f"Вы получили эксклюзивный энергетик редкости <b>{rarity_emoji} {rarity}</b>!\n\n"
@@ -5436,122 +6727,137 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<b>Редкость:</b> {rarity_emoji} {rarity}\n\n"
                 f"<i>{found_drink.description}</i>"
             )
+            if new_rating is not None:
+                caption += f"\n\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
             reward_log = f"{found_drink.name} | rarity={rarity}"
-            # found_drink сохраняется для отправки фото в конце
-            
-    elif selected_reward == 'vip_3d':
-        # Награда 3: VIP на 3 дня или VIP+ на 1 день если уже есть VIP+
-        vip_plus_ts = db.get_vip_plus_until(user.id)
-        current_time_check = time.time()
-        
-        if vip_plus_ts and current_time_check < vip_plus_ts:
-            # Если есть активный VIP+, добавляем 1 день VIP+
-            new_vip_plus_ts = db.extend_vip_plus(user.id, 1 * 24 * 60 * 60)
+
+        elif selected_reward == 'vip_3d':
+            # Награда 3: VIP на 3 дня или VIP+ на 1 день если уже есть VIP+
+            vip_plus_ts = db.get_vip_plus_until(user.id)
+            current_time_check = time.time()
+
+            if vip_plus_ts and current_time_check < vip_plus_ts:
+                new_vip_plus_ts = db.extend_vip_plus(user.id, 1 * 24 * 60 * 60)
+                db.update_player(user.id, last_bonus_claim=current_time)
+
+                caption = (
+                    f"🎉 <b>Элитная награда!</b>\n\n"
+                    f"{VIP_PLUS_EMOJI} Вы получили <b>+1 день VIP+</b>!\n\n"
+                    f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
+                )
+                if new_rating is not None:
+                    caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
+                reward_log = "+1 day VIP+"
+            else:
+                new_vip_ts = db.extend_vip(user.id, 3 * 24 * 60 * 60)
+                db.update_player(user.id, last_bonus_claim=current_time)
+
+                caption = (
+                    f"🎉 <b>Отличная награда!</b>\n\n"
+                    f"{VIP_EMOJI} Вы получили <b>VIP на 3 дня</b>!\n\n"
+                    f"VIP активен до: {safe_format_timestamp(new_vip_ts)}"
+                )
+                if new_rating is not None:
+                    caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
+                reward_log = "VIP 3 days"
+
+        elif selected_reward == 'vip_plus_7d':
+            # Награда 4: VIP+ на 7 дней
+            new_vip_plus_ts = db.extend_vip_plus(user.id, 7 * 24 * 60 * 60)
             db.update_player(user.id, last_bonus_claim=current_time)
-            
+
             caption = (
-                f"🎉 <b>Элитная награда!</b>\n\n"
-                f"{VIP_PLUS_EMOJI} Вы получили <b>+1 день VIP+</b>!\n\n"
+                f"🎉 <b>Фантастическая награда!</b>\n\n"
+                f"{VIP_PLUS_EMOJI} Вы получили <b>VIP+ на 7 дней</b>!\n\n"
                 f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
             )
-            reward_log = "+1 day VIP+"
-        else:
-            # Выдаём обычный VIP на 3 дня
-            new_vip_ts = db.extend_vip(user.id, 3 * 24 * 60 * 60)
-            db.update_player(user.id, last_bonus_claim=current_time)
-            
-            caption = (
-                f"🎉 <b>Отличная награда!</b>\n\n"
-                f"{VIP_EMOJI} Вы получили <b>VIP на 3 дня</b>!\n\n"
-                f"VIP активен до: {safe_format_timestamp(new_vip_ts)}"
-            )
-            reward_log = "VIP 3 days"
-            
-    elif selected_reward == 'vip_plus_7d':
-        # Награда 4: VIP+ на 7 дней
-        new_vip_plus_ts = db.extend_vip_plus(user.id, 7 * 24 * 60 * 60)
-        db.update_player(user.id, last_bonus_claim=current_time)
-        
-        caption = (
-            f"🎉 <b>Фантастическая награда!</b>\n\n"
-            f"{VIP_PLUS_EMOJI} Вы получили <b>VIP+ на 7 дней</b>!\n\n"
-            f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
-        )
-        reward_log = "VIP+ 7 days"
-        
-    elif selected_reward == 'vip_plus_30d':
-        # Награда 5: VIP+ на 30 дней (джекпот!)
-        new_vip_plus_ts = db.extend_vip_plus(user.id, 30 * 24 * 60 * 60)
-        db.update_player(user.id, last_bonus_claim=current_time)
-        
-        caption = (
-            f"🎊 <b>ДЖЕКПОТ!!!</b> 🎊\n\n"
-            f"{VIP_PLUS_EMOJI} Вы сорвали куш — <b>VIP+ на 30 дней</b>!\n\n"
-            f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
-        )
-        reward_log = "VIP+ 30 days (JACKPOT!)"
+            if new_rating is not None:
+                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
+            reward_log = "VIP+ 7 days"
 
-    elif selected_reward == 'selyuk_fragment':
-        # Награда 6: Фрагмент Селюка
-        amount = reward_info.get('amount', 1)
-        new_fragments = db.increment_selyuk_fragments(user.id, amount)
-        db.update_player(user.id, last_bonus_claim=current_time)
-        
-        caption = (
-            f"🎉 <b>Редкая находка!</b>\n\n"
-            f"🧩 Вы нашли <b>Фрагмент Селюка</b> ({amount} шт.)!\n\n"
-            f"Всего фрагментов: <b>{new_fragments}</b>"
+        elif selected_reward == 'vip_plus_30d':
+            # Награда 5: VIP+ на 30 дней (джекпот!)
+            new_vip_plus_ts = db.extend_vip_plus(user.id, 30 * 24 * 60 * 60)
+            db.update_player(user.id, last_bonus_claim=current_time)
+
+            caption = (
+                f"🎊 <b>ДЖЕКПОТ!!!</b> 🎊\n\n"
+                f"{VIP_PLUS_EMOJI} Вы сорвали куш — <b>VIP+ на 30 дней</b>!\n\n"
+                f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
+            )
+            if new_rating is not None:
+                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
+            reward_log = "VIP+ 30 days (JACKPOT!)"
+
+        elif selected_reward == 'selyuk_fragment':
+            # Награда 6: Фрагмент Селюка
+            amount = reward_info.get('amount', 1)
+            new_fragments = db.increment_selyuk_fragments(user.id, amount)
+            db.update_player(user.id, last_bonus_claim=current_time)
+
+            caption = (
+                f"🎉 <b>Редкая находка!</b>\n\n"
+                f"🧩 Вы нашли <b>Фрагмент Селюка</b> ({amount} шт.)!\n\n"
+                f"Всего фрагментов: <b>{new_fragments}</b>"
+            )
+            if new_rating is not None:
+                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
+            reward_log = f"Selyuk Fragment +{amount} -> {new_fragments}"
+
+        # Логируем результат
+        logger.info(
+            f"[DAILY BONUS ROULETTE] User {user.username or user.id} ({user.id}) | "
+            f"reward={selected_reward} | {reward_log}"
         )
-        reward_log = f"Selyuk Fragment +{amount} -> {new_fragments}"
-    
-    # Логируем результат
-    logger.info(
-        f"[DAILY BONUS ROULETTE] User {user.username or user.id} ({user.id}) | "
-        f"reward={selected_reward} | {reward_log}"
-    )
-    
-    # Отправляем финальное сообщение с наградой
-    keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Если выпал энергетик - отправляем с фото, иначе - просто текст
-    if found_drink and found_drink.image_path:
-        image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path)
-        if os.path.exists(image_full_path):
-            try:
-                with open(image_full_path, 'rb') as photo:
-                    await context.bot.send_photo(
-                        chat_id=query.message.chat_id,
-                        photo=photo,
-                        caption=caption,
+
+        # Отправляем финальное сообщение с наградой
+        back_label = "🔙 В меню" if lang == 'ru' else "🔙 Menu"
+        keyboard = [[InlineKeyboardButton(back_label, callback_data='menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Если выпал энергетик - отправляем с фото, иначе - просто текст
+        if found_drink and getattr(found_drink, 'image_path', None):
+            image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path)
+            if os.path.exists(image_full_path):
+                try:
+                    with open(image_full_path, 'rb') as photo:
+                        await _send_photo_long(
+                            context.bot.send_photo,
+                            chat_id=chat_id,
+                            photo=photo,
+                            caption=caption,
+                            reply_markup=reply_markup,
+                            parse_mode='HTML'
+                        )
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить фото энергетика: {e}")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=caption,
                         reply_markup=reply_markup,
                         parse_mode='HTML'
                     )
-            except Exception as e:
-                logger.warning(f"Не удалось отправить фото энергетика: {e}")
-                # Отправляем текстом если фото не получилось
+            else:
                 await context.bot.send_message(
-                    chat_id=query.message.chat_id,
+                    chat_id=chat_id,
                     text=caption,
                     reply_markup=reply_markup,
                     parse_mode='HTML'
                 )
         else:
-            # Фото не найдено - отправляем текстом
+            # Для всех остальных наград - просто текст
             await context.bot.send_message(
-                chat_id=query.message.chat_id,
+                chat_id=chat_id,
                 text=caption,
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
-    else:
-        # Для всех остальных наград - просто текст
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=caption,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
+
+        try:
+            # Удаляем старое сообщение
+            await query.message.delete()
+        except Exception:
+            pass
 
 
 async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5561,6 +6867,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = query.from_user.id
     inventory_items = db.get_player_inventory_with_details(user_id)
+    sorted_items = []
 
     # Определяем страницу из callback_data: inventory_p{num}
     page = 1
@@ -5605,14 +6912,14 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
                 inventory_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
                 current_rarity = item.rarity
-            display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+            display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
             inventory_text += f"• {display_name} — <b>{item.quantity} шт.</b>\n"
 
         # Клавиатура с кнопками предметов (2 в строке)
         keyboard_rows = []
         current_row = []
         for item in page_items:
-            display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+            display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
             btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
             callback = f"view_{item.id}_p{page}"
             current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
@@ -5775,14 +7082,14 @@ async def show_inventory_search_results(update: Update, context: ContextTypes.DE
             rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
             search_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
             current_rarity = item.rarity
-        display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+        display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
         search_text += f"• {display_name} — <b>{item.quantity} шт.</b>\n"
     
     # Клавиатура с кнопками предметов (2 в строке)
     keyboard_rows = []
     current_row = []
     for item in page_items:
-        display_name = "Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else item.drink.name
+        display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
         btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
         callback = f"view_{item.id}_sp{page}"
         current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
@@ -5850,6 +7157,13 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     player = db.get_or_create_player(user_id, user.username or user.first_name)
     lang = player.language
+
+    rating_value = int(getattr(player, 'rating', 0) or 0)
+    rating_bonus = db.get_rating_bonus_percent(rating_value)
+    if lang == 'ru':
+        rating_line = f"⭐ <b>Рейтинг:</b> {rating_value}\n💹 <b>Бонус продажи:</b> +{rating_bonus:.1f}%"
+    else:
+        rating_line = f"⭐ <b>Rating:</b> {rating_value}\n💹 <b>Sell bonus:</b> +{rating_bonus:.1f}%"
     inventory_items = db.get_player_inventory_with_details(user_id)
     
     total_drinks = sum(item.quantity for item in inventory_items)
@@ -5871,6 +7185,26 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip_plus_ts = db.get_vip_plus_until(user_id)
     vip_active = bool(vip_ts and time.time() < vip_ts)
     vip_plus_active = bool(vip_plus_ts and time.time() < vip_plus_ts)
+
+    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
+    if vip_plus_active:
+        search_cd = base_search_cd / 4
+    elif vip_active:
+        search_cd = base_search_cd / 2
+    else:
+        search_cd = base_search_cd
+    last_search_val = float(getattr(player, 'last_search', 0) or 0)
+    search_time_left = max(0, search_cd - (time.time() - last_search_val))
+
+    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
+    if vip_plus_active:
+        bonus_cd = base_bonus_cd / 4
+    elif vip_active:
+        bonus_cd = base_bonus_cd / 2
+    else:
+        bonus_cd = base_bonus_cd
+    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
+    bonus_time_left = max(0, bonus_cd - (time.time() - last_bonus_claim_val))
     
     # === ЗАГОЛОВОК И ПРОФИЛЬ ===
     stats_text = f"<b>📊 Статистика игрока</b>\n"
@@ -6036,7 +7370,9 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     stats_text += f"\n━━━━━━━━━━━━━━━━━━━"
 
-    keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]
+    back_label = "🔙 Назад" if lang == 'ru' else "🔙 Back"
+    back_callback = 'my_profile' if query.data == 'profile_stats' else 'menu'
+    keyboard = [[InlineKeyboardButton(back_label, callback_data=back_callback)]]
 
     # Единое поведение: если текущее сообщение с медиа — удаляем и шлём новое
     message = query.message
@@ -6055,6 +7391,756 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(stats_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
+async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    user_id = user.id
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    lang = player.language
+
+    username_display = f"@{user.username}" if user.username else user.first_name
+
+    vip_ts = db.get_vip_until(user_id)
+    vip_plus_ts = db.get_vip_plus_until(user_id)
+    vip_active = bool(vip_ts and time.time() < vip_ts)
+    vip_plus_active = bool(vip_plus_ts and time.time() < vip_plus_ts)
+
+    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
+    if vip_plus_active:
+        search_cd = base_search_cd / 4
+    elif vip_active:
+        search_cd = base_search_cd / 2
+    else:
+        search_cd = base_search_cd
+    last_search_val = float(getattr(player, 'last_search', 0) or 0)
+    search_time_left = max(0, search_cd - (time.time() - last_search_val))
+
+    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
+    if vip_plus_active:
+        bonus_cd = base_bonus_cd / 4
+    elif vip_active:
+        bonus_cd = base_bonus_cd / 2
+    else:
+        bonus_cd = base_bonus_cd
+    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
+    bonus_time_left = max(0, bonus_cd - (time.time() - last_bonus_claim_val))
+
+    if vip_plus_active:
+        vip_until_str = safe_format_timestamp(vip_plus_ts, '%d.%m.%Y %H:%M')
+        status_line = f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_until_str})" if lang == 'ru' else f"💎 <b>Status:</b> {VIP_PLUS_EMOJI} V.I.P+ (until {vip_until_str})"
+    elif vip_active:
+        vip_until_str = safe_format_timestamp(vip_ts, '%d.%m.%Y %H:%M')
+        status_line = f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until_str})" if lang == 'ru' else f"👑 <b>Status:</b> {VIP_EMOJI} V.I.P (until {vip_until_str})"
+    else:
+        status_line = "📊 <b>Статус:</b> Обычный игрок" if lang == 'ru' else "📊 <b>Status:</b> Regular player"
+
+    timing_lines = []
+    if lang == 'ru':
+        if search_time_left > 0:
+            timing_lines.append(f"🔎 <b>Поиск:</b> ⏳ {int(search_time_left // 60)}:{int(search_time_left % 60):02d}")
+        else:
+            timing_lines.append("🔎 <b>Поиск:</b> ✅")
+
+        if bonus_time_left > 0:
+            hours, remainder = divmod(int(bonus_time_left), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            timing_lines.append(f"🎁 <b>Бонус:</b> ⏳ {hours:02d}:{minutes:02d}:{seconds:02d}")
+        else:
+            timing_lines.append("🎁 <b>Бонус:</b> ✅")
+    else:
+        if search_time_left > 0:
+            timing_lines.append(f"🔎 <b>Search:</b> ⏳ {int(search_time_left // 60)}:{int(search_time_left % 60):02d}")
+        else:
+            timing_lines.append("🔎 <b>Search:</b> ✅")
+
+        if bonus_time_left > 0:
+            hours, remainder = divmod(int(bonus_time_left), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            timing_lines.append(f"🎁 <b>Bonus:</b> ⏳ {hours:02d}:{minutes:02d}:{seconds:02d}")
+        else:
+            timing_lines.append("🎁 <b>Bonus:</b> ✅")
+
+    timing_block = "\n" + "\n".join(timing_lines) if timing_lines else ""
+
+    auto_line = ""
+    if vip_active or vip_plus_active:
+        auto_enabled = bool(getattr(player, 'auto_search_enabled', False))
+        auto_state = "Включен ✅" if auto_enabled else "Выключен ❌"
+
+        now_ts = int(time.time())
+        reset_ts = int(getattr(player, 'auto_search_reset_ts', 0) or 0)
+        current_count = int(getattr(player, 'auto_search_count', 0) or 0)
+        if reset_ts == 0 or now_ts >= reset_ts:
+            current_count = 0
+        try:
+            daily_limit = db.get_auto_search_daily_limit(user_id)
+        except Exception:
+            daily_limit = AUTO_SEARCH_DAILY_LIMIT
+            if vip_plus_active:
+                daily_limit *= 2
+
+        if lang == 'ru':
+            auto_line = f"\n🤖 <b>Автопоиск:</b> {auto_state}\n📊 <b>Сегодня:</b> {current_count}/{daily_limit}"
+        else:
+            auto_line = f"\n🤖 <b>Auto-search:</b> {auto_state}\n📊 <b>Today:</b> {current_count}/{daily_limit}"
+
+    # Получаем рейтинг пользователя
+    rating = int(getattr(player, 'rating', 0) or 0)
+    rating_line = f"🏆 <b>Рейтинг:</b> {rating}" if rating > 0 else ""
+    
+    title = "<b>👤 Мой профиль</b>" if lang == 'ru' else "<b>👤 My profile</b>"
+    profile_text = (
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>Игрок:</b> {username_display}\n"
+        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+        f"💰 <b>Баланс:</b> {int(getattr(player, 'coins', 0) or 0)} 🪙\n"
+        f"{rating_line}\n"
+        f"{status_line}"
+        f"{timing_block}"
+        f"{auto_line}"
+    )
+
+    try:
+        pending_cnt = db.get_pending_friend_requests_count(user_id)
+    except Exception:
+        pending_cnt = 0
+    if pending_cnt and int(pending_cnt) > 0:
+        friends_label = (f"👥 Друзья ({int(pending_cnt)})" if lang == 'ru' else f"👥 Friends ({int(pending_cnt)})")
+    else:
+        friends_label = "👥 Друзья" if lang == 'ru' else "👥 Friends"
+    stats_label = "📊 Статистика" if lang == 'ru' else "📊 Stats"
+    boosts_label = "🚀 Бусты" if lang == 'ru' else "🚀 Boosts"
+    promo_label = "🎟 Промокод" if lang == 'ru' else "🎟 Promo"
+    vip_label = "👑 VIP" if lang == 'ru' else "👑 VIP"
+    vip_plus_label = f"{VIP_PLUS_EMOJI} VIP+"
+    favorites_label = t(lang, 'favorite_energy_drinks')
+    back_label = "🔙 В меню" if lang == 'ru' else "🔙 Menu"
+
+    keyboard = [
+        [InlineKeyboardButton(friends_label, callback_data='profile_friends')],
+        [InlineKeyboardButton(stats_label, callback_data='profile_stats')],
+        [InlineKeyboardButton(boosts_label, callback_data='profile_boosts')],
+        [InlineKeyboardButton(favorites_label, callback_data='profile_favorites')],
+        [InlineKeyboardButton(promo_label, callback_data='promo_enter')],
+        [InlineKeyboardButton(vip_label, callback_data='vip_menu'), InlineKeyboardButton(vip_plus_label, callback_data='vip_plus_menu')],
+        [InlineKeyboardButton(back_label, callback_data='menu')],
+    ]
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_profile_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    # сбрасываем режимы ожидания ввода в разделе друзей
+    try:
+        context.user_data.pop('awaiting_friend_username_search', None)
+        context.user_data.pop('awaiting_friend_transfer', None)
+    except Exception:
+        pass
+
+    try:
+        pending_cnt = db.get_pending_friend_requests_count(user.id)
+    except Exception:
+        pending_cnt = 0
+    pending_cnt = int(pending_cnt or 0)
+
+    title = "👥 <b>Друзья</b>" if lang == 'ru' else "👥 <b>Friends</b>"
+    text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
+    if lang == 'ru':
+        text_lines.append(f"📨 Заявки в друзья: <b>{pending_cnt}</b>")
+        text_lines.append("Выберите действие ниже.")
+    else:
+        text_lines.append(f"📨 Friend requests: <b>{pending_cnt}</b>")
+        text_lines.append("Choose an action below.")
+    text = "\n".join(text_lines)
+
+    kb = []
+    kb.append([InlineKeyboardButton("➕ Добавить друга" if lang == 'ru' else "➕ Add friend", callback_data='friends_add_start')])
+    kb.append([InlineKeyboardButton(("📨 Заявки" if lang == 'ru' else "📨 Requests") + (f" ({pending_cnt})" if pending_cnt > 0 else ""), callback_data='friends_requests_0')])
+    kb.append([InlineKeyboardButton("👤 Мои друзья" if lang == 'ru' else "👤 My friends", callback_data='friends_list_0')])
+    kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='my_profile')])
+    keyboard = kb
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def friends_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    context.user_data['awaiting_friend_username_search'] = True
+
+    text = (
+        "Введите ник друга (без @ или с @). Я покажу совпадения." if lang == 'ru'
+        else "Enter friend's username (with or without @). I'll show matches."
+    )
+    kb = [[InlineKeyboardButton("❌ Отмена" if lang == 'ru' else "❌ Cancel", callback_data='profile_friends')]]
+
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def friends_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE, search_query: str, page: int = 0):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user = query.from_user
+    else:
+        user = update.effective_user
+
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    # Используем существующую систему поиска игроков
+    res = db.find_player_by_identifier(search_query)
+    if res.get('ok') and res.get('player'):
+        p = res.get('player')
+        uid = int(getattr(p, 'user_id', 0) or 0)
+        uname = getattr(p, 'username', None) or str(uid)
+
+        if uid == int(user.id):
+            text = "Нельзя добавить себя." if lang == 'ru' else "You can't add yourself."
+            kb = [[InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_friends')]]
+        else:
+            title = "➕ <b>Добавить друга</b>" if lang == 'ru' else "➕ <b>Add friend</b>"
+            text = (
+                f"{title}\n\n"
+                f"Найден пользователь: @{html.escape(str(uname))}\n"
+                f"🆔 <code>{uid}</code>"
+                if lang == 'ru'
+                else f"{title}\n\nFound user: @{html.escape(str(uname))}\n🆔 <code>{uid}</code>"
+            )
+            kb = [
+                [InlineKeyboardButton("✅ Отправить заявку" if lang == 'ru' else "✅ Send request", callback_data=f'friends_add_pick:{uid}')],
+                [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_friends')],
+            ]
+
+        if query:
+            try:
+                await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        else:
+            await update.effective_message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if res.get('reason') == 'multiple':
+        candidates = res.get('candidates') or []
+        title = "➕ <b>Добавить друга</b>" if lang == 'ru' else "➕ <b>Add friend</b>"
+        if lang == 'ru':
+            text = f"{title}\n\nНайдено несколько пользователей, выберите:" 
+        else:
+            text = f"{title}\n\nMultiple users found, pick one:"
+
+        kb = []
+        for c in candidates:
+            try:
+                uid = int(c.get('user_id') or 0)
+            except Exception:
+                uid = 0
+            uname = c.get('username') or str(uid)
+            if not uid or uid == int(user.id):
+                continue
+            kb.append([InlineKeyboardButton(f"@{uname} (ID {uid})", callback_data=f'friends_add_pick:{uid}')])
+        kb.append([InlineKeyboardButton("🔎 Новый поиск" if lang == 'ru' else "🔎 New search", callback_data='friends_add_start')])
+        kb.append([InlineKeyboardButton("❌ Отмена" if lang == 'ru' else "❌ Cancel", callback_data='profile_friends')])
+
+        if query:
+            try:
+                await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        else:
+            await update.effective_message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    text = "❌ Ник не найден. Попробуйте ещё раз." if lang == 'ru' else "❌ No matches. Try again."
+    kb = [
+        [InlineKeyboardButton("🔎 Новый поиск" if lang == 'ru' else "🔎 New search", callback_data='friends_add_start')],
+        [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_friends')],
+    ]
+    if query:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def friends_add_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    try:
+        res = db.send_friend_request(user.id, int(target_user_id))
+    except Exception:
+        res = {"ok": False, "reason": "exception"}
+
+    if not res.get('ok'):
+        reason = res.get('reason')
+        if reason == 'self':
+            msg = "Нельзя добавить себя." if lang == 'ru' else "You can't add yourself."
+        elif reason == 'already_friends':
+            msg = "Вы уже друзья." if lang == 'ru' else "You're already friends."
+        elif reason == 'already_sent':
+            msg = "Заявка уже отправлена." if lang == 'ru' else "Request already sent."
+        else:
+            msg = "❌ Ошибка. Попробуйте позже." if lang == 'ru' else "❌ Error. Try later."
+        await query.answer(msg, show_alert=True)
+        await show_profile_friends(update, context)
+        return
+
+    msg_ok = "✅ Заявка отправлена!" if lang == 'ru' else "✅ Friend request sent!"
+    if res.get('auto_accepted'):
+        msg_ok = "✅ Вы теперь друзья!" if lang == 'ru' else "✅ You're now friends!"
+    await query.answer(msg_ok, show_alert=True)
+
+    try:
+        sender_name = user.username or user.first_name or str(user.id)
+        notify_text = f"👥 Вам пришла заявка в друзья от @{sender_name}." if lang == 'ru' else f"👥 You received a friend request from @{sender_name}."
+        await context.bot.send_message(chat_id=int(target_user_id), text=notify_text)
+    except Exception:
+        pass
+
+    await show_profile_friends(update, context)
+
+
+async def friends_requests_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.list_pending_incoming_friend_requests(user.id, page=page, per_page=6)
+    items = (res or {}).get('items') or []
+    total = int((res or {}).get('total') or 0)
+    per_page = int((res or {}).get('per_page') or 6)
+
+    title = "📨 <b>Заявки в друзья</b>" if lang == 'ru' else "📨 <b>Friend requests</b>"
+    text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
+    if not items:
+        text_lines.append("Пока нет заявок." if lang == 'ru' else "No requests yet.")
+    text = "\n".join(text_lines)
+
+    kb = []
+    for it in items:
+        rid = int(it.get('request_id') or 0)
+        uid = int(it.get('from_user_id') or 0)
+        uname = it.get('from_username') or str(uid)
+        kb.append([InlineKeyboardButton(f"@{uname} (ID {uid})", callback_data=f'friends_req_open:{rid}')])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'friends_requests_{page-1}'))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'friends_requests_{page+1}'))
+    if nav:
+        kb.append(nav)
+
+    kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_friends')])
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def friends_open_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, friend_user_id: int):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user = query.from_user
+    else:
+        user = update.effective_user
+
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    if not db.are_friends(user.id, int(friend_user_id)):
+        text = "❌ Этот игрок не у вас в друзьях." if lang == 'ru' else "❌ This player is not in your friends list."
+        kb = [[InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='friends_list_0')]]
+        if query:
+            try:
+                await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+            except BadRequest:
+                await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    try:
+        dbs = SessionLocal()
+        p = dbs.query(Player).filter(Player.user_id == int(friend_user_id)).first()
+    finally:
+        try:
+            dbs.close()
+        except Exception:
+            pass
+
+    uname = getattr(p, 'username', None) if p else None
+    uname_disp = f"@{uname}" if uname else f"ID {int(friend_user_id)}"
+
+    title = "👥 <b>Друг</b>" if lang == 'ru' else "👥 <b>Friend</b>"
+    if lang == 'ru':
+        text = (
+            f"{title}\n\n"
+            f"{html.escape(uname_disp)}\n"
+            f"🆔 <code>{int(friend_user_id)}</code>\n\n"
+            f"Лимиты:\n"
+            f"- Монеты: до 10 000 в сутки\n"
+            f"- Фрагменты: до 5 в сутки\n"
+            f"- VIP на 7 дней: раз в 2 недели (только VIP, без VIP+)\n"
+            f"- Рейтинг: до 3 за 48 часов"
+        )
+    else:
+        text = (
+            f"{title}\n\n"
+            f"{html.escape(uname_disp)}\n"
+            f"🆔 <code>{int(friend_user_id)}</code>\n\n"
+            f"Limits:\n"
+            f"- Coins: up to 10,000 per day\n"
+            f"- Fragments: up to 5 per day\n"
+            f"- VIP 7d: once per 2 weeks (VIP only, no VIP+)\n"
+            f"- Rating: up to 3 per 48 hours"
+        )
+
+    kb = [
+        [InlineKeyboardButton("💰 Передать монеты" if lang == 'ru' else "💰 Send coins", callback_data=f'friends_give_coins:{int(friend_user_id)}')],
+        [InlineKeyboardButton("🧩 Передать фрагменты" if lang == 'ru' else "🧩 Send fragments", callback_data=f'friends_give_fragments:{int(friend_user_id)}')],
+        [InlineKeyboardButton("👑 Подарить VIP (7 дней)" if lang == 'ru' else "👑 Gift VIP (7 days)", callback_data=f'friends_give_vip7:{int(friend_user_id)}')],
+        [InlineKeyboardButton("🏆 Передать рейтинг" if lang == 'ru' else "🏆 Send rating", callback_data=f'friends_give_rating:{int(friend_user_id)}')],
+        [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='friends_list_0')],
+    ]
+    if query:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    else:
+        await update.effective_message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def friends_start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, to_user_id: int):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    context.user_data['awaiting_friend_transfer'] = {"kind": str(kind), "to_user_id": int(to_user_id)}
+
+    if kind == 'coins':
+        prompt = "Введите количество монет (1..10000 за сутки):" if lang == 'ru' else "Enter coin amount (1..10000 per day):"
+    elif kind == 'fragments':
+        prompt = "Введите количество фрагментов (1..5 за сутки):" if lang == 'ru' else "Enter fragments amount (1..5 per day):"
+    else:
+        prompt = "Введите количество рейтинга (1..3 за 48 часов):" if lang == 'ru' else "Enter rating amount (1..3 per 48 hours):"
+
+    kb = [[InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data=f'friends_open:{int(to_user_id)}')]]
+    try:
+        await query.edit_message_text(prompt, reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=prompt, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def friends_request_open(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.list_pending_incoming_friend_requests(user.id, page=0, per_page=50)
+    items = (res or {}).get('items') or []
+    target = None
+    for it in items:
+        if int(it.get('request_id') or 0) == int(request_id):
+            target = it
+            break
+    if not target:
+        await query.answer("Заявка не найдена." if lang == 'ru' else "Request not found.", show_alert=True)
+        await friends_requests_menu(update, context, page=0)
+        return
+
+    uname = target.get('from_username') or str(target.get('from_user_id'))
+    uid = int(target.get('from_user_id') or 0)
+
+    title = "🤝 <b>Предложение дружбы</b>" if lang == 'ru' else "🤝 <b>Friend request</b>"
+    text = f"{title}\n\nОт: @{html.escape(str(uname))} (ID <code>{uid}</code>)" if lang == 'ru' else f"{title}\n\nFrom: @{html.escape(str(uname))} (ID <code>{uid}</code>)"
+
+    kb = [
+        [
+            InlineKeyboardButton("✅ Принять" if lang == 'ru' else "✅ Accept", callback_data=f'friends_req_accept:{request_id}'),
+            InlineKeyboardButton("❌ Отклонить" if lang == 'ru' else "❌ Reject", callback_data=f'friends_req_reject:{request_id}')
+        ],
+        [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='friends_requests_0')]
+    ]
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def friends_req_accept(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.accept_friend_request(user.id, int(request_id))
+    if not res or not res.get('ok'):
+        await query.answer("❌ Не удалось принять." if lang == 'ru' else "❌ Failed to accept.", show_alert=True)
+        await friends_requests_menu(update, context, page=0)
+        return
+
+    from_uid = int(res.get('from_user_id') or 0)
+    try:
+        await context.bot.send_message(chat_id=from_uid, text="✅ Вашу заявку в друзья приняли!" if lang == 'ru' else "✅ Your friend request was accepted!")
+    except Exception:
+        pass
+
+    await query.answer("✅ Добавлен в друзья" if lang == 'ru' else "✅ Added", show_alert=True)
+    await show_profile_friends(update, context)
+
+
+async def friends_req_reject(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.reject_friend_request(user.id, int(request_id))
+    if not res or not res.get('ok'):
+        await query.answer("❌ Не удалось отклонить." if lang == 'ru' else "❌ Failed to reject.", show_alert=True)
+        await friends_requests_menu(update, context, page=0)
+        return
+
+    from_uid = int(res.get('from_user_id') or 0)
+    try:
+        await context.bot.send_message(chat_id=from_uid, text="❌ Вашу заявку в друзья отклонили." if lang == 'ru' else "❌ Your friend request was rejected.")
+    except Exception:
+        pass
+
+    await query.answer("✅ Отклонено" if lang == 'ru' else "✅ Rejected", show_alert=True)
+    await show_profile_friends(update, context)
+
+
+async def friends_list_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.list_friends(user.id, page=page, per_page=8)
+    items = (res or {}).get('items') or []
+    total = int((res or {}).get('total') or 0)
+    per_page = int((res or {}).get('per_page') or 8)
+
+    title = "👤 <b>Мои друзья</b>" if lang == 'ru' else "👤 <b>My friends</b>"
+    text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
+    if not items:
+        text_lines.append("Список пуст." if lang == 'ru' else "List is empty.")
+    text = "\n".join(text_lines)
+
+    kb = []
+    for it in items:
+        uid = int(it.get('user_id') or 0)
+        uname = it.get('username') or str(uid)
+        kb.append([InlineKeyboardButton(f"@{uname} (ID {uid})", callback_data=f'friends_open:{uid}')])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'friends_list_{page-1}'))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'friends_list_{page+1}'))
+    if nav:
+        kb.append(nav)
+
+    kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_friends')])
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+def _farmer_fert_priority_from_player(player: Player) -> list[int]:
+    try:
+        prio_ids = json.loads(getattr(player, 'farmer_fert_priority', '[]') or '[]')
+        prio_ids = [int(x) for x in prio_ids] if isinstance(prio_ids, list) else []
+    except Exception:
+        prio_ids = []
+    return prio_ids
+
+
+async def show_selyuk_farmer_fert_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    prio_ids = _farmer_fert_priority_from_player(player)
+    inv = db.get_fertilizer_inventory(user.id) or []
+
+    ferts = []
+    for it in inv:
+        fz = getattr(it, 'fertilizer', None)
+        qty = int(getattr(it, 'quantity', 0) or 0)
+        if not fz:
+            continue
+        ferts.append((fz, qty))
+    ferts.sort(key=lambda x: int(getattr(x[0], 'id', 0) or 0))
+
+    prio_names = []
+    id_to_name = {int(getattr(fz, 'id', 0) or 0): html.escape(getattr(fz, 'name', 'Удобрение')) for fz, _ in ferts}
+    for fid in prio_ids:
+        if fid in id_to_name:
+            prio_names.append(id_to_name[fid])
+
+    text = "🧪 <b>Приоритет удобрений (ур.4)</b>\n\n"
+    if prio_names:
+        text += "Текущий приоритет:\n" + "\n".join([f"{i+1}. {n}" for i, n in enumerate(prio_names[:10])])
+    else:
+        text += "Пока пусто. Добавь удобрения в приоритет ниже."
+
+    per_page = 6
+    page = max(0, int(page or 0))
+    start = page * per_page
+    chunk = ferts[start:start+per_page]
+    keyboard = []
+
+    for fz, qty in chunk:
+        fid = int(getattr(fz, 'id', 0) or 0)
+        name = html.escape(getattr(fz, 'name', 'Удобрение'))
+        in_prio = fid in set(prio_ids)
+        if in_prio:
+            keyboard.append([InlineKeyboardButton(f"🗑️ Убрать: {name}", callback_data=f'selyuk_farmer_fert_prio_rm_{fid}_{page}')])
+        else:
+            keyboard.append([InlineKeyboardButton(f"➕ В приоритет: {name} (x{qty})", callback_data=f'selyuk_farmer_fert_prio_add_{fid}_{page}')])
+
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'selyuk_farmer_fert_prio_{page-1}'))
+    if start + per_page < len(ferts):
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'selyuk_farmer_fert_prio_{page+1}'))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_settings')])
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    title = "🚀 <b>Бусты</b>" if lang == 'ru' else "🚀 <b>Boosts</b>"
+    text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
+
+    try:
+        boost_info = db.get_boost_info(user.id)
+        if boost_info.get('is_active'):
+            if lang == 'ru':
+                text_lines.append(f"✅ Активен автопоиск-буст")
+                text_lines.append(f"📊 Дополнительно: +{boost_info.get('boost_count', 0)} поисков")
+                text_lines.append(f"⏰ Осталось: {boost_info.get('time_remaining_formatted', '—')}")
+                text_lines.append(f"📅 Истекает: {boost_info.get('boost_until_formatted', '—')}")
+            else:
+                text_lines.append("✅ Auto-search boost is active")
+                text_lines.append(f"📊 Extra: +{boost_info.get('boost_count', 0)} searches")
+                text_lines.append(f"⏰ Remaining: {boost_info.get('time_remaining_formatted', '—')}")
+                text_lines.append(f"📅 Expires: {boost_info.get('boost_until_formatted', '—')}")
+        elif boost_info.get('has_boost'):
+            text_lines.append("⏱ Буст автопоиска истёк" if lang == 'ru' else "⏱ Auto-search boost expired")
+        else:
+            text_lines.append("ℹ️ Активных бустов нет" if lang == 'ru' else "ℹ️ No active boosts")
+    except Exception:
+        text_lines.append("ℹ️ Активных бустов нет" if lang == 'ru' else "ℹ️ No active boosts")
+
+    try:
+        history = db.get_user_boost_history(user.id, limit=5)
+        if history:
+            text_lines.append("")
+            text_lines.append("<b>Последние:</b>" if lang == 'ru' else "<b>Recent:</b>")
+            for record in history:
+                dt = record.get('formatted_date') or ''
+                action = record.get('action_text') or ''
+                if dt and action:
+                    text_lines.append(f"• {dt} — {action}")
+    except Exception:
+        pass
+
+    text = "\n".join(text_lines)
+    back_label = "🔙 Назад" if lang == 'ru' else "🔙 Back"
+    keyboard = [[InlineKeyboardButton(back_label, callback_data='my_profile')]]
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
 async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает инвентарь игрока с сортировкой по количеству (для Приёмника)."""
     query = update.callback_query
@@ -6062,6 +8148,7 @@ async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAU
 
     user_id = query.from_user.id
     inventory_items = db.get_player_inventory_with_details(user_id)
+    sorted_items = []
 
     # Определяем страницу из callback_data: receiver_qty_p{num}
     page = 1
@@ -6101,8 +8188,8 @@ async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAU
         
         for item in page_items:
             rarity_emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
-            # Вычисляем стоимость продажи
-            unit_payout = int(RECEIVER_PRICES.get(item.rarity, 0) * (1.0 - RECEIVER_COMMISSION))
+            # Вычисляем стоимость продажи с учётом рейтинга
+            unit_payout = int(db.get_receiver_unit_payout_for_user(user_id, item.rarity) or 0)
             total_value = unit_payout * item.quantity
             inventory_text += f"{rarity_emoji} <b>{item.drink.name}</b> — {item.quantity} шт. (~{total_value} монет)\n"
 
@@ -6182,6 +8269,7 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Показывает подробности конкретного напитка из инвентаря."""
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
 
     try:
         # Парсим callback_data: view_{item_id} или view_{item_id}_p{page} или view_{item_id}_rp{page}
@@ -6225,7 +8313,7 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     # Расчёт выплат для кнопок продажи
-    unit_payout = int(RECEIVER_PRICES.get(rarity, 0) * (1.0 - RECEIVER_COMMISSION))
+    unit_payout = int(db.get_receiver_unit_payout_for_user(user_id, rarity) or 0)
     total_payout_all = unit_payout * int(inventory_item.quantity)
 
     rows = []
@@ -6272,7 +8360,8 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if image_full_path and os.path.exists(image_full_path):
         with open(image_full_path, 'rb') as photo:
-            await context.bot.send_photo(
+            await _send_photo_long(
+                context.bot.send_photo,
                 chat_id=query.message.chat_id,
                 photo=photo,
                 caption=caption,
@@ -6286,6 +8375,139 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=keyboard,
             parse_mode='HTML'
         )
+
+
+async def show_profile_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    title = t(lang, 'favorites_title')
+
+    slot_values = []
+    for i in (1, 2, 3):
+        item_id = int(getattr(player, f'favorite_drink_{i}', 0) or 0)
+        if item_id > 0:
+            inv_item = db.get_inventory_item(item_id)
+            if inv_item and int(getattr(inv_item, 'player_id', 0) or 0) == int(user_id) and getattr(inv_item, 'drink', None):
+                name = str(getattr(inv_item.drink, 'name', '') or '').strip() or ("Энергетик" if lang == 'ru' else "Energy drink")
+                slot_values.append((i, name))
+            else:
+                slot_values.append((i, t(lang, 'favorites_empty')))
+        else:
+            slot_values.append((i, t(lang, 'favorites_empty')))
+
+    lines = [title, "━━━━━━━━━━━━━━━━━━━", ""]
+    for i, val in slot_values:
+        lines.append(t(lang, 'favorites_slot').format(n=i, value=val))
+
+    text = "\n".join(lines)
+
+    keyboard = []
+    for i, val in slot_values:
+        label = f"{i}. {val}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"fav_slot_{i}")])
+    keyboard.append([InlineKeyboardButton(t(lang, 'favorites_back_profile'), callback_data='my_profile')])
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_favorites_pick_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: int, page: int = 1):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    slot = int(slot or 0)
+    if slot not in (1, 2, 3):
+        await query.answer("Ошибка", show_alert=True)
+        return
+
+    inventory_items = db.get_player_inventory_with_details(user_id)
+    if not inventory_items:
+        await query.answer(t(lang, 'favorites_pick_empty_inventory'), show_alert=True)
+        await show_profile_favorites(update, context)
+        return
+
+    # Сортировка как в show_inventory
+    sorted_items = sorted(
+        inventory_items,
+        key=lambda i: (
+            RARITY_ORDER.index(i.rarity) if i.rarity in RARITY_ORDER else len(RARITY_ORDER),
+            i.drink.name.lower(),
+        )
+    )
+
+    total_items = len(sorted_items)
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+    start_idx = (page - 1) * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    page_items = sorted_items[start_idx:end_idx]
+
+    text = (
+        f"{t(lang, 'favorites_pick_title').format(n=slot)}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{t(lang, 'inventory')}: {total_items}\n"
+        f"{('Страница' if lang == 'ru' else 'Page')} {page}/{total_pages}"
+    )
+
+    keyboard_rows = []
+    current_row = []
+    for item in page_items:
+        display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
+        callback = f"fav_pick_{slot}_{item.id}_p{page}"
+        current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
+        if len(current_row) == 2:
+            keyboard_rows.append(current_row)
+            current_row = []
+    if current_row:
+        keyboard_rows.append(current_row)
+
+    if total_pages > 1:
+        prev_page = total_pages if page == 1 else page - 1
+        next_page = 1 if page == total_pages else page + 1
+        keyboard_rows.append([
+            InlineKeyboardButton("⬅️", callback_data=f"fav_pick_page_{slot}_{prev_page}"),
+            InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
+            InlineKeyboardButton("➡️", callback_data=f"fav_pick_page_{slot}_{next_page}"),
+        ])
+
+    keyboard_rows.append([InlineKeyboardButton(t(lang, 'favorites_back_profile'), callback_data='profile_favorites')])
+    reply_markup = InlineKeyboardMarkup(keyboard_rows)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 # --- Приёмник: обработка продажи ---
@@ -6437,6 +8659,107 @@ async def handle_sell_absolutely_all_but_one(update: Update, context: ContextTyp
             f"♻️ Массовая продажа успешна!\n"
             f"Обработано типов: {items_processed}\n"
             f"Продано предметов: {total_sold} шт.\n"
+            f"Заработано: +{total_earned} монет\n"
+            f"Баланс: {coins_after} монет"
+        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text=success_text)
+        except Exception:
+            pass
+
+
+async def receiver_sell_all_confirm_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        "<b>🗑️ Продать все</b>\n\n"
+        "Вы собираетесь продать <b>все</b> энергетики из инвентаря через Приёмник.\n"
+        "Это действие нельзя отменить.\n\n"
+        "Продолжить?"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✅ Да", callback_data='sell_all_confirm_2')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='market_receiver')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def receiver_sell_all_confirm_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        "<b>⚠️ Второе подтверждение</b>\n\n"
+        "Точно продать <b>ВСЕ</b> энергетики?\n"
+        "Если в Приёмнике нет цены на редкость, такие предметы будут пропущены."
+    )
+    keyboard = [
+        [InlineKeyboardButton("🔥 Продать все", callback_data='sell_all_execute')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='market_receiver')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def handle_sell_all_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    lock = _get_lock(f"sell_all_inventory:{user_id}")
+    async with lock:
+        try:
+            result = db.sell_all_inventory(user_id)
+        except Exception:
+            await query.answer("Ошибка при массовой продаже. Попробуйте позже.", show_alert=True)
+            return
+
+        if not result or not result.get('ok'):
+            reason = (result or {}).get('reason')
+            reason_map = {
+                'no_items': 'У вас нет предметов в инвентаре',
+                'nothing_to_sell': 'Нет предметов для продажи',
+                'exception': 'Произошла ошибка. Повторите попытку',
+            }
+            msg = reason_map.get(reason, 'Не удалось выполнить продажу. Повторите попытку позже.')
+            await query.answer(msg, show_alert=True)
+            return
+
+        total_sold = int(result.get('total_items_sold', 0))
+        total_earned = int(result.get('total_earned', 0))
+        items_processed = int(result.get('items_processed', 0))
+        skipped_items = int(result.get('skipped_items', 0))
+        coins_after = int(result.get('coins_after', 0))
+
+        user = query.from_user
+        try:
+            db.log_action(
+                user_id=user_id,
+                username=user.username or user.first_name,
+                action_type='transaction',
+                action_details=f'Приёмник: продано всё. Обработано типов: {items_processed}. Пропущено: {skipped_items}.',
+                amount=total_earned,
+                success=True
+            )
+        except Exception:
+            pass
+
+        await show_inventory_by_quantity(update, context)
+
+        success_text = (
+            f"♻️ Продажа всех энергетиков успешна!\n"
+            f"Обработано типов: {items_processed}\n"
+            f"Продано предметов: {total_sold} шт.\n"
+            f"Пропущено (нет цены): {skipped_items}\n"
             f"Заработано: +{total_earned} монет\n"
             f"Баланс: {coins_after} монет"
         )
@@ -8752,20 +11075,28 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
-    _ = player.language
+    lang = getattr(player, 'language', 'ru') or 'ru'
 
-    # TODO: В будущем здесь будет статистика плантаций игрока
-    text = (
-        "<b>🌱 Плантация</b>\n\n"
-        "Добро пожаловать в систему плантаций!\n"
-        "Здесь вы сможете выращивать энергетики и собирать урожай.\n\n"
-        "<i>🚧 Система находится в разработке</i>"
-    )
+    if lang == 'en':
+        text = (
+            "<b>🌱 Plantation</b>\n\n"
+            "Grow energy drinks on beds and harvest them when ready.\n\n"
+            "⭐ Harvest reward: <b>+3 rating</b> for each harvest.\n"
+            "⭐ Rating affects drop rates: up to <b>+10%</b> for rare drinks from search and up to <b>+5%</b> for rare daily rewards."
+        )
+    else:
+        text = (
+            "<b>🌱 Плантация</b>\n\n"
+            "Выращивайте энергетики на грядках и собирайте урожай, когда он готов.\n\n"
+            "⭐ Награда за сбор: <b>+3 рейтинга</b> за каждый сбор урожая.\n"
+            "⭐ Рейтинг влияет на шансы: до <b>+10%</b> к редким напиткам из поиска и до <b>+5%</b> к редким наградам ежедневного бонуса."
+        )
     
     keyboard = [
         [InlineKeyboardButton("🌾 Мои грядки", callback_data='plantation_my_beds')],
         [InlineKeyboardButton("🛒 Купить семена", callback_data='plantation_shop')],
         [InlineKeyboardButton("🧪 Купить удобрения", callback_data='plantation_fertilizers_shop')],
+        [InlineKeyboardButton("💰 Цены на грядки", callback_data='plantation_bed_prices')],
         [InlineKeyboardButton("➕ Купить грядку", callback_data='plantation_buy_bed')],
         [InlineKeyboardButton("📊 Статистика", callback_data='plantation_stats')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
@@ -8789,12 +11120,57 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
 
 # === PLANTATION MENU FUNCTIONS ===
 
+async def show_plantation_bed_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    try:
+        db.ensure_player_beds(user.id)
+    except Exception:
+        pass
+
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    coins = int(getattr(player, 'coins', 0) or 0)
+    beds = db.get_player_beds(user.id) or []
+    owned = len(beds)
+
+    lines = [
+        "<b>💰 Цены на грядки</b>",
+        f"\n💰 Баланс: {coins} септимов",
+        "\nСтоимость покупки новых грядок:",
+        "1-я грядка — бесплатно (выдаётся автоматически)",
+        "2-я грядка — 1000💰",
+        "3-я грядка — 2000💰",
+        "4-я грядка — 4000💰",
+        "5-я грядка — 8000💰",
+    ]
+
+    if owned >= 5:
+        lines.append("\n✅ У вас уже максимум грядок (5/5)")
+    else:
+        next_index = owned + 1
+        next_price = 0
+        if next_index >= 2:
+            next_price = 1000 * (2 ** (next_index - 2))
+        if next_index <= 1:
+            lines.append("\nСледующая грядка: бесплатно")
+        else:
+            lines.append(f"\nСледующая грядка ({next_index}-я): {next_price}💰")
+
+    keyboard = []
+    if owned < 5:
+        keyboard.append([InlineKeyboardButton("➕ Купить следующую грядку", callback_data='plantation_buy_bed')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
 async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Мои грядки."""
     query = update.callback_query
     await query.answer()
     user = query.from_user
     context.user_data['last_plantation_screen'] = 'beds'
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
     # Гарантируем грядки и читаем текущее состояние
     try:
         db.ensure_player_beds(user.id)
@@ -8802,7 +11178,10 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
         pass
     beds = db.get_player_beds(user.id) or []
 
-    lines = ["<b>🌾 Мои грядки</b>"]
+    if lang == 'en':
+        lines = ["<b>🌾 My beds</b>", "⭐ Each harvest gives <b>+3 rating</b>."]
+    else:
+        lines = ["<b>🌾 Мои грядки</b>", "⭐ Каждый сбор урожая даёт <b>+3 рейтинга</b>."]
     actions = []
     for b in beds:
         idx = int(getattr(b, 'bed_index', 0) or 0)
@@ -8818,6 +11197,7 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
             name = html.escape(getattr(st, 'name', 'Семена')) if st else 'Семена'
             # Получаем фактическое время роста с учетом удобрения
             actual_grow_time = db.get_actual_grow_time(b)
+            base_grow_time = int(getattr(st, 'grow_time_sec', 0) or 0) if st else 0
             planted = int(getattr(b, 'planted_at', 0) or 0)
             passed = max(0, int(time.time()) - planted)
             remain = max(0, actual_grow_time - passed)
@@ -8826,26 +11206,85 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
             next_water = max(0, interval - (int(time.time()) - last)) if last and interval else 0
             
             # Проверяем статус удобрений
-            fert_status = db.get_fertilizer_status(b)
+            fert_status = db.get_fertilizer_status(b, check_duration=True)
+            fert_total_status = db.get_fertilizer_status(b, check_duration=False)
             
             prog = f"⏳ До созревания: { _fmt_time(remain) }" if remain else "⏳ Проверка готовности…"
             water_info = "💧 Можно поливать" if not next_water else f"💧 Через { _fmt_time(next_water) }"
-            
-            # Добавляем информацию об удобрениях (теперь может быть несколько)
-            if fert_status['active'] and fert_status['fertilizer_names']:
-                if len(fert_status['fertilizer_names']) == 1:
-                    fert_info = f"🧪 {fert_status['fertilizer_names'][0]} (x{fert_status['total_multiplier']:.1f})"
-                else:
-                    fert_info = f"🧪 Удобрений: {len(fert_status['fertilizer_names'])} (x{fert_status['total_multiplier']:.1f})"
+
+            growth_line = None
+            try:
+                if base_grow_time > 0 and actual_grow_time > 0 and actual_grow_time < base_grow_time:
+                    pct = int(round((1.0 - (float(actual_grow_time) / float(base_grow_time))) * 100.0))
+                    growth_line = f"⚡ Рост: -{pct}% ({_fmt_time(base_grow_time)} → {_fmt_time(actual_grow_time)})"
+                elif actual_grow_time > 0:
+                    growth_line = f"⚡ Рост: {_fmt_time(actual_grow_time)}"
+            except Exception:
+                growth_line = None
+
+            fert_lines = []
+            try:
+                info_list = list(fert_status.get('fertilizers_info', []) or [])
+            except Exception:
+                info_list = []
+            slots_used = len(info_list)
+            fert_header = f"🧪 Удобрения: {slots_used}/3"
+            fert_lines.append(fert_header)
+
+            try:
+                total_mult = float(fert_total_status.get('total_multiplier') or 1.0)
+            except Exception:
+                total_mult = 1.0
+
+            if total_mult > 1.0:
+                try:
+                    fert_lines.append(f"🌾 Урожай: x{total_mult:.2f}")
+                except Exception:
+                    fert_lines.append("🌾 Урожай: x1.00")
+
+            if slots_used > 0:
+                try:
+                    info_list.sort(key=lambda x: int(x.get('time_left') or 0), reverse=True)
+                except Exception:
+                    pass
+
+                icon_map = {
+                    'mega_yield': '🌾',
+                    'yield': '🌾',
+                    'quality': '💎',
+                    'complex': '🌟',
+                    'growth_quality': '⚡',
+                    'time': '⚡',
+                    'growth': '⚡',
+                    'nutrition': '🌿',
+                    'bio': '🌿',
+                    'basic': '🧪',
+                }
+
+                for fi in info_list[:3]:
+                    try:
+                        fn = html.escape(str(fi.get('name') or 'Удобрение'))
+                        mult = float(fi.get('multiplier') or 1.0)
+                        tl = int(fi.get('time_left') or 0)
+                        et = str(fi.get('effect_type') or 'basic')
+                        ico = icon_map.get(et, '🧪')
+                        fert_lines.append(f"• {fn} {ico} x{mult:.2f} — {_fmt_time(tl)}")
+                    except Exception:
+                        continue
+                if len(info_list) > 3:
+                    fert_lines.append(f"• …и ещё {len(info_list) - 3}")
             else:
-                # Проверяем, было ли применено удобрение (даже если истекло)
-                if getattr(b, 'fertilizer_id', None) and getattr(b, 'fertilizer', None):
-                    fert_name = getattr(b.fertilizer, 'name', 'Удобрение')
-                    fert_info = f"🧪 {fert_name}: эффект ускорения действует"
-                else:
-                    fert_info = "🧪 Удобрения нет"
-            
-            lines.append(f"🌱 Грядка {idx}: Растёт {name}\n{prog}\n{water_info}\n{fert_info}")
+                try:
+                    if growth_line and base_grow_time > 0 and actual_grow_time > 0 and actual_grow_time < base_grow_time:
+                        fert_lines[-1] = f"{fert_header} (ускорение сохранено)"
+                except Exception:
+                    pass
+
+            block = [f"🌱 Грядка {idx}: Растёт {name}", prog, water_info]
+            if growth_line:
+                block.append(growth_line)
+            block.extend(fert_lines)
+            lines.append("\n".join(block))
             actions.append([
                 InlineKeyboardButton(f"💧 Полить {idx}", callback_data=f'plantation_water_{idx}'),
                 InlineKeyboardButton(f"🧪 Удобрить {idx}", callback_data=f'fert_pick_for_bed_{idx}')
@@ -8864,6 +11303,7 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
     keyboard.extend(actions)
     keyboard.append([InlineKeyboardButton("🛒 Купить семена", callback_data='plantation_shop')])
     keyboard.append([InlineKeyboardButton("🧪 Купить удобрения", callback_data='plantation_fertilizers_shop'), InlineKeyboardButton("🧪 Мои удобрения", callback_data='plantation_fertilizers_inv')])
+    keyboard.append([InlineKeyboardButton("💰 Цены на грядки", callback_data='plantation_bed_prices')])
     keyboard.append([InlineKeyboardButton("➕ Купить грядку", callback_data='plantation_buy_bed')])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
     await query.edit_message_text("\n\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
@@ -8902,26 +11342,347 @@ async def show_plantation_shop(update: Update, context: ContextTypes.DEFAULT_TYP
                     if st.drink_id and st.drink 
                     and not getattr(st.drink, 'is_special', False)]
 
-    lines = [f"<b>🛒 Магазин семян</b>", f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов"]
-    keyboard = []
+    prev_ids = context.user_data.pop('plantation_shop_message_ids', None)
+    if isinstance(prev_ids, list) and prev_ids:
+        for mid in prev_ids:
+            try:
+                await context.bot.delete_message(chat_id=user.id, message_id=int(mid))
+            except Exception:
+                pass
+
+    try:
+        if query.message:
+            await query.message.delete()
+    except BadRequest:
+        pass
+
+    sent_ids: list[int] = []
+    balance = int(getattr(player, 'coins', 0) or 0)
+    header_text = f"<b>🛒 Магазин семян</b>\n\n💰 Баланс: {balance} септимов"
+    try:
+        msg = await context.bot.send_message(chat_id=user.id, text=header_text, parse_mode='HTML')
+        sent_ids.append(int(msg.message_id))
+    except Exception:
+        pass
+
     if seed_types:
-        lines.append("\nДоступные семена:")
         for st in seed_types:
+            drink = None
+            try:
+                did = int(getattr(st, 'drink_id', 0) or 0)
+            except Exception:
+                did = 0
+            if did:
+                try:
+                    drink = db.get_drink_by_id(did)
+                except Exception:
+                    drink = None
             name = html.escape(getattr(st, 'name', 'Семена'))
+            desc = html.escape((getattr(st, 'description', None) or (getattr(drink, 'description', None) if drink else None) or '').strip())
             price = int(getattr(st, 'price_coins', 0) or 0)
             ymin = int(getattr(st, 'yield_min', 0) or 0)
             ymax = int(getattr(st, 'yield_max', 0) or 0)
             grow_m = int((int(getattr(st, 'grow_time_sec', 0) or 0)) / 60)
-            lines.append(f"🌱 {name} — {price}💰, урожай {ymin}-{ymax}, рост ~{grow_m} мин")
-            keyboard.append([
-                InlineKeyboardButton("Купить 1", callback_data=f'plantation_buy_{st.id}_1'),
-                InlineKeyboardButton("Купить 5", callback_data=f'plantation_buy_{st.id}_5'),
-            ])
-    else:
-        lines.append("\nПока нет доступных семян. Загляните позже.")
 
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')])
-    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            caption_lines = [f"<b>🌱 {name}</b>"]
+            if desc:
+                caption_lines.append(desc)
+            caption_lines.append("")
+            caption_lines.append(f"💰 Цена: <b>{price}</b> септимов / 1 шт.")
+            caption_lines.append(f"🥕 Урожай: {ymin}-{ymax}")
+            caption_lines.append(f"⏱️ Рост: ~{grow_m} мин")
+            caption = "\n".join(caption_lines)
+
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Купить", callback_data=f'seed_buy_custom_{st.id}')]])
+
+            image_path = getattr(drink, 'image_path', None) if drink else None
+            image_full_path = os.path.join(ENERGY_IMAGES_DIR, image_path) if image_path else None
+
+            try:
+                if image_full_path and os.path.exists(image_full_path):
+                    with open(image_full_path, 'rb') as photo:
+                        m = await context.bot.send_photo(chat_id=user.id, photo=photo, caption=caption, reply_markup=kb, parse_mode='HTML')
+                else:
+                    m = await context.bot.send_message(chat_id=user.id, text=caption, reply_markup=kb, parse_mode='HTML')
+                sent_ids.append(int(m.message_id))
+            except Exception:
+                pass
+    else:
+        try:
+            m = await context.bot.send_message(chat_id=user.id, text="Пока нет доступных семян. Загляните позже.")
+            sent_ids.append(int(m.message_id))
+        except Exception:
+            pass
+
+    nav_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')]])
+    try:
+        m = await context.bot.send_message(chat_id=user.id, text="Что дальше?", reply_markup=nav_kb)
+        sent_ids.append(int(m.message_id))
+    except Exception:
+        pass
+
+    context.user_data['plantation_shop_message_ids'] = sent_ids
+
+
+async def start_seed_custom_buy_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        seed_type_id = int(query.data.split('_')[-1])
+        return await start_seed_custom_buy(update, context, seed_type_id)
+    except Exception:
+        await query.answer("Ошибка. Попробуйте позже.", show_alert=True)
+        return ConversationHandler.END
+
+
+def _build_seed_buy_prompt_text(seed_type, balance: int) -> tuple[str, int, int]:
+    name = html.escape(getattr(seed_type, 'name', 'Семена'))
+    price = int(getattr(seed_type, 'price_coins', 0) or 0)
+    max_qty = (balance // price) if price > 0 else 0
+    text = f"<b>🛒 Покупка семян</b>\n\n"
+    text += f"<b>{name}</b>\n"
+    text += f"💰 Цена: {price} септимов за 1 шт.\n"
+    text += f"💰 Ваш баланс: {balance} септимов\n"
+    text += f"📦 Максимум: {max_qty} шт.\n\n"
+    if max_qty > 0:
+        text += f"<i>Введите количество для покупки (1-{max_qty}):</i>"
+    else:
+        text += "<i>У вас недостаточно монет для покупки этих семян.</i>"
+    return text, price, max_qty
+
+
+async def start_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, seed_type_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    context.user_data['seed_custom_buy_id'] = int(seed_type_id)
+
+    seed_type = None
+    try:
+        seed_type = db.get_seed_type_by_id(int(seed_type_id))
+    except Exception:
+        seed_type = None
+    if not seed_type:
+        await query.answer("Семена не найдены", show_alert=True)
+        return ConversationHandler.END
+
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    balance = int(getattr(player, 'coins', 0) or 0)
+
+    text, _, max_qty = _build_seed_buy_prompt_text(seed_type, balance)
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='seed_custom_cancel')]]
+
+    try:
+        if max_qty <= 0:
+            await query.answer("Недостаточно монет", show_alert=True)
+            await show_plantation_shop(update, context)
+            return ConversationHandler.END
+
+        if getattr(query.message, 'photo', None):
+            await query.edit_message_caption(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        else:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        return SEED_CUSTOM_QTY
+    except BadRequest:
+        try:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            return SEED_CUSTOM_QTY
+        except Exception:
+            return ConversationHandler.END
+
+
+async def seed_custom_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    seed_type_id = context.user_data.get('seed_custom_buy_id')
+    if not seed_type_id:
+        await query.answer("Ошибка: семена не выбраны", show_alert=True)
+        return ConversationHandler.END
+
+    seed_type = None
+    try:
+        seed_type = db.get_seed_type_by_id(int(seed_type_id))
+    except Exception:
+        seed_type = None
+    if not seed_type:
+        await query.answer("Семена не найдены", show_alert=True)
+        return ConversationHandler.END
+
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    balance = int(getattr(player, 'coins', 0) or 0)
+
+    text, _, _ = _build_seed_buy_prompt_text(seed_type, balance)
+    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='seed_custom_cancel')]]
+
+    try:
+        if getattr(query.message, 'photo', None):
+            await query.edit_message_caption(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        else:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+    return SEED_CUSTOM_QTY
+
+
+async def seed_custom_buy_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    seed_type_id = context.user_data.get('seed_custom_buy_id')
+    if not seed_type_id:
+        await query.answer("Ошибка: семена не выбраны", show_alert=True)
+        return ConversationHandler.END
+
+    seed_type = None
+    try:
+        seed_type = db.get_seed_type_by_id(int(seed_type_id))
+    except Exception:
+        seed_type = None
+    if not seed_type:
+        await query.answer("Семена не найдены", show_alert=True)
+        return ConversationHandler.END
+
+    price = int(getattr(seed_type, 'price_coins', 0) or 0)
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    balance = int(getattr(player, 'coins', 0) or 0)
+    max_qty = (balance // price) if price > 0 else 0
+    if max_qty <= 0:
+        await query.answer("Недостаточно монет", show_alert=True)
+        return SEED_CUSTOM_QTY
+
+    lock = _get_lock(f"user:{user.id}:plantation_seed_buy")
+    if lock.locked():
+        await query.answer("Обработка…", show_alert=False)
+        return SEED_CUSTOM_QTY
+
+    async with lock:
+        res = db.purchase_seeds(user.id, int(seed_type_id), int(max_qty))
+        if not res.get('ok'):
+            await query.answer("Не удалось купить", show_alert=True)
+            return SEED_CUSTOM_QTY
+
+        name = html.escape(getattr(seed_type, 'name', 'Семена'))
+        text = (
+            f"✅ <b>Куплено!</b>\n\n"
+            f"{name} x {max_qty}\n"
+            f"💰 Баланс: {res.get('coins_left')} септимов\n"
+            f"📦 В инвентаре: {res.get('inventory_qty')} шт."
+        )
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Вернуться в магазин", callback_data='plantation_shop')]])
+        try:
+            if getattr(query.message, 'photo', None):
+                await query.edit_message_caption(text, reply_markup=keyboard, parse_mode='HTML')
+            else:
+                await query.edit_message_text(text, reply_markup=keyboard, parse_mode='HTML')
+        except BadRequest:
+            pass
+
+    return ConversationHandler.END
+
+
+async def handle_seed_custom_qty_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+
+    if not msg or not msg.text:
+        await msg.reply_text("Пожалуйста, введите число.")
+        return SEED_CUSTOM_QTY
+
+    seed_type_id = context.user_data.get('seed_custom_buy_id')
+    if not seed_type_id:
+        await msg.reply_text("Ошибка: семена не выбраны.")
+        return ConversationHandler.END
+
+    try:
+        quantity = int(msg.text.strip())
+    except ValueError:
+        await msg.reply_text("❌ Неверный формат. Пожалуйста, введите целое число.")
+        return SEED_CUSTOM_QTY
+
+    if quantity <= 0:
+        await msg.reply_text("❌ Количество должно быть больше 0.")
+        return SEED_CUSTOM_QTY
+
+    if quantity > 1000:
+        await msg.reply_text("❌ Слишком много! Максимум 1000 шт. за раз.")
+        return SEED_CUSTOM_QTY
+
+    seed_type = None
+    try:
+        seed_type = db.get_seed_type_by_id(int(seed_type_id))
+    except Exception:
+        seed_type = None
+    if not seed_type:
+        await msg.reply_text("❌ Семена не найдены.")
+        return ConversationHandler.END
+
+    price = int(getattr(seed_type, 'price_coins', 0) or 0)
+    if price <= 0:
+        await msg.reply_text("❌ Эти семена сейчас недоступны для покупки.")
+        return ConversationHandler.END
+
+    total_cost = price * int(quantity)
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    balance = int(getattr(player, 'coins', 0) or 0)
+
+    if total_cost > balance:
+        max_qty = (balance // price) if price > 0 else 0
+        text = f"❌ Недостаточно монет!\nНужно: {total_cost} септимов\nУ вас: {balance} септимов"
+        keyboard = [
+            [InlineKeyboardButton("✏️ Ввести другое количество", callback_data='seed_custom_retry')],
+        ]
+        if max_qty > 0:
+            keyboard.append([InlineKeyboardButton(f"🪙 Купить максимум ({max_qty})", callback_data='seed_custom_buy_max')])
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data='seed_custom_cancel')])
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return SEED_CUSTOM_QTY
+
+    lock = _get_lock(f"user:{user.id}:plantation_seed_buy")
+    if lock.locked():
+        await msg.reply_text("⏳ Обработка предыдущей покупки...")
+        return SEED_CUSTOM_QTY
+
+    async with lock:
+        res = db.purchase_seeds(user.id, int(seed_type_id), int(quantity))
+        if not res.get('ok'):
+            reason = res.get('reason')
+            if reason == 'not_enough_coins':
+                await msg.reply_text('❌ Недостаточно монет')
+                return SEED_CUSTOM_QTY
+            elif reason == 'no_such_seed':
+                await msg.reply_text('❌ Семена не найдены')
+                return ConversationHandler.END
+            elif reason == 'invalid_quantity':
+                await msg.reply_text('❌ Неверное количество')
+                return SEED_CUSTOM_QTY
+            else:
+                await msg.reply_text('❌ Ошибка. Попробуйте позже.')
+                return ConversationHandler.END
+        else:
+            name = html.escape(getattr(seed_type, 'name', 'Семена'))
+            await msg.reply_html(
+                f"✅ <b>Куплено!</b>\n\n"
+                f"{name} x {quantity}\n"
+                f"💰 Баланс: {res.get('coins_left')} септимов\n"
+                f"📦 В инвентаре: {res.get('inventory_qty')} шт."
+            )
+
+        keyboard = [[InlineKeyboardButton("🛒 Вернуться в магазин", callback_data='plantation_shop')]]
+        await msg.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    return ConversationHandler.END
+
+
+async def cancel_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await show_plantation_shop(update, context)
+    return ConversationHandler.END
 
 async def show_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбор урожая."""
@@ -8979,34 +11740,211 @@ async def show_plantation_water(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def show_plantation_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Статистика плантации."""
+    """Статистика плантации - улучшенная версия с красивым интерфейсом."""
     query = update.callback_query
     await query.answer()
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     beds = db.get_player_beds(user.id) or []
-    inv = db.get_seed_inventory(user.id) or []
+    seed_inv = db.get_seed_inventory(user.id) or []
+    
+    # Получаем инвентарь удобрений
+    try:
+        fert_inv = db.get_fertilizer_inventory(user.id) or []
+    except Exception:
+        fert_inv = []
+    
+    # Получаем информацию о фермере
+    try:
+        farmer = db.get_selyuk_by_type(user.id, 'farmer')
+    except Exception:
+        farmer = None
 
+    # Подсчёт состояний грядок
     counts = {'empty': 0, 'growing': 0, 'ready': 0, 'withered': 0}
+    growing_info = []  # Информация о растущих грядках
+    ready_info = []    # Информация о готовых грядках
+    
+    now_ts = int(time.time())
+    
     for b in beds:
         s = str(getattr(b, 'state', 'empty') or 'empty')
         counts[s] = counts.get(s, 0) + 1
+        
+        if s == 'growing':
+            st = getattr(b, 'seed_type', None)
+            if st:
+                actual_grow_time = db.get_actual_grow_time(b)
+                planted = int(getattr(b, 'planted_at', 0) or 0)
+                passed = max(0, now_ts - planted)
+                remain = max(0, actual_grow_time - passed)
+                progress = min(100, int((passed / actual_grow_time) * 100)) if actual_grow_time > 0 else 0
+                growing_info.append({
+                    'idx': int(getattr(b, 'bed_index', 0) or 0),
+                    'name': getattr(st, 'name', 'Растение'),
+                    'remain': remain,
+                    'progress': progress
+                })
+        elif s == 'ready':
+            st = getattr(b, 'seed_type', None)
+            if st:
+                ready_info.append({
+                    'idx': int(getattr(b, 'bed_index', 0) or 0),
+                    'name': getattr(st, 'name', 'Растение')
+                })
 
-    lines = ["<b>📊 Статистика плантации</b>"]
-    lines.append(f"\n💰 Баланс: {int(getattr(player, 'coins', 0) or 0)} септимов")
-    lines.append(f"🌾 Грядок: {len(beds)} (пустых {counts.get('empty',0)}, растёт {counts.get('growing',0)}, готово {counts.get('ready',0)}, завяло {counts.get('withered',0)})")
-    if inv:
-        lines.append("\n🌱 Семена в инвентаре:")
-        for it in inv:
+    # === ФОРМИРУЕМ КРАСИВЫЙ ТЕКСТ ===
+    coins = int(getattr(player, 'coins', 0) or 0)
+    
+    lines = [
+        "╔══════════════════════════╗",
+        "║   📊 <b>СТАТИСТИКА ПЛАНТАЦИИ</b>   ║",
+        "╚══════════════════════════╝",
+        ""
+    ]
+    
+    # Блок баланса
+    lines.append(f"💰 <b>Баланс:</b> {coins:,} септимов".replace(',', ' '))
+    lines.append("")
+    
+    # Блок грядок с визуальным отображением
+    total_beds = len(beds)
+    lines.append(f"🌾 <b>Грядки ({total_beds} шт.):</b>")
+    
+    # Визуальная полоса состояний
+    if total_beds > 0:
+        bar_length = 12
+        empty_blocks = int(counts['empty'] / total_beds * bar_length)
+        growing_blocks = int(counts['growing'] / total_beds * bar_length)
+        ready_blocks = int(counts['ready'] / total_beds * bar_length)
+        withered_blocks = int(counts['withered'] / total_beds * bar_length)
+        
+        # Корректируем для точности
+        total_blocks = empty_blocks + growing_blocks + ready_blocks + withered_blocks
+        if total_blocks < bar_length and total_beds > 0:
+            if counts['growing'] > 0:
+                growing_blocks += bar_length - total_blocks
+            elif counts['empty'] > 0:
+                empty_blocks += bar_length - total_blocks
+        
+        visual_bar = "⬜" * empty_blocks + "🌱" * growing_blocks + "✅" * ready_blocks + "💀" * withered_blocks
+        lines.append(f"   {visual_bar}")
+    
+    # Детальная статистика грядок
+    lines.append(f"   ⬜ Пустых: <b>{counts['empty']}</b>")
+    lines.append(f"   🌱 Растёт: <b>{counts['growing']}</b>")
+    lines.append(f"   ✅ Готово: <b>{counts['ready']}</b>")
+    if counts['withered'] > 0:
+        lines.append(f"   💀 Завяло: <b>{counts['withered']}</b>")
+    lines.append("")
+    
+    # Детали растущих грядок (если есть)
+    if growing_info:
+        lines.append("⏳ <b>Созревают:</b>")
+        for gi in growing_info[:3]:  # Показываем первые 3
+            # Прогресс-бар
+            prog_filled = gi['progress'] // 10
+            prog_empty = 10 - prog_filled
+            prog_bar = "▓" * prog_filled + "░" * prog_empty
+            time_str = _fmt_time(gi['remain'])
+            lines.append(f"   🌱 #{gi['idx']} {html.escape(gi['name'])}")
+            lines.append(f"      [{prog_bar}] {gi['progress']}%")
+            lines.append(f"      ⏱ Осталось: {time_str}")
+        if len(growing_info) > 3:
+            lines.append(f"   <i>...и ещё {len(growing_info) - 3} грядок</i>")
+        lines.append("")
+    
+    # Готовые к сбору
+    if ready_info:
+        lines.append("🎉 <b>Готово к сбору:</b>")
+        for ri in ready_info[:5]:
+            lines.append(f"   ✅ #{ri['idx']} {html.escape(ri['name'])}")
+        if len(ready_info) > 5:
+            lines.append(f"   <i>...и ещё {len(ready_info) - 5} грядок</i>")
+        lines.append("")
+    
+    # Блок инвентаря семян
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    total_seeds = sum(int(getattr(it, 'quantity', 0) or 0) for it in seed_inv)
+    lines.append(f"🌱 <b>Семена:</b> {total_seeds} шт.")
+    if seed_inv:
+        seed_items = []
+        for it in seed_inv:
             st = getattr(it, 'seed_type', None)
             name = html.escape(getattr(st, 'name', 'Семена')) if st else 'Семена'
             qty = int(getattr(it, 'quantity', 0) or 0)
             if qty > 0:
-                lines.append(f"• {name}: {qty} шт.")
+                seed_items.append(f"{name}: {qty}")
+        if seed_items:
+            lines.append(f"   {', '.join(seed_items[:3])}")
+            if len(seed_items) > 3:
+                lines.append(f"   <i>...и ещё {len(seed_items) - 3} видов</i>")
     else:
-        lines.append("\n🌱 Семян нет.")
-
-    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='market_plantation')]]
+        lines.append("   <i>Инвентарь пуст</i>")
+    lines.append("")
+    
+    # Блок удобрений
+    total_ferts = sum(int(getattr(it, 'quantity', 0) or 0) for it in fert_inv if getattr(it, 'quantity', 0) and int(getattr(it, 'quantity', 0) or 0) > 0)
+    lines.append(f"🧪 <b>Удобрения:</b> {total_ferts} шт.")
+    if fert_inv:
+        fert_items = []
+        for it in fert_inv:
+            fz = getattr(it, 'fertilizer', None)
+            qty = int(getattr(it, 'quantity', 0) or 0)
+            if fz and qty > 0:
+                fert_items.append(f"{getattr(fz, 'name', 'Удобрение')}: {qty}")
+        if fert_items:
+            lines.append(f"   {', '.join(fert_items[:3])}")
+            if len(fert_items) > 3:
+                lines.append(f"   <i>...и ещё {len(fert_items) - 3} видов</i>")
+    else:
+        lines.append("   <i>Инвентарь пуст</i>")
+    lines.append("")
+    
+    # Блок фермера
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if farmer:
+        level = int(getattr(farmer, 'level', 1) or 1)
+        balance = int(getattr(farmer, 'balance_septims', 0) or 0)
+        is_enabled = bool(getattr(farmer, 'is_enabled', False))
+        status_emoji = "🟢" if is_enabled else "🔴"
+        level_icons = {1: "⭐", 2: "⭐⭐", 3: "⭐⭐⭐", 4: "⭐⭐⭐⭐"}
+        
+        lines.append(f"👨‍🌾 <b>Селюк-Фермер:</b>")
+        lines.append(f"   {level_icons.get(level, '⭐')} Уровень: <b>{level}</b>")
+        lines.append(f"   {status_emoji} Статус: <b>{'Активен' if is_enabled else 'Отключен'}</b>")
+        lines.append(f"   💵 Баланс: <b>{balance:,} септимов</b>".replace(',', ' '))
+        
+        # Бонусы по уровню
+        if level == 1:
+            lines.append("   📋 Автополив (-50💰)")
+        elif level == 2:
+            lines.append("   📋 Автополив (-45💰) + Автосбор")
+        elif level == 3:
+            lines.append("   📋 Полный автомат (-45💰)")
+        elif level >= 4:
+            lines.append("   📋 Полный автомат (-45💰) + Автоудобрение")
+    else:
+        lines.append("👨‍🌾 <b>Селюк-Фермер:</b> <i>Не куплен</i>")
+        lines.append("   <i>Купите в разделе 🌾 Селюки!</i>")
+    
+    # Кнопки навигации
+    keyboard = [
+        [
+            InlineKeyboardButton("🌾 К грядкам", callback_data='plantation_my_beds'),
+            InlineKeyboardButton("🛒 Семена", callback_data='plantation_shop')
+        ],
+        [
+            InlineKeyboardButton("🧪 Удобрения", callback_data='plantation_fertilizers_shop'),
+            InlineKeyboardButton("➕ Грядка", callback_data='plantation_buy_bed')
+        ],
+        [InlineKeyboardButton("🔙 Назад в меню", callback_data='market_plantation')]
+    ]
+    
+    # Добавляем кнопку сбора, если есть готовые
+    if counts['ready'] > 0:
+        keyboard.insert(0, [InlineKeyboardButton(f"🥕 Собрать урожай ({counts['ready']})", callback_data='plantation_harvest_all')])
+    
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 # === FERTILIZERS: SHOP, INVENTORY, APPLY ===
@@ -9448,7 +12386,31 @@ async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEF
     await query.answer()
     user = query.from_user
     inv = db.get_fertilizer_inventory(user.id) or []
+    beds = db.get_player_beds(user.id) or []
+    bed = None
+    for b in beds:
+        try:
+            if int(getattr(b, 'bed_index', 0) or 0) == int(bed_index):
+                bed = b
+                break
+        except Exception:
+            continue
+
     lines = [f"<b>🧪 Выберите удобрение для грядки {bed_index}</b>"]
+    if bed is not None:
+        try:
+            fs = db.get_fertilizer_status(bed)
+            info_list = list(fs.get('fertilizers_info', []) or [])
+            used = len(info_list)
+            lines.append(f"\n🧪 Сейчас на грядке: {used}/3")
+            for fi in info_list[:3]:
+                fn = html.escape(str(fi.get('name') or 'Удобрение'))
+                tl = int(fi.get('time_left') or 0)
+                lines.append(f"• {fn} — {_fmt_time(tl)}")
+            if len(info_list) > 3:
+                lines.append(f"• …и ещё {len(info_list) - 3}")
+        except Exception:
+            pass
     keyboard = []
     any_items = False
     for it in inv:
@@ -9482,7 +12444,7 @@ async def handle_plantation_buy_bed(update: Update, context: ContextTypes.DEFAUL
             else:
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         else:
-            idx = res.get('bed_index')
+            idx = res.get('new_bed_index')
             await query.answer(f"Грядка куплена! #{idx}. Баланс: {res.get('coins_left')}", show_alert=False)
         await show_plantation_my_beds(update, context)
 
@@ -9701,6 +12663,11 @@ async def handle_plantation_water(update: Update, context: ContextTypes.DEFAULT_
                 await query.answer('Ошибка при поливе', show_alert=True)
         else:
             await query.answer('Полито!', show_alert=False)
+
+            try:
+                db.try_farmer_auto_fertilize(user.id)
+            except Exception:
+                pass
             
             # Планируем напоминание о следующем поливе, если включено
             player = db.get_or_create_player(user.id, user.username or user.first_name)
@@ -9729,6 +12696,11 @@ async def handle_plantation_water(update: Update, context: ContextTypes.DEFAULT_
 async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
     query = update.callback_query
     user = query.from_user
+    try:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+    except Exception:
+        lang = 'ru'
     lock = _get_lock(f"user:{user.id}:plantation_harvest")
     if lock.locked():
         await query.answer("Обработка…", show_alert=False)
@@ -9750,6 +12722,8 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
             items_added = int(res.get('items_added') or 0)
             drink_id = int(res.get('drink_id') or 0)
             rarity_counts = res.get('rarity_counts') or {}
+            rating_added = int(res.get('rating_added') or 0)
+            new_rating = res.get('new_rating')
 
             # Удаляем напоминание о поливе для этой грядки
             if context.application and context.application.job_queue:
@@ -9761,7 +12735,19 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
                     logger.warning(f"Не удалось удалить напоминание о поливе при сборе урожая: {ex}")
 
             # Короткое подтверждение
-            await query.answer(f"Собрано: {items_added}", show_alert=False)
+            if lang == 'en':
+                short = f"Collected: {items_added}"
+                if rating_added > 0:
+                    short += f" | ⭐ +{rating_added}"
+                    if new_rating is not None:
+                        short += f" (Rating: {int(new_rating)})"
+            else:
+                short = f"Собрано: {items_added}"
+                if rating_added > 0:
+                    short += f" | ⭐ +{rating_added}"
+                    if new_rating is not None:
+                        short += f" (Рейтинг: {int(new_rating)})"
+            await query.answer(short, show_alert=False)
 
             # Детальный отчёт с фото и эффектами
             try:
@@ -9774,6 +12760,16 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
                 "<b>🥕 Урожай собран</b>",
                 f"{name}: <b>{items_added}</b>" + (f" из {amount}" if items_added != amount else ""),
             ]
+            if rating_added > 0:
+                if lang == 'en':
+                    rr = f"⭐ Rating: <b>+{rating_added}</b>"
+                    if new_rating is not None:
+                        rr += f" (now <b>{int(new_rating)}</b>)"
+                else:
+                    rr = f"⭐ Рейтинг: <b>+{rating_added}</b>"
+                    if new_rating is not None:
+                        rr += f" (теперь <b>{int(new_rating)}</b>)"
+                lines.append(rr)
             for r in RARITY_ORDER:
                 cnt = int((rarity_counts.get(r) or 0))
                 if cnt > 0:
@@ -9829,6 +12825,11 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
         return
     async with lock:
         beds = db.get_player_beds(user.id) or []
+        try:
+            player = db.get_or_create_player(user.id, user.username or user.first_name)
+            lang = getattr(player, 'language', 'ru') or 'ru'
+        except Exception:
+            lang = 'ru'
         ready = [b for b in beds if str(getattr(b, 'state', '')) == 'ready']
         if not ready:
             await query.answer('Пока нет готового урожая', show_alert=True)
@@ -9836,6 +12837,7 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
 
         total_items = 0
         total_amount = 0
+        total_rating_added = 0
         agg_rarity: dict[str, int] = {}
         per_drink: dict[int, dict] = {}
 
@@ -9859,6 +12861,10 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
             drink_id = int(res.get('drink_id') or 0)
             rarity_counts = res.get('rarity_counts') or {}
             eff = res.get('effects') or {}
+            try:
+                total_rating_added += int(res.get('rating_added') or 0)
+            except Exception:
+                pass
 
             total_items += items_added
             total_amount += amount
@@ -9948,6 +12954,11 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
             "<b>🥕 Сбор завершён</b>",
             f"Итого собрано: <b>{total_items}</b>" + (f" из {total_amount}" if total_items != total_amount else ""),
         ]
+        if total_rating_added > 0:
+            if lang == 'en':
+                lines.append(f"⭐ Rating gained: <b>+{int(total_rating_added)}</b>")
+            else:
+                lines.append(f"⭐ Получено рейтинга: <b>+{int(total_rating_added)}</b>")
         for r in RARITY_ORDER:
             cnt = int((agg_rarity.get(r) or 0))
             if cnt > 0:
@@ -10007,7 +13018,7 @@ async def show_cities_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
-    _ = player.language
+    lang = getattr(player, 'language', 'ru') or 'ru'
 
     text = (
         "<b>🏙️ КАРТА ГОРОДОВ 🏙️</b>\n\n"
@@ -10069,7 +13080,7 @@ async def show_city_hightown(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
-    _ = player.language
+    lang = getattr(player, 'language', 'ru') or 'ru'
 
     text = (
         "🏰 <b>ДОБРО ПОЖАЛОВАТЬ В ХАЙТАУН</b> 🏰\n\n"
@@ -10236,6 +13247,398 @@ async def show_power_sematori(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest:
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+ROSTOV_ELITE_ITEM_PRICES = {
+    'search_skip': 2500,
+    'bonus_skip': 4000,
+    'auto_boost_10_24h': 20000,
+    'fragments_pack_3': 6000,
+    'luck_coupon_3': 15000,
+}
+
+
+async def show_rostov_elite_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+
+    coins = int(getattr(player, 'coins', 0) or 0)
+    luck = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+    fragments = int(getattr(player, 'selyuk_fragments', 0) or 0)
+
+    try:
+        boost_info = db.get_boost_info(user.id)
+    except Exception:
+        boost_info = {}
+
+    boost_active = bool(boost_info.get('is_active'))
+    boost_count = int(boost_info.get('boost_count', 0) or 0)
+    boost_remaining = boost_info.get('time_remaining_formatted', '—')
+
+    text_lines = [
+        "💠 <b>ЭЛИТНЫЕ ПРЕДМЕТЫ</b> 💠",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"💰 <b>Баланс:</b> {coins:,} 💎",
+        f"🧩 <b>Фрагменты Селюка:</b> {fragments}",
+        f"🎲 <b>Купон удачи:</b> {luck} заряд(ов)",
+        f"🚀 <b>Автопоиск-буст:</b> {'активен' if boost_active else '—'} (+{boost_count}, осталось {boost_remaining})" if boost_active else "🚀 <b>Автопоиск-буст:</b> —",
+        "",
+        "<b>Товары:</b>",
+        "",
+        f"⏱ Пропуск кулдауна поиска — <b>{ROSTOV_ELITE_ITEM_PRICES['search_skip']:,}</b> 💎",
+        f"🎁 Пропуск кулдауна бонуса — <b>{ROSTOV_ELITE_ITEM_PRICES['bonus_skip']:,}</b> 💎",
+        f"🚀 Автопоиск-буст +10 на 24ч — <b>{ROSTOV_ELITE_ITEM_PRICES['auto_boost_10_24h']:,}</b> 💎",
+        f"🧩 Фрагменты Селюка +3 — <b>{ROSTOV_ELITE_ITEM_PRICES['fragments_pack_3']:,}</b> 💎",
+        f"🎲 Купон удачи (+3 заряда, 50% на 2 дропа) — <b>{ROSTOV_ELITE_ITEM_PRICES['luck_coupon_3']:,}</b> 💎",
+    ]
+
+    text = "\n".join(text_lines)
+
+    keyboard = [
+        [InlineKeyboardButton(f"Купить ⏱ ({ROSTOV_ELITE_ITEM_PRICES['search_skip']})", callback_data='rostov_elite_buy_search_skip')],
+        [InlineKeyboardButton(f"Купить 🎁 ({ROSTOV_ELITE_ITEM_PRICES['bonus_skip']})", callback_data='rostov_elite_buy_bonus_skip')],
+        [InlineKeyboardButton(f"Купить 🚀 (+10/24ч) ({ROSTOV_ELITE_ITEM_PRICES['auto_boost_10_24h']})", callback_data='rostov_elite_buy_auto_boost_10_24h')],
+        [InlineKeyboardButton(f"Купить 🧩 (+3) ({ROSTOV_ELITE_ITEM_PRICES['fragments_pack_3']})", callback_data='rostov_elite_buy_fragments_pack_3')],
+        [InlineKeyboardButton(f"Купить 🎲 (+3) ({ROSTOV_ELITE_ITEM_PRICES['luck_coupon_3']})", callback_data='rostov_elite_buy_luck_coupon_3')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='rostov_elite_shop')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def handle_rostov_elite_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, item_key: str):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    lock = _get_lock(f"user:{user.id}:rostov_elite_buy")
+    if lock.locked():
+        await query.answer("Подождите…", show_alert=True)
+        return
+    async with lock:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        coins = int(getattr(player, 'coins', 0) or 0)
+
+        price = int(ROSTOV_ELITE_ITEM_PRICES.get(item_key, 0) or 0)
+        if price <= 0:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+
+        if coins < price:
+            await query.answer(f"Недостаточно монет: {coins}/{price}", show_alert=True)
+            return
+
+        # Списываем монеты
+        try:
+            db.update_player(user.id, coins=coins - price)
+        except Exception:
+            await query.answer("Ошибка покупки.", show_alert=True)
+            return
+
+        now_ts = int(time.time())
+
+        if item_key == 'search_skip':
+            db.update_player(user.id, last_search=0)
+            await query.answer("✅ Кулдаун поиска сброшен!", show_alert=True)
+        elif item_key == 'bonus_skip':
+            db.update_player(user.id, last_bonus_claim=0)
+            await query.answer("✅ Кулдаун бонуса сброшен!", show_alert=True)
+        elif item_key == 'auto_boost_10_24h':
+            try:
+                ok = db.add_auto_search_boost(user.id, boost_count=10, days=1)
+            except Exception:
+                ok = False
+            if ok:
+                await query.answer("✅ Автопоиск-буст добавлен (+10 на 24ч)", show_alert=True)
+            else:
+                await query.answer("⚠️ Не удалось применить буст.", show_alert=True)
+        elif item_key == 'fragments_pack_3':
+            try:
+                db.increment_selyuk_fragments(user.id, 3)
+            except Exception:
+                pass
+            await query.answer("✅ Вы получили +3 фрагмента!", show_alert=True)
+        elif item_key == 'luck_coupon_3':
+            current = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+            db.update_player(user.id, luck_coupon_charges=current + 3)
+            await query.answer("✅ Купон удачи пополнен (+3 заряда)", show_alert=True)
+        else:
+            await query.answer("Товар не найден.", show_alert=True)
+
+        # Лёгкий аудит в action_logs
+        try:
+            db.log_action(
+                user_id=user.id,
+                username=getattr(player, 'username', None) or (user.username or user.first_name),
+                action_type='purchase',
+                action_details=f"rostov_elite_item:{item_key}",
+                amount=-price,
+                success=True
+            )
+        except Exception:
+            pass
+
+    await show_rostov_elite_items(update, context)
+
+
+async def show_selyuk_farmer_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+
+    auto_w = bool(getattr(player, 'farmer_auto_water', True))
+    auto_h = bool(getattr(player, 'farmer_auto_harvest', True))
+    auto_p = bool(getattr(player, 'farmer_auto_plant', True))
+    auto_f = bool(getattr(player, 'farmer_auto_fertilize', True))
+    silent = bool(getattr(player, 'farmer_silent', False))
+    summ_on = bool(getattr(player, 'farmer_summary_enabled', True))
+    interval = int(getattr(player, 'farmer_summary_interval_sec', 3600) or 3600)
+    min_bal = int(getattr(player, 'farmer_min_balance', 0) or 0)
+    dlim = int(getattr(player, 'farmer_daily_limit', 0) or 0)
+
+    mode = str(getattr(player, 'farmer_seed_mode', 'any') or 'any')
+    mode_readable = {'any': 'Любые', 'whitelist': 'Только выбранные', 'blacklist': 'Кроме выбранных'}.get(mode, mode)
+    try:
+        seed_ids = json.loads(getattr(player, 'farmer_seed_ids', '[]') or '[]')
+        seed_cnt = len(seed_ids) if isinstance(seed_ids, list) else 0
+    except Exception:
+        seed_cnt = 0
+    try:
+        prio_ids = json.loads(getattr(player, 'farmer_seed_priority', '[]') or '[]')
+        prio_cnt = len(prio_ids) if isinstance(prio_ids, list) else 0
+    except Exception:
+        prio_cnt = 0
+
+    try:
+        fert_prio = json.loads(getattr(player, 'farmer_fert_priority', '[]') or '[]')
+        fert_prio_cnt = len(fert_prio) if isinstance(fert_prio, list) else 0
+    except Exception:
+        fert_prio_cnt = 0
+
+    text = (
+        "⚙️ <b>Настройки Селюка Фермера</b>\n\n"
+        f"💧 Автополив: {'✅' if auto_w else '🚫'}\n"
+        f"🥕 Автосбор: {'✅' if auto_h else '🚫'}\n"
+        f"🌱 Автопосадка: {'✅' if auto_p else '🚫'}\n"
+        f"🧪 Автоудобрение: {'✅' if auto_f else '🚫'}\n\n"
+        f"🤫 Тихий режим: {'✅' if silent else '🚫'}\n"
+        f"🧾 Сводки: {'✅' if summ_on else '🚫'} (интервал: {int(interval/60)} мин)\n\n"
+        f"🛡️ Не опускать баланс ниже: <b>{min_bal}</b> 💎\n"
+        f"📆 Дневной лимит расходов: <b>{dlim}</b> 💎\n\n"
+        f"🌾 Семена (ур.3): <b>{mode_readable}</b>\n"
+        f"• в списке: <b>{seed_cnt}</b>\n"
+        f"• приоритет: <b>{prio_cnt}</b>\n\n"
+        f"🧪 Удобрения (ур.4): приоритет: <b>{fert_prio_cnt}</b>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(f"💧 Автополив {'✅' if auto_w else '🚫'}", callback_data='selyuk_farmer_set_autow')],
+        [InlineKeyboardButton(f"🥕 Автосбор {'✅' if auto_h else '🚫'}", callback_data='selyuk_farmer_set_autoh')],
+        [InlineKeyboardButton(f"🌱 Автопосадка {'✅' if auto_p else '🚫'}", callback_data='selyuk_farmer_set_autop')],
+        [InlineKeyboardButton(f"🧪 Автоудобрение {'✅' if auto_f else '🚫'}", callback_data='selyuk_farmer_set_autof')],
+        [InlineKeyboardButton(f"🤫 Тихий режим {'✅' if silent else '🚫'}", callback_data='selyuk_farmer_set_silent')],
+        [InlineKeyboardButton(f"🧾 Сводки {'✅' if summ_on else '🚫'}", callback_data='selyuk_farmer_set_summary')],
+        [InlineKeyboardButton("🧾 Сводки (интервал)", callback_data='selyuk_farmer_summary_interval')],
+        [InlineKeyboardButton("🛡️ Минимальный остаток", callback_data='selyuk_farmer_min_balance')],
+        [InlineKeyboardButton("📆 Дневной лимит", callback_data='selyuk_farmer_daily_limit')],
+        [InlineKeyboardButton("🌾 Настройка семян", callback_data='selyuk_farmer_seed_settings')],
+        [InlineKeyboardButton("🧪 Приоритет удобрений", callback_data='selyuk_farmer_fert_prio_0')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_manage')],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def handle_selyuk_farmer_toggle_setting(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    cur = bool(getattr(player, field, False))
+    db.update_player(user.id, **{field: (not cur)})
+    await show_selyuk_farmer_settings(update, context)
+
+
+async def show_selyuk_farmer_min_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    cur = int(getattr(player, 'farmer_min_balance', 0) or 0)
+    text = f"🛡️ <b>Минимальный остаток</b>\n\nТекущее значение: <b>{cur}</b> 💎\n\nВыбери новое значение:"
+    vals = [0, 100, 500, 1000, 5000, 10000]
+    keyboard = [[InlineKeyboardButton(str(v), callback_data=f'selyuk_farmer_set_minbal_{v}') for v in vals[:3]],
+                [InlineKeyboardButton(str(v), callback_data=f'selyuk_farmer_set_minbal_{v}') for v in vals[3:]],
+                [InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_settings')]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_selyuk_farmer_daily_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    cur = int(getattr(player, 'farmer_daily_limit', 0) or 0)
+    text = f"📆 <b>Дневной лимит расходов</b>\n\nТекущее значение: <b>{cur}</b> 💎\n\nВыбери новое значение:"
+    vals = [0, 500, 1000, 5000, 10000, 50000]
+    keyboard = [[InlineKeyboardButton(str(v), callback_data=f'selyuk_farmer_set_dlim_{v}') for v in vals[:3]],
+                [InlineKeyboardButton(str(v), callback_data=f'selyuk_farmer_set_dlim_{v}') for v in vals[3:]],
+                [InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_settings')]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_selyuk_farmer_summary_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    cur = int(getattr(player, 'farmer_summary_interval_sec', 3600) or 3600)
+    text = f"🧾 <b>Интервал сводок</b>\n\nТекущее значение: <b>{int(cur/60)}</b> мин\n\nВыбери новое значение:"
+    vals = [900, 1800, 3600, 7200]
+    keyboard = [
+        [InlineKeyboardButton("15м", callback_data='selyuk_farmer_set_sumint_900'), InlineKeyboardButton("30м", callback_data='selyuk_farmer_set_sumint_1800')],
+        [InlineKeyboardButton("60м", callback_data='selyuk_farmer_set_sumint_3600'), InlineKeyboardButton("120м", callback_data='selyuk_farmer_set_sumint_7200')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_settings')]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_selyuk_farmer_seed_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    mode = str(getattr(player, 'farmer_seed_mode', 'any') or 'any')
+    mode_readable = {'any': 'Любые', 'whitelist': 'Только выбранные', 'blacklist': 'Кроме выбранных'}.get(mode, mode)
+    text = (
+        "🌾 <b>Семена для автопосадки (ур.3)</b>\n\n"
+        f"Режим: <b>{mode_readable}</b>\n"
+        "\nНастрой: список семян и приоритет (что сажать в первую очередь)."
+    )
+    keyboard = [
+        [InlineKeyboardButton("Режим: любые", callback_data='selyuk_farmer_seed_mode_any')],
+        [InlineKeyboardButton("Режим: whitelist", callback_data='selyuk_farmer_seed_mode_whitelist')],
+        [InlineKeyboardButton("Режим: blacklist", callback_data='selyuk_farmer_seed_mode_blacklist')],
+        [InlineKeyboardButton("🧾 Список семян", callback_data='selyuk_farmer_seed_list_0')],
+        [InlineKeyboardButton("⭐ Приоритет", callback_data='selyuk_farmer_seed_prio_0')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_settings')],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+def _farmer_seed_lists_from_player(player: Player) -> tuple[list[int], list[int]]:
+    try:
+        seed_ids = json.loads(getattr(player, 'farmer_seed_ids', '[]') or '[]')
+        seed_ids = [int(x) for x in seed_ids] if isinstance(seed_ids, list) else []
+    except Exception:
+        seed_ids = []
+    try:
+        prio_ids = json.loads(getattr(player, 'farmer_seed_priority', '[]') or '[]')
+        prio_ids = [int(x) for x in prio_ids] if isinstance(prio_ids, list) else []
+    except Exception:
+        prio_ids = []
+    return seed_ids, prio_ids
+
+
+async def show_selyuk_farmer_seed_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    seed_ids, prio_ids = _farmer_seed_lists_from_player(player)
+    mode = str(getattr(player, 'farmer_seed_mode', 'any') or 'any')
+    inv = db.get_seed_inventory(user.id) or []
+    seeds = [(it.seed_type, int(getattr(it, 'quantity', 0) or 0)) for it in inv if getattr(it, 'seed_type', None)]
+    seeds.sort(key=lambda x: x[0].id)
+
+    per_page = 8
+    page = max(0, int(page or 0))
+    start = page * per_page
+    chunk = seeds[start:start+per_page]
+    text = f"🧾 <b>Список семян</b> (режим: {mode})\n\nНажимай на семя, чтобы добавить/убрать из списка."
+    keyboard = []
+    for st, qty in chunk:
+        sid = int(getattr(st, 'id', 0) or 0)
+        name = html.escape(getattr(st, 'name', 'Семена'))
+        in_list = sid in set(seed_ids)
+        mark = '✅' if in_list else '⬜️'
+        keyboard.append([InlineKeyboardButton(f"{mark} {name} (x{qty})", callback_data=f'selyuk_farmer_seed_tgl_{sid}_{page}')])
+
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'selyuk_farmer_seed_list_{page-1}'))
+    if start + per_page < len(seeds):
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'selyuk_farmer_seed_list_{page+1}'))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_seed_settings')])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_selyuk_farmer_seed_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    seed_ids, prio_ids = _farmer_seed_lists_from_player(player)
+    inv = db.get_seed_inventory(user.id) or []
+    seeds = [(it.seed_type, int(getattr(it, 'quantity', 0) or 0)) for it in inv if getattr(it, 'seed_type', None)]
+    seeds.sort(key=lambda x: x[0].id)
+
+    prio_names = []
+    id_to_name = {int(getattr(st, 'id', 0) or 0): html.escape(getattr(st, 'name', 'Семена')) for st, _ in seeds}
+    for sid in prio_ids:
+        if sid in id_to_name:
+            prio_names.append(id_to_name[sid])
+
+    text = "⭐ <b>Приоритет семян</b>\n\n"
+    if prio_names:
+        text += "Текущий приоритет:\n" + "\n".join([f"{i+1}. {n}" for i, n in enumerate(prio_names[:10])])
+    else:
+        text += "Пока пусто. Добавь семена в приоритет ниже." 
+
+    per_page = 6
+    page = max(0, int(page or 0))
+    start = page * per_page
+    chunk = seeds[start:start+per_page]
+    keyboard = []
+    for st, qty in chunk:
+        sid = int(getattr(st, 'id', 0) or 0)
+        name = html.escape(getattr(st, 'name', 'Семена'))
+        in_prio = sid in set(prio_ids)
+        if in_prio:
+            keyboard.append([InlineKeyboardButton(f"🗑️ Убрать: {name}", callback_data=f'selyuk_farmer_prio_rm_{sid}_{page}')])
+        else:
+            keyboard.append([InlineKeyboardButton(f"➕ В приоритет: {name} (x{qty})", callback_data=f'selyuk_farmer_prio_add_{sid}_{page}')])
+
+    nav = []
+    if start > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'selyuk_farmer_seed_prio_{page-1}'))
+    if start + per_page < len(seeds):
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'selyuk_farmer_seed_prio_{page+1}'))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='selyuk_farmer_seed_settings')])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 async def show_power_red_cores(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10745,6 +14148,7 @@ async def show_selyuk_farmer_manage(update: Update, context: ContextTypes.DEFAUL
         enabled = bool(getattr(farmer, 'is_enabled', False))
         status = "✅ Включен" if enabled else "🚫 Выключен"
         coins = int(getattr(player, 'coins', 0) or 0)
+        water_cost = 45 if lvl >= 2 else 50
 
         text = (
             "👨‍🌾 <b>СЕЛЮК ФЕРМЕР</b>\n\n"
@@ -10755,7 +14159,7 @@ async def show_selyuk_farmer_manage(update: Update, context: ContextTypes.DEFAUL
             "Фермер автоматически поливает обычные плантации, когда:\n"
             "• грядка готова к поливу;\n"
             "• включены напоминания о поливе;\n"
-            "• на балансе селюка есть ≥ 50 септимов."
+            f"• на балансе селюка есть ≥ {water_cost} септимов."
         )
 
         toggle_text = "🚫 Выключить" if enabled else "✅ Включить"
@@ -10766,11 +14170,11 @@ async def show_selyuk_farmer_manage(update: Update, context: ContextTypes.DEFAUL
                 InlineKeyboardButton("💰 +10 000", callback_data='selyuk_farmer_topup_10000'),
             ],
             [InlineKeyboardButton("ℹ️ Как работает", callback_data='selyuk_farmer_howto')],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data='selyuk_farmer_settings')],
             [InlineKeyboardButton("⬆️ Улучшить селюка", callback_data='selyuk_farmer_upgrade')],
             [InlineKeyboardButton("💸 Продать селюка", callback_data='selyuk_farmer_sell')],
             [InlineKeyboardButton("🔙 К Вашим селюкам", callback_data='rostov_hub_my_selyuki')],
         ]
-
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
@@ -10870,13 +14274,16 @@ async def show_selyuk_farmer_howto(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
 
     user = query.from_user
+    farmer = db.get_selyuk_by_type(user.id, 'farmer')
+    lvl = int(getattr(farmer, 'level', 1) or 1) if farmer else 1
+    water_cost = 45 if lvl >= 2 else 50
     text = (
         "ℹ️ <b>КАК РАБОТАЕТ СЕЛЮК ФЕРМЕР</b>\n\n"
         "• Работает только с обычными плантациями энергетиков.\n"
         "• Когда грядка готова к поливу, фермер пытается полить её автоматически.\n"
-        "• За каждый полив списывается 50 септимов с баланса селюка.\n"
+        f"• За каждый полив списывается {water_cost} септимов с баланса селюка.\n"
         "• Для работы фермера должны быть включены напоминания о поливе.\n"
-        "• Если на балансе селюка меньше 50 септимов, он не поливает грядку."
+        f"• Если на балансе селюка меньше {water_cost} септимов, он не поливает грядку."
     )
 
     keyboard = [
@@ -10903,15 +14310,32 @@ async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAU
 
     lvl = int(getattr(farmer, 'level', 1) or 1)
     
-    if lvl >= 3:
+    if lvl >= 4:
         text = (
             "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
-            "Ваш селюк уже достиг максимального 3 уровня!\n\n"
+            "Ваш селюк уже достиг максимального 4 уровня!\n\n"
             "✅ Стоимость полива снижена до 45 септимов.\n"
             "✅ Автоматический сбор урожая включен.\n"
-            "✅ Автоматическая посадка семян включена."
+            "✅ Автоматическая посадка семян включена.\n"
+            "✅ Автоматическое удобрение (до 3 слотов на грядку) включено."
         )
         keyboard = [[InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')]]
+    elif lvl == 3:
+        text = (
+            "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
+            "Текущий уровень: 3\n"
+            "Следующий уровень: 4\n\n"
+            "<b>Бонусы 4 уровня:</b>\n"
+            "🧪 <b>Автоудобрение:</b> селюк поддерживает удобрения на грядках (до 3 слотов).\n"
+            "(Выбор удобрений — по приоритету в настройках)\n\n"
+            "<b>Стоимость улучшения:</b>\n"
+            "💰 250 000 септимов\n"
+            "🧩 25 Фрагментов Селюка"
+        )
+        keyboard = [
+            [InlineKeyboardButton("💰 Улучшить (250к + 25 фрагм.)", callback_data='selyuk_farmer_upgrade_action')],
+            [InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')],
+        ]
     elif lvl == 2:
         text = (
             "⬆️ <b>УЛУЧШЕНИЕ СЕЛЮКА ФЕРМЕРА</b>\n\n"
@@ -11313,20 +14737,36 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
-    _ = player.language
+    lang = getattr(player, 'language', 'ru') or 'ru'
 
-    # Собираем прайс-лист (выплата за 1 шт. с учётом комиссии)
+    # Собираем прайс-лист (выплата за 1 шт. с учётом комиссии и рейтинга)
+    rating_value = int(getattr(player, 'rating', 0) or 0)
+    rating_bonus = db.get_rating_bonus_percent(rating_value)
     lines = [
         "<b>♻️ Приёмник</b>",
         "Сдавайте лишние энергетики и получайте монеты.",
         f"Комиссия: {int(RECEIVER_COMMISSION*100)}% (выплата = {100-int(RECEIVER_COMMISSION*100)}% от цены)",
+        f"Бонус рейтинга: +{rating_bonus:.1f}%",
+    ]
+    if lang == 'ru':
+        lines.extend([
+            "💡 <b>Шкала бонусов рейтинга:</b>",
+            "50 → +5%, 100 → +7.5%, 150 → +10%, 200 → +12.5%, 250 → +13%",
+            "Дальше плавно до +25% при рейтинге 1000.",
+        ])
+    else:
+        lines.extend([
+            "💡 <b>Rating bonus scale:</b>",
+            "50 → +5%, 100 → +7.5%, 150 → +10%, 200 → +12.5%, 250 → +13%",
+            "Then increases smoothly to +25% at rating 1000.",
+        ])
+    lines.extend([
         "",
         "<b>Прайс-лист (за 1 шт.)</b>",
-    ]
+    ])
     for r in RARITY_ORDER:
         if r in RECEIVER_PRICES:
-            base = int(RECEIVER_PRICES[r])
-            payout = int(base * (1.0 - float(RECEIVER_COMMISSION)))
+            payout = int(db.get_receiver_unit_payout_with_rating(r, rating_value) or 0)
             emoji = COLOR_EMOJIS.get(r, '⚫')
             lines.append(f"{emoji} {r}: {payout} монет")
     text = "\n".join(lines)
@@ -11334,6 +14774,7 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = [
         [InlineKeyboardButton("📦 Открыть инвентарь", callback_data='inventory')],
         [InlineKeyboardButton("📊 По количеству", callback_data='receiver_by_quantity')],
+        [InlineKeyboardButton("🗑️ Продать все", callback_data='sell_all_confirm_1')],
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
     ]
@@ -12095,7 +15536,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await register_group_if_needed(update)
     except Exception:
         pass
-    db.get_or_create_player(user.id, user.username or user.first_name)
+    db.get_or_create_player(user.id, username=getattr(user, 'username', None), display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)))
     await show_menu(update, context)
 
 
@@ -12111,6 +15552,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
+
+    try:
+        u = query.from_user
+        if u:
+            db.get_or_create_player(u.id, username=getattr(u, 'username', None), display_name=(getattr(u, 'full_name', None) or getattr(u, 'first_name', None)))
+    except Exception:
+        pass
     
     data = query.data
     
@@ -12121,6 +15569,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'menu':
         await show_menu(update, context)
+    elif data == 'promo_enter':
+        await promo_button_start(update, context)
+    elif data == 'promo_cancel':
+        await promo_button_cancel(update, context)
     elif data == 'creator_panel':
         await show_creator_panel(update, context)
     elif data == 'creator_wipe':
@@ -12157,6 +15609,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_player_details(update, context)
     elif data.startswith('admin_player_balance:'):
         await admin_player_balance_start(update, context)
+    elif data.startswith('admin_player_rating:'):
+        await admin_player_rating_start(update, context)
     elif data.startswith('admin_player_vip:'):
         await admin_player_vip_menu(update, context)
     elif data.startswith('admin_player_vip_give:'):
@@ -12233,6 +15687,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_admin_drinks_menu(update, context)
     elif data == 'admin_promo_menu':
         await show_admin_promo_menu(update, context)
+    elif data == 'admin_promo_wizard':
+        await admin_promo_wizard_start(update, context)
     elif data == 'admin_settings_menu':
         await show_admin_settings_menu(update, context)
     elif data == 'admin_settings_cooldowns':
@@ -12241,6 +15697,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_settings_set_search_cd_start(update, context)
     elif data == 'admin_settings_set_bonus_cd':
         await admin_settings_set_bonus_cd_start(update, context)
+    elif data == 'admin_settings_autosearch':
+        await show_admin_settings_autosearch(update, context)
+    elif data == 'admin_settings_set_auto_base':
+        await admin_settings_set_auto_base_start(update, context)
+    elif data == 'admin_settings_set_auto_vip_mult':
+        await admin_settings_set_auto_vip_mult_start(update, context)
+    elif data == 'admin_settings_set_auto_vip_plus_mult':
+        await admin_settings_set_auto_vip_plus_mult_start(update, context)
     elif data == 'admin_moderation_menu':
         await show_admin_moderation_menu(update, context)
     elif data == 'admin_mod_ban':
@@ -12384,6 +15848,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⚙️ Функция в разработке!", show_alert=True)
     elif data == 'admin_promo_create':
         await admin_promo_create_start(update, context)
+    elif data == 'admin_promo_deactivate_pick' or data.startswith('admin_promo_deactivate_pick:'):
+        await admin_promo_deactivate_pick_show(update, context)
     elif data == 'admin_promo_list_active':
         await admin_promo_list_active_show(update, context)
     elif data == 'admin_promo_list_all':
@@ -12392,11 +15858,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_promo_deactivate_start(update, context)
     elif data == 'admin_promo_stats':
         await admin_promo_stats_show(update, context)
+    elif data == 'promo_wiz_cancel':
+        await promo_wiz_cancel(update, context)
+    elif data == 'promo_wiz_confirm':
+        await promo_wiz_confirm(update, context)
+    elif data.startswith('promo_wiz_kind:'):
+        await promo_wiz_kind_select(update, context, data.split(':', 1)[1])
+    elif data.startswith('promo_wiz_rarity:'):
+        await promo_wiz_rarity_select(update, context, data.split(':', 1)[1])
+    elif data.startswith('promo_wiz_active:'):
+        await promo_wiz_active_select(update, context, data.split(':', 1)[1] == '1')
+    elif data.startswith('promo_deact:'):
+        try:
+            pid = int(data.split(':', 1)[1])
+            await admin_promo_deactivate_confirm(update, context, pid)
+        except Exception:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('promo_deact_do:'):
+        try:
+            pid = int(data.split(':', 1)[1])
+            await admin_promo_deactivate_do(update, context, pid)
+        except Exception:
+            await query.answer('Ошибка', show_alert=True)
     
     elif data == 'find_energy':
         await find_energy(update, context)
     elif data == 'claim_bonus':
         await claim_daily_bonus(update, context)
+    elif data == 'daily_bonus_info':
+        await show_daily_bonus_info(update, context)
     elif data == 'inventory':
         await show_inventory(update, context)
     elif data.startswith('inventory_p'):
@@ -12422,6 +15912,211 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('receiver_qty_p'):
         # Пагинация инвентаря по количеству для Приёмника
         await show_inventory_by_quantity(update, context)
+    elif data == 'my_profile':
+        await show_my_profile(update, context)
+    elif data == 'profile_stats':
+        await show_stats(update, context)
+    elif data == 'profile_friends':
+        await show_profile_friends(update, context)
+    elif data == 'profile_favorites':
+        await show_profile_favorites(update, context)
+    elif data.startswith('fav_slot_'):
+        query = update.callback_query
+        try:
+            slot = int(data.split('_')[-1])
+        except Exception:
+            slot = 0
+        if slot not in (1, 2, 3):
+            await query.answer('Ошибка', show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        lock = _get_lock(f"favorites:{user_id}")
+        async with lock:
+            player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+            lang = getattr(player, 'language', 'ru') or 'ru'
+            item_id = int(getattr(player, f'favorite_drink_{slot}', 0) or 0)
+
+            if item_id > 0:
+                res = db.clear_favorite_drink_slot(user_id, slot)
+                if not res or not res.get('ok'):
+                    await query.answer('Ошибка', show_alert=True)
+                    return
+                await query.answer('✅ Удалено' if lang == 'ru' else '✅ Removed')
+                await show_profile_favorites(update, context)
+            else:
+                await show_favorites_pick_inventory(update, context, slot=slot, page=1)
+    elif data.startswith('fav_pick_page_'):
+        query = update.callback_query
+        try:
+            _, _, _, slot_str, page_str = data.split('_', 4)
+            slot = int(slot_str)
+            page = int(page_str)
+        except Exception:
+            await query.answer('Ошибка', show_alert=True)
+            return
+        await show_favorites_pick_inventory(update, context, slot=slot, page=page)
+    elif data.startswith('fav_pick_'):
+        query = update.callback_query
+        try:
+            # fav_pick_{slot}_{item_id}_p{page}
+            parts = data.split('_')
+            slot = int(parts[2])
+            item_id = int(parts[3])
+            page_part = parts[4] if len(parts) > 4 else 'p1'
+            page = int(str(page_part).lstrip('p') or 1)
+        except Exception:
+            await query.answer('Ошибка', show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        lock = _get_lock(f"favorites:{user_id}")
+        async with lock:
+            player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+            lang = getattr(player, 'language', 'ru') or 'ru'
+            res = db.set_favorite_drink_slot(user_id, slot, item_id)
+            if not res or not res.get('ok'):
+                reason = (res or {}).get('reason')
+                if reason == 'forbidden':
+                    msg = '❌ Это не ваш предмет.' if lang == 'ru' else "❌ This isn't your item."
+                elif reason == 'not_found':
+                    msg = '❌ Предмет не найден.' if lang == 'ru' else '❌ Item not found.'
+                else:
+                    msg = '❌ Ошибка.' if lang == 'ru' else '❌ Error.'
+                await query.answer(msg, show_alert=True)
+                await show_favorites_pick_inventory(update, context, slot=slot, page=page)
+                return
+
+            await query.answer('✅ Сохранено' if lang == 'ru' else '✅ Saved')
+            await show_profile_favorites(update, context)
+    elif data == 'friends_add_start':
+        await friends_add_start(update, context)
+    elif data.startswith('friends_add_search:'):
+        # Backward-compat: если в старых сообщениях остались кнопки пагинации
+        q = context.user_data.get('friends_last_search_query') or ''
+        if q:
+            await friends_search_results(update, context, str(q), page=0)
+        else:
+            await friends_add_start(update, context)
+    elif data.startswith('friends_add_pick:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_add_pick(update, context, uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_requests_'):
+        try:
+            page = int(data.split('_')[-1])
+        except Exception:
+            page = 0
+        await friends_requests_menu(update, context, page=page)
+    elif data.startswith('friends_req_open:'):
+        try:
+            rid = int(data.split(':', 1)[1])
+        except Exception:
+            rid = 0
+        if rid:
+            await friends_request_open(update, context, rid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_req_accept:'):
+        try:
+            rid = int(data.split(':', 1)[1])
+        except Exception:
+            rid = 0
+        if rid:
+            await friends_req_accept(update, context, rid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_req_reject:'):
+        try:
+            rid = int(data.split(':', 1)[1])
+        except Exception:
+            rid = 0
+        if rid:
+            await friends_req_reject(update, context, rid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_list_'):
+        try:
+            page = int(data.split('_')[-1])
+        except Exception:
+            page = 0
+        await friends_list_menu(update, context, page=page)
+    elif data.startswith('friends_open:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_open_menu(update, context, uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_give_coins:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_start_transfer(update, context, 'coins', uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_give_fragments:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_start_transfer(update, context, 'fragments', uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_give_rating:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_start_transfer(update, context, 'rating', uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_give_vip7:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if not uid:
+            await query.answer('Ошибка', show_alert=True)
+        else:
+            user = query.from_user
+            p = db.get_or_create_player(user.id, user.username or user.first_name)
+            lang = p.language
+            res = db.gift_vip_7d_to_friend(user.id, uid)
+            if not res or not res.get('ok'):
+                reason = (res or {}).get('reason')
+                if reason == 'sender_not_vip':
+                    msg = "❌ Нужно иметь VIP для подарка." if lang == 'ru' else "❌ You need VIP to gift."
+                elif reason == 'sender_is_vip_plus':
+                    msg = "❌ VIP+ не может дарить VIP." if lang == 'ru' else "❌ VIP+ can't gift VIP."
+                elif reason == 'cooldown':
+                    msg = "❌ Подарок VIP доступен раз в 2 недели." if lang == 'ru' else "❌ VIP gift is available once per 2 weeks."
+                elif reason == 'not_friends':
+                    msg = "❌ Этот игрок не у вас в друзьях." if lang == 'ru' else "❌ Not your friend."
+                else:
+                    msg = "❌ Ошибка. Попробуйте позже." if lang == 'ru' else "❌ Error. Try later."
+                await query.answer(msg, show_alert=True)
+                await friends_open_menu(update, context, uid)
+            else:
+                await query.answer("✅ VIP подарен на 7 дней!" if lang == 'ru' else "✅ VIP gifted for 7 days!", show_alert=True)
+                try:
+                    await context.bot.send_message(chat_id=uid, text="🎁 Вам подарили VIP на 7 дней!" if lang == 'ru' else "🎁 You received VIP for 7 days!")
+                except Exception:
+                    pass
+                await friends_open_menu(update, context, uid)
+    elif data == 'profile_boosts':
+        await show_profile_boosts(update, context)
     elif data == 'stats':
         await show_stats(update, context)
     elif data == 'extra_bonuses':
@@ -12466,6 +16161,155 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_selyuk_buy_farmer(update, context)
     elif data == 'selyuk_farmer_manage':
         await show_selyuk_farmer_manage(update, context)
+    elif data == 'selyuk_farmer_settings':
+        await show_selyuk_farmer_settings(update, context)
+    elif data == 'selyuk_farmer_set_autow':
+        await handle_selyuk_farmer_toggle_setting(update, context, 'farmer_auto_water')
+    elif data == 'selyuk_farmer_set_autoh':
+        await handle_selyuk_farmer_toggle_setting(update, context, 'farmer_auto_harvest')
+    elif data == 'selyuk_farmer_set_autop':
+        await handle_selyuk_farmer_toggle_setting(update, context, 'farmer_auto_plant')
+    elif data == 'selyuk_farmer_set_autof':
+        await handle_selyuk_farmer_toggle_setting(update, context, 'farmer_auto_fertilize')
+    elif data == 'selyuk_farmer_set_silent':
+        await handle_selyuk_farmer_toggle_setting(update, context, 'farmer_silent')
+    elif data == 'selyuk_farmer_set_summary':
+        await handle_selyuk_farmer_toggle_setting(update, context, 'farmer_summary_enabled')
+    elif data == 'selyuk_farmer_summary_interval':
+        await show_selyuk_farmer_summary_interval(update, context)
+    elif data.startswith('selyuk_farmer_set_sumint_'):
+        try:
+            sec = int(data.split('_')[-1])
+        except Exception:
+            sec = 3600
+        db.update_player(query.from_user.id, farmer_summary_interval_sec=max(300, sec))
+        await show_selyuk_farmer_settings(update, context)
+    elif data == 'selyuk_farmer_min_balance':
+        await show_selyuk_farmer_min_balance(update, context)
+    elif data.startswith('selyuk_farmer_set_minbal_'):
+        try:
+            v = int(data.split('_')[-1])
+        except Exception:
+            v = 0
+        db.update_player(query.from_user.id, farmer_min_balance=max(0, v))
+        await show_selyuk_farmer_settings(update, context)
+    elif data == 'selyuk_farmer_daily_limit':
+        await show_selyuk_farmer_daily_limit(update, context)
+    elif data.startswith('selyuk_farmer_set_dlim_'):
+        try:
+            v = int(data.split('_')[-1])
+        except Exception:
+            v = 0
+        db.update_player(query.from_user.id, farmer_daily_limit=max(0, v))
+        await show_selyuk_farmer_settings(update, context)
+    elif data == 'selyuk_farmer_seed_settings':
+        await show_selyuk_farmer_seed_settings(update, context)
+    elif data == 'selyuk_farmer_seed_mode_any':
+        db.update_player(query.from_user.id, farmer_seed_mode='any')
+        await show_selyuk_farmer_seed_settings(update, context)
+    elif data == 'selyuk_farmer_seed_mode_whitelist':
+        db.update_player(query.from_user.id, farmer_seed_mode='whitelist')
+        await show_selyuk_farmer_seed_settings(update, context)
+    elif data == 'selyuk_farmer_seed_mode_blacklist':
+        db.update_player(query.from_user.id, farmer_seed_mode='blacklist')
+        await show_selyuk_farmer_seed_settings(update, context)
+    elif data.startswith('selyuk_farmer_seed_list_'):
+        try:
+            page = int(data.split('_')[-1])
+        except Exception:
+            page = 0
+        await show_selyuk_farmer_seed_list(update, context, page)
+    elif data.startswith('selyuk_farmer_seed_prio_'):
+        try:
+            page = int(data.split('_')[-1])
+        except Exception:
+            page = 0
+        await show_selyuk_farmer_seed_priority(update, context, page)
+    elif data.startswith('selyuk_farmer_seed_tgl_'):
+        # selyuk_farmer_seed_tgl_{seed_id}_{page}
+        parts = data.split('_')
+        try:
+            seed_id = int(parts[-2])
+            page = int(parts[-1])
+        except Exception:
+            seed_id = 0
+            page = 0
+        player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
+        seed_ids, prio_ids = _farmer_seed_lists_from_player(player)
+        if seed_id > 0:
+            if seed_id in set(seed_ids):
+                seed_ids = [x for x in seed_ids if x != seed_id]
+                prio_ids = [x for x in prio_ids if x != seed_id]
+            else:
+                seed_ids.append(seed_id)
+        db.update_player(query.from_user.id, farmer_seed_ids=json.dumps(seed_ids), farmer_seed_priority=json.dumps(prio_ids))
+        await show_selyuk_farmer_seed_list(update, context, page)
+    elif data.startswith('selyuk_farmer_prio_add_'):
+        # selyuk_farmer_prio_add_{seed_id}_{page}
+        parts = data.split('_')
+        try:
+            seed_id = int(parts[-2])
+            page = int(parts[-1])
+        except Exception:
+            seed_id = 0
+            page = 0
+        player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
+        seed_ids, prio_ids = _farmer_seed_lists_from_player(player)
+        if seed_id > 0 and seed_id not in set(prio_ids):
+            prio_ids.append(seed_id)
+        if seed_id > 0 and seed_id not in set(seed_ids):
+            seed_ids.append(seed_id)
+        db.update_player(query.from_user.id, farmer_seed_ids=json.dumps(seed_ids), farmer_seed_priority=json.dumps(prio_ids))
+        await show_selyuk_farmer_seed_priority(update, context, page)
+    elif data.startswith('selyuk_farmer_prio_rm_'):
+        # selyuk_farmer_prio_rm_{seed_id}_{page}
+        parts = data.split('_')
+        try:
+            seed_id = int(parts[-2])
+            page = int(parts[-1])
+        except Exception:
+            seed_id = 0
+            page = 0
+        player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
+        seed_ids, prio_ids = _farmer_seed_lists_from_player(player)
+        if seed_id > 0:
+            prio_ids = [x for x in prio_ids if x != seed_id]
+        db.update_player(query.from_user.id, farmer_seed_priority=json.dumps(prio_ids))
+        await show_selyuk_farmer_seed_priority(update, context, page)
+    elif data.startswith('selyuk_farmer_fert_prio_add_'):
+        parts = data.split('_')
+        try:
+            fert_id = int(parts[-2])
+            page = int(parts[-1])
+        except Exception:
+            fert_id = 0
+            page = 0
+        player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
+        prio_ids = _farmer_fert_priority_from_player(player)
+        if fert_id > 0 and fert_id not in set(prio_ids):
+            prio_ids.append(fert_id)
+        db.update_player(query.from_user.id, farmer_fert_priority=json.dumps(prio_ids))
+        await show_selyuk_farmer_fert_priority(update, context, page)
+    elif data.startswith('selyuk_farmer_fert_prio_rm_'):
+        parts = data.split('_')
+        try:
+            fert_id = int(parts[-2])
+            page = int(parts[-1])
+        except Exception:
+            fert_id = 0
+            page = 0
+        player = db.get_or_create_player(query.from_user.id, query.from_user.username or query.from_user.first_name)
+        prio_ids = _farmer_fert_priority_from_player(player)
+        if fert_id > 0:
+            prio_ids = [x for x in prio_ids if x != fert_id]
+        db.update_player(query.from_user.id, farmer_fert_priority=json.dumps(prio_ids))
+        await show_selyuk_farmer_fert_priority(update, context, page)
+    elif data.startswith('selyuk_farmer_fert_prio_'):
+        try:
+            page = int(data.split('_')[-1])
+        except Exception:
+            page = 0
+        await show_selyuk_farmer_fert_priority(update, context, page)
     elif data == 'selyuk_farmer_toggle':
         await handle_selyuk_farmer_toggle(update, context)
     elif data == 'selyuk_farmer_howto':
@@ -12482,8 +16326,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'rostov_elite_shop':
         await show_rostov_elite_shop(update, context)
+    elif data == 'rostov_elite_items':
+        await show_rostov_elite_items(update, context)
+    elif data.startswith('rostov_elite_buy_'):
+        key = data.replace('rostov_elite_buy_', '', 1)
+        await handle_rostov_elite_buy(update, context, key)
     elif data in [
-        'rostov_elite_items',
         'rostov_elite_boosters',
         'rostov_elite_themes',
         'rostov_elite_titles',
@@ -12579,6 +16427,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_plantation_water(update, context)
     elif data == 'plantation_stats':
         await show_plantation_stats(update, context)
+    elif data == 'plantation_bed_prices':
+        await show_plantation_bed_prices(update, context)
     elif data == 'plantation_buy_bed':
         await handle_plantation_buy_bed(update, context)
     elif data == 'plantation_join_project':
@@ -12842,6 +16692,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     elif data == 'my_receipts':
         await my_receipts_handler(update, context)
+    elif data == 'sell_all_confirm_1':
+        await receiver_sell_all_confirm_1(update, context)
+    elif data == 'sell_all_confirm_2':
+        await receiver_sell_all_confirm_2(update, context)
+    elif data == 'sell_all_execute':
+        await handle_sell_all_inventory(update, context)
     elif data.startswith('sellall_'):
         try:
             item_id = int(data.split('_')[1])
@@ -12997,10 +16853,14 @@ async def editdrink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Этой командой можно пользоваться только в личных сообщениях боту.")
         return
     args = context.args or []
-    if len(args) < 3 or not args[0].isdigit():
+    if len(args) < 3:
         await update.message.reply_text("Использование: /editdrink <drink_id> <name|description> <new_value>")
         return
-    drink_id = int(args[0])
+    m = re.search(r"\d+", str(args[0]))
+    if not m:
+        await update.message.reply_text("Использование: /editdrink <drink_id> <name|description> <new_value>")
+        return
+    drink_id = int(m.group(0))
     field = args[1].lower().strip()
     if field in ('название', 'имя'):
         field = 'name'
@@ -13212,11 +17072,16 @@ async def delrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if chat.type != 'private':
         await update.message.reply_text("Этой командой можно пользоваться только в личных сообщениях боту.")
         return
-    if not context.args or not context.args[0].isdigit():
+    args = context.args or []
+    if not args:
         await update.message.reply_text("Использование: /delrequest <drink_id> [причина]")
         return
-    drink_id = int(context.args[0])
-    reason = " ".join(context.args[1:]).strip() if len(context.args) > 1 else None
+    m = re.search(r"\d+", str(args[0]))
+    if not m:
+        await update.message.reply_text("Использование: /delrequest <drink_id> [причина]")
+        return
+    drink_id = int(m.group(0))
+    reason = " ".join(args[1:]).strip() if len(args) > 1 else None
     drink = db.get_drink_by_id(drink_id)
     if not drink:
         await update.message.reply_text("Напиток с таким ID не найден.")
@@ -13235,10 +17100,14 @@ async def inceditdrink_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Нет прав: только Создатель может использовать эту команду.")
         return
     args = context.args or []
-    if len(args) < 3 or not args[0].isdigit():
+    if len(args) < 3:
         await update.message.reply_text("Использование: /inceditdrink <drink_id> <name|description> <new_value>")
         return
-    drink_id = int(args[0])
+    m = re.search(r"\d+", str(args[0]))
+    if not m:
+        await update.message.reply_text("Использование: /inceditdrink <drink_id> <name|description> <new_value>")
+        return
+    drink_id = int(m.group(0))
     field = args[1].lower().strip()
     if field in ('название', 'имя'):
         field = 'name'
@@ -13271,11 +17140,16 @@ async def incdelrequest_command(update: Update, context: ContextTypes.DEFAULT_TY
     if user.username not in ADMIN_USERNAMES:
         await update.message.reply_text("Нет прав: только Создатель может использовать эту команду.")
         return
-    if not context.args or not context.args[0].isdigit():
+    args = context.args or []
+    if not args:
         await update.message.reply_text("Использование: /incdelrequest <drink_id> [причина]")
         return
-    drink_id = int(context.args[0])
-    reason = " ".join(context.args[1:]).strip() if len(context.args) > 1 else None
+    m = re.search(r"\d+", str(args[0]))
+    if not m:
+        await update.message.reply_text("Использование: /incdelrequest <drink_id> [причина]")
+        return
+    drink_id = int(m.group(0))
+    reason = " ".join(args[1:]).strip() if len(args) > 1 else None
     drink = db.get_drink_by_id(drink_id)
     if not drink:
         await update.message.reply_text("Напиток с таким ID не найден.")
@@ -13408,6 +17282,11 @@ async def handle_reject_reason_reply(update: Update, context: ContextTypes.DEFAU
     data = REJECT_PROMPTS.get(key)
     if not data:
         return
+    try:
+        skip_ids = context.chat_data.setdefault('_skip_text_message_ids', set())
+        skip_ids.add(int(msg.message_id))
+    except Exception:
+        pass
     # Разрешаем отвечать только модератору, который нажал "Отклонить"
     if msg.from_user and data.get('reviewer_id') and msg.from_user.id != data['reviewer_id']:
         try:
@@ -14362,22 +18241,24 @@ async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сумма должна быть положительным целым числом.")
         return
 
-    # Разрешение username -> ID, если нужно
-    if target_id is None and target_username:
-        try:
-            chat_obj = await context.bot.get_chat(f"@{target_username}")
-            if getattr(chat_obj, 'id', None):
-                target_id = chat_obj.id
-        except Exception:
-            pass
-        if target_id is None:
-            player = db.get_player_by_username(target_username)
-            if player:
-                target_id = int(player.user_id)
-
+    # Разрешение пользователя через единый поиск
     if target_id is None:
-        await update.message.reply_text("Не удалось определить пользователя по указанному идентификатору/username.")
-        return
+        ident = f"@{target_username}" if target_username else None
+        res = db.find_player_by_identifier(ident)
+        if res.get('reason') == 'multiple':
+            lines = ["Найдено несколько пользователей, уточните запрос:"]
+            for c in (res.get('candidates') or []):
+                cu = c.get('username')
+                lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+            await update.message.reply_text("\n".join(lines))
+            return
+        if res.get('ok') and res.get('player'):
+            target_id = int(res['player'].user_id)
+            if not target_username:
+                target_username = getattr(res['player'], 'username', None)
+        else:
+            await update.message.reply_text("Не удалось определить пользователя по указанному идентификатору/username.")
+            return
 
     new_balance = db.increment_coins(target_id, amount)
     if new_balance is None:
@@ -14460,22 +18341,24 @@ async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сумма должна быть положительным целым числом.")
         return
 
-    # Разрешение username -> ID, если нужно
-    if target_id is None and target_username:
-        try:
-            chat_obj = await context.bot.get_chat(f"@{target_username}")
-            if getattr(chat_obj, 'id', None):
-                target_id = chat_obj.id
-        except Exception:
-            pass
-        if target_id is None:
-            player = db.get_player_by_username(target_username)
-            if player:
-                target_id = int(player.user_id)
-
+    # Разрешение пользователя через единый поиск
     if target_id is None:
-        await update.message.reply_text("Не удалось определить пользователя по указанному идентификатору/username.")
-        return
+        ident = f"@{target_username}" if target_username else None
+        res = db.find_player_by_identifier(ident)
+        if res.get('reason') == 'multiple':
+            lines = ["Найдено несколько пользователей, уточните запрос:"]
+            for c in (res.get('candidates') or []):
+                cu = c.get('username')
+                lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+            await update.message.reply_text("\n".join(lines))
+            return
+        if res.get('ok') and res.get('player'):
+            target_id = int(res['player'].user_id)
+            if not target_username:
+                target_username = getattr(res['player'], 'username', None)
+        else:
+            await update.message.reply_text("Не удалось определить пользователя по указанному идентификатору/username.")
+            return
 
     result = db.decrement_coins(target_id, amount)
     if not result.get('ok'):
@@ -14589,13 +18472,30 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(t(lang, 'btn_reset'), callback_data='settings_reset')],
         [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='menu')]
     ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        return
+
     try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest as e:
         if 'not modified' in str(e).lower():
-            await query.answer()
+            try:
+                await query.answer()
+            except Exception:
+                pass
         else:
-            raise
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+            except Exception:
+                pass
 
 async def settings_lang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -15063,7 +18963,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     medals = {0: '🥇', 1: '🥈', 2: '🥉'}
     
-    for i, (user_id, username, total_drinks, vip_until, vip_plus_until) in enumerate(leaderboard_data):
+    for i, (user_id, username, total_drinks, vip_until, vip_plus_until, rating) in enumerate(leaderboard_data):
         place = i + 1
         medal = medals.get(i, f" {place}.")
         display_name = await _format_display_name(context, update, user_id, username)
@@ -15080,7 +18980,8 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             vip_badge = ""
             
-        text += f"{medal} {display_name}{vip_badge} - <b>{total_drinks} шт.</b>\n"
+        rating_value = int(rating or 0)
+        text += f"{medal} {display_name}{vip_badge} - <b>{total_drinks} шт.</b> | ⭐ {rating_value}\n"
 
     await update.message.reply_html(text)
 
@@ -15129,31 +19030,70 @@ async def show_money_leaderboard(update: Update, context: ContextTypes.DEFAULT_T
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет справочное сообщение."""
     user = update.effective_user
+    player = None
+    try:
+        player = db.get_or_create_player(user.id, getattr(user, 'username', None) or getattr(user, 'first_name', None))
+    except Exception:
+        player = None
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    rating_value = int(getattr(player, 'rating', 0) or 0) if player else 0
     # Динамические кулдауны
     search_minutes = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN) // 60
     bonus_hours = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN) // 3600
-    text = (
-        f"👋 Привет, {user.mention_html()}!\n\n"
-        "Я бот для коллекционирования энергетиков. Вот что доступно:\n\n"
-        "<b>Главное меню:</b>\n"
-        f"• 🔎 <b>Найти энергетик</b> — раз в {search_minutes} мин. можно испытать удачу и найти случайный энергетик.\n"
-        f"• 🎁 <b>Ежедневный бонус</b> — раз в {bonus_hours} ч. гарантированный энергетик.\n"
-        "• 📦 <b>Инвентарь</b> — все ваши найденные напитки (есть пагинация).\n"
-        "• 🏙️ <b>Города</b> — выбор города (ХайТаун: Магазин, Приёмник, Плантация).\n"
-        "• 📊 <b>Статистика</b> — личные показатели.\n"
-        "• ⚙️ <b>Настройки</b> — выбор языка и сброс прогресса.\n\n"
-        "<b>Команды:</b>\n"
-        "/start — показать главное меню.\n"
-        "/leaderboard — таблица лидеров по энергетикам.\n"
-        "/moneyleaderboard — таблица лидеров по деньгам.\n"
-        "/find — быстро найти энергетик (работает и в группах).\n"
-        "/myreceipts — ваши последние чеки TG Premium.\n"
-        "/myboosts — ваша история автопоиск бустов.\n"
-        "/help — это сообщение.\n\n"
-        "<b>Подсказки:</b>\n"
-        "• Можно просто написать в чат \"<b>Найти энергетик</b>\", \"<b>Найди энергетик</b>\" или \"<b>Получить энергетик</b>\" — я всё пойму.\n"
-        "• В группах можно дарить напитки друзьям: /gift @username (бот пришлёт выбор в личку)."
-    )
+    if lang == 'en':
+        text = (
+            f"👋 Hi, {user.mention_html()}!\n\n"
+            "I am a bot for collecting energy drinks. Here is what you can do:\n\n"
+            "<b>Main menu:</b>\n"
+            f"• 🔎 <b>Find energy</b> — once per {search_minutes} min you can try your luck and find a random drink.\n"
+            f"• 🎁 <b>Daily bonus</b> — once per {bonus_hours} h.\n"
+            "• 📦 <b>Inventory</b> — all your found drinks (with pages).\n"
+            "• 🏙️ <b>Cities</b> — choose a city (HighTown: Shop, Receiver, Plantation).\n"
+            "• 👤 <b>My profile</b> — your stats, boosts and promo codes.\n"
+            "• ⚙️ <b>Settings</b> — language and reset progress.\n\n"
+            "<b>Rating system:</b>\n"
+            "• 🌱 Plantation harvest: <b>+3 rating</b> per harvest.\n"
+            "• 🧵 Silk plantation harvest: <b>+3 rating</b> per harvest.\n"
+            f"• Current rating bonus: search up to <b>+10%</b> (now <b>+{_rating_bonus_percent(rating_value, 0.10) * 100:.2f}%</b>), daily up to <b>+5%</b> (now <b>+{_rating_bonus_percent(rating_value, 0.05) * 100:.2f}%</b>).\n\n"
+            "<b>Commands:</b>\n"
+            "/start — open main menu.\n"
+            "/leaderboard — leaderboard by drinks.\n"
+            "/moneyleaderboard — leaderboard by coins.\n"
+            "/find — quick find (works in groups too).\n"
+            "/myreceipts — your TG Premium receipts.\n"
+            "/myboosts — your auto-search boosts history.\n"
+            "/help — this message.\n\n"
+            "<b>Tips:</b>\n"
+            "• You can just type: \"<b>Find energy</b>\" — I will understand.\n"
+            "• In groups you can gift drinks: /gift @username (bot will send the menu in DM)."
+        )
+    else:
+        text = (
+            f"👋 Привет, {user.mention_html()}!\n\n"
+            "Я бот для коллекционирования энергетиков. Вот что доступно:\n\n"
+            "<b>Главное меню:</b>\n"
+            f"• 🔎 <b>Найти энергетик</b> — раз в {search_minutes} мин. можно испытать удачу и найти случайный энергетик.\n"
+            f"• 🎁 <b>Ежедневный бонус</b> — раз в {bonus_hours} ч.\n"
+            "• 📦 <b>Инвентарь</b> — все ваши найденные напитки (есть пагинация).\n"
+            "• 🏙️ <b>Города</b> — выбор города (ХайТаун: Магазин, Приёмник, Плантация).\n"
+            "• 👤 <b>Мой профиль</b> — ваш профиль, статистика, бусты и промокоды.\n"
+            "• ⚙️ <b>Настройки</b> — выбор языка и сброс прогресса.\n\n"
+            "<b>Система рейтинга:</b>\n"
+            "• 🌱 Сбор урожая плантации: <b>+3 рейтинга</b> за каждый сбор.\n"
+            "• 🧵 Сбор урожая шёлковой плантации: <b>+3 рейтинга</b> за каждый сбор.\n"
+            f"• Бонус рейтинга к шансам: поиск до <b>+10%</b> (сейчас <b>+{_rating_bonus_percent(rating_value, 0.10) * 100:.2f}%</b>), daily до <b>+5%</b> (сейчас <b>+{_rating_bonus_percent(rating_value, 0.05) * 100:.2f}%</b>).\n\n"
+            "<b>Команды:</b>\n"
+            "/start — показать главное меню.\n"
+            "/leaderboard — таблица лидеров по энергетикам.\n"
+            "/moneyleaderboard — таблица лидеров по деньгам.\n"
+            "/find — быстро найти энергетик (работает и в группах).\n"
+            "/myreceipts — ваши последние чеки TG Premium.\n"
+            "/myboosts — ваша история автопоиск бустов.\n"
+            "/help — это сообщение.\n\n"
+            "<b>Подсказки:</b>\n"
+            "• Можно просто написать в чат \"<b>Найти энергетик</b>\", \"<b>Найди энергетик</b>\" или \"<b>Получить энергетик</b>\" — я всё пойму.\n"
+            "• В группах можно дарить напитки друзьям: /gift @username (бот пришлёт выбор в личку)."
+        )
     await update.message.reply_html(text, disable_web_page_preview=True)
 
 
@@ -15164,6 +19104,37 @@ async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data['awaiting_promo_code'] = True
     await update.message.reply_text("Введите промокод:")
+
+
+async def promo_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    chat = update.effective_chat
+    if not chat or getattr(chat, 'type', None) != 'private':
+        await query.answer("Только в личных сообщениях бота", show_alert=True)
+        return
+    context.user_data['awaiting_promo_code'] = True
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_cancel')],
+    ])
+    try:
+        await query.message.edit_text("Введите промокод:", reply_markup=kb)
+    except BadRequest:
+        try:
+            await query.message.reply_text("Введите промокод:", reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def promo_button_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    context.user_data.pop('awaiting_promo_code', None)
+    await show_menu(update, context)
 
 async def myboosts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/myboosts — показать историю бустов пользователя."""
@@ -15220,6 +19191,23 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.effective_message
     if not msg or not getattr(msg, 'text', None):
         return
+
+    try:
+        u = update.effective_user
+        if u:
+            db.get_or_create_player(u.id, username=getattr(u, 'username', None), display_name=(getattr(u, 'full_name', None) or getattr(u, 'first_name', None)))
+    except Exception:
+        pass
+    try:
+        skip_ids = context.chat_data.get('_skip_text_message_ids')
+        if skip_ids and int(getattr(msg, 'message_id', 0) or 0) in skip_ids:
+            try:
+                skip_ids.remove(int(msg.message_id))
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
     incoming = msg.text or ""
     
     # Проверяем, ждём ли мы ввод для админ панели Создателя
@@ -15255,8 +19243,38 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await msg.reply_text("Некорректный приз в промокоде.")
             elif reason == 'unsupported_kind':
                 await msg.reply_text("Неподдерживаемый тип промокода.")
+            elif reason == 'exception':
+                logger.error("[PROMO] Ошибка активации промокода (см. traceback в database.py)")
+                await msg.reply_text("Ошибка при активации промокода. Попробуйте позже.")
             else:
-                await msg.reply_text("Промокод не найден или не активен.")
+                # Диагностика: проверим, есть ли промокод в базе после нормализации ввода
+                try:
+                    visible = db.find_promos_by_code_debug(code)
+                    items = (visible or {}).get('items') or []
+                    code_norm = (visible or {}).get('code_norm') or ''
+                    if items:
+                        p = items[0]
+                        active = bool(p.get('active'))
+                        exp = p.get('expires_at')
+                        exp_str = safe_format_timestamp(exp) if exp else '—'
+                        if not active:
+                            await msg.reply_html(
+                                "Промокод найден, но он не активен.\n"
+                                f"Код в базе: <code>{html.escape(str(p.get('code')))}</code>\n"
+                                f"Срок: <b>{html.escape(exp_str)}</b>"
+                            )
+                        else:
+                            # Активен, но redeem_promo не применил — чаще всего это несовпадение кода/символов
+                            await msg.reply_html(
+                                "Промокод с таким вводом не применился.\n"
+                                f"Нормализованный ввод: <code>{html.escape(str(code_norm))}</code>\n"
+                                f"Код в базе: <code>{html.escape(str(p.get('code')))}</code>\n"
+                                "Попробуйте скопировать код из списка промокодов и вставить без пробелов."
+                            )
+                    else:
+                        await msg.reply_text("Промокод не найден или не активен.")
+                except Exception:
+                    await msg.reply_text("Промокод не найден или не активен.")
             return
         kind = res.get('kind')
         if kind == 'coins':
@@ -15326,6 +19344,122 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await show_inventory_search_results(update, context, search_query, page=1)
         return
 
+    # === ДРУЗЬЯ: ввод ника для поиска ===
+    if context.user_data.get('awaiting_friend_username_search'):
+        context.user_data.pop('awaiting_friend_username_search', None)
+        chat = update.effective_chat
+        if not chat or getattr(chat, 'type', None) != 'private':
+            await msg.reply_text("Добавление друзей доступно только в личных сообщениях бота.")
+            return
+        search_query = incoming.strip()
+        if not search_query:
+            await msg.reply_text("❌ Пустой запрос. Попробуйте снова.")
+            return
+        try:
+            context.user_data['friends_last_search_query'] = search_query.lstrip('@').strip()
+        except Exception:
+            pass
+        await friends_search_results(update, context, search_query.lstrip('@').strip(), page=0)
+        return
+
+    # === ДРУЗЬЯ: ввод суммы для перевода ===
+    transfer_state = context.user_data.get('awaiting_friend_transfer')
+    if transfer_state and isinstance(transfer_state, dict):
+        chat = update.effective_chat
+        if not chat or getattr(chat, 'type', None) != 'private':
+            await msg.reply_text("Передачи друзьям доступны только в личных сообщениях бота.")
+            return
+        kind = str(transfer_state.get('kind') or '')
+        to_uid = int(transfer_state.get('to_user_id') or 0)
+        try:
+            amount = int(incoming.strip())
+        except Exception:
+            amount = 0
+        if amount <= 0:
+            await msg.reply_text("❌ Нужно число больше 0.")
+            return
+
+        user = update.effective_user
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        lang = player.language
+
+        if kind == 'coins':
+            res = db.transfer_coins_to_friend(user.id, to_uid, amount)
+            if not res or not res.get('ok'):
+                reason = (res or {}).get('reason')
+                if reason == 'limit_reached':
+                    rem = int((res or {}).get('remaining') or 0)
+                    await msg.reply_text(f"❌ Достигнут лимит. Осталось на сегодня: {rem}.")
+                elif reason == 'not_enough_coins':
+                    have = int((res or {}).get('have') or 0)
+                    await msg.reply_text(f"❌ Недостаточно монет. У вас: {have}.")
+                elif reason == 'not_friends':
+                    await msg.reply_text("❌ Этот игрок не у вас в друзьях.")
+                else:
+                    await msg.reply_text("❌ Ошибка перевода. Попробуйте позже.")
+                return
+            context.user_data.pop('awaiting_friend_transfer', None)
+            try:
+                await context.bot.send_message(chat_id=to_uid, text=f"💰 Вам перевели {amount} монет!" if lang == 'ru' else f"💰 You received {amount} coins!")
+            except Exception:
+                pass
+            await msg.reply_text("✅ Перевод выполнен." if lang == 'ru' else "✅ Transfer complete.")
+            await friends_open_menu(update, context, to_uid)
+            return
+
+        if kind == 'fragments':
+            res = db.transfer_fragments_to_friend(user.id, to_uid, amount)
+            if not res or not res.get('ok'):
+                reason = (res or {}).get('reason')
+                if reason == 'limit_reached':
+                    rem = int((res or {}).get('remaining') or 0)
+                    await msg.reply_text(f"❌ Достигнут лимит. Осталось на сегодня: {rem}.")
+                elif reason == 'not_enough_fragments':
+                    have = int((res or {}).get('have') or 0)
+                    await msg.reply_text(f"❌ Недостаточно фрагментов. У вас: {have}.")
+                elif reason == 'not_friends':
+                    await msg.reply_text("❌ Этот игрок не у вас в друзьях.")
+                else:
+                    await msg.reply_text("❌ Ошибка перевода. Попробуйте позже.")
+                return
+            context.user_data.pop('awaiting_friend_transfer', None)
+            try:
+                await context.bot.send_message(chat_id=to_uid, text=f"🧩 Вам перевели {amount} фрагментов!" if lang == 'ru' else f"🧩 You received {amount} fragments!")
+            except Exception:
+                pass
+            await msg.reply_text("✅ Перевод выполнен." if lang == 'ru' else "✅ Transfer complete.")
+            await friends_open_menu(update, context, to_uid)
+            return
+
+        if kind == 'rating':
+            res = db.transfer_rating_to_friend(user.id, to_uid, amount)
+            if not res or not res.get('ok'):
+                reason = (res or {}).get('reason')
+                if reason == 'limit_reached':
+                    rem = int((res or {}).get('remaining') or 0)
+                    await msg.reply_text(f"❌ Достигнут лимит. Осталось на 48ч: {rem}.")
+                elif reason == 'not_enough_rating':
+                    have = int((res or {}).get('have') or 0)
+                    await msg.reply_text(f"❌ Недостаточно рейтинга. У вас: {have}.")
+                elif reason == 'receiver_max_rating':
+                    await msg.reply_text("❌ У получателя достигнут максимум рейтинга.")
+                elif reason == 'not_friends':
+                    await msg.reply_text("❌ Этот игрок не у вас в друзьях.")
+                else:
+                    await msg.reply_text("❌ Ошибка перевода. Попробуйте позже.")
+                return
+            context.user_data.pop('awaiting_friend_transfer', None)
+            try:
+                await context.bot.send_message(chat_id=to_uid, text=f"🏆 Вам перевели {amount} рейтинга!" if lang == 'ru' else f"🏆 You received {amount} rating!")
+            except Exception:
+                pass
+            await msg.reply_text("✅ Перевод выполнен." if lang == 'ru' else "✅ Transfer complete.")
+            await friends_open_menu(update, context, to_uid)
+            return
+
+        await msg.reply_text("❌ Неизвестный тип передачи.")
+        return
+
     chat = update.effective_chat
     if chat and getattr(chat, 'type', None) == 'private':
         norm_simple = "".join(ch for ch in incoming.lower() if ch.isalnum() or ch.isspace()).strip()
@@ -15384,9 +19518,35 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
         if result["status"] == 'ok':
-            if result["image_path"] and os.path.exists(result["image_path"]):
-                with open(result["image_path"], 'rb') as photo:
-                    await msg.reply_photo(
+            img_paths = result.get("image_paths") or []
+            existing = [p for p in img_paths if p and os.path.exists(p)]
+            found_count = int(result.get('found_count', 1) or 1)
+            if found_count >= 2 and len(existing) >= 2:
+                f1 = None
+                f2 = None
+                try:
+                    f1 = open(existing[0], 'rb')
+                    f2 = open(existing[1], 'rb')
+                    media = [
+                        InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
+                        InputMediaPhoto(media=f2),
+                    ]
+                    await _send_media_group_long(context.bot.send_media_group, chat_id=msg.chat_id, media=media)
+                finally:
+                    try:
+                        if f1:
+                            f1.close()
+                    except Exception:
+                        pass
+                    try:
+                        if f2:
+                            f2.close()
+                    except Exception:
+                        pass
+            elif existing:
+                with open(existing[0], 'rb') as photo:
+                    await _send_photo_long(
+                        msg.reply_photo,
                         photo=photo,
                         caption=result["caption"],
                         reply_markup=result["reply_markup"],
@@ -15484,19 +19644,50 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if result["status"] == 'ok':
-        if result["image_path"] and os.path.exists(result["image_path"]):
-            with open(result["image_path"], 'rb') as photo:
-                sent_msg = await msg.reply_photo(
+        img_paths = result.get("image_paths") or []
+        existing = [p for p in img_paths if p and os.path.exists(p)]
+        found_count = int(result.get('found_count', 1) or 1)
+        if found_count >= 2 and len(existing) >= 2:
+            f1 = None
+            f2 = None
+            try:
+                f1 = open(existing[0], 'rb')
+                f2 = open(existing[1], 'rb')
+                media = [
+                    InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
+                    InputMediaPhoto(media=f2),
+                ]
+                sent_messages = await _send_media_group_long(context.bot.send_media_group, chat_id=chat.id, media=media)
+                for sm in sent_messages or []:
+                    try:
+                        await schedule_auto_delete_message(context, chat.id, sm.message_id)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    if f1:
+                        f1.close()
+                except Exception:
+                    pass
+                try:
+                    if f2:
+                        f2.close()
+                except Exception:
+                    pass
+        elif existing:
+            with open(existing[0], 'rb') as photo:
+                sent_msg = await _send_photo_long(
+                    msg.reply_photo,
                     photo=photo,
                     caption=result["caption"],
                     reply_markup=result["reply_markup"],
                     parse_mode='HTML'
                 )
-                # Планируем автоудаление для фото-сообщения
-                try:
-                    await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
-                except Exception:
-                    pass
+            # Планируем автоудаление для фото-сообщения
+            try:
+                await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
+            except Exception:
+                pass
         else:
             sent_msg = await msg.reply_html(
                 text=result["caption"],
@@ -15550,7 +19741,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if image_full_path and os.path.exists(image_full_path):
         try:
             with open(image_full_path, 'rb') as photo:
-                await msg.reply_photo(photo=photo, caption=caption, reply_markup=keyboard, parse_mode='HTML')
+                await _send_photo_long(msg.reply_photo, photo=photo, caption=caption, reply_markup=keyboard, parse_mode='HTML')
         except Exception:
             # На случай проблем с файлом — отправим без фото
             await msg.reply_html(text=caption, reply_markup=keyboard)
@@ -15562,6 +19753,24 @@ def get_rarity_emoji(rarity: str) -> str:
     """Возвращает эмодзи для редкости напитка из constants.COLOR_EMOJIS."""
     from constants import COLOR_EMOJIS
     return COLOR_EMOJIS.get(rarity, '⭐')
+
+
+def _load_rarity_emoji_overrides_into_constants() -> None:
+    try:
+        rows = db.list_rarity_emoji_overrides()
+    except Exception:
+        rows = []
+    if not rows:
+        return
+    try:
+        for rarity, emoji in rows:
+            try:
+                if rarity and emoji:
+                    COLOR_EMOJIS[str(rarity)] = str(emoji)
+            except Exception:
+                pass
+    except Exception:
+        return
 
 
 async def send_gift_selection_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int = 1, search_query: str = None, message_id: int = None):
@@ -16111,6 +20320,7 @@ async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYP
 def main():
     """Запускает бота."""
     db.ensure_schema()
+    _load_rarity_emoji_overrides_into_constants()
     # Инициализируем дефолтные типы семян для плантации (идемпотентно)
     try:
         db.ensure_default_seed_types()
@@ -16128,6 +20338,7 @@ def main():
             logger.info(f"[PLANTATION] Updated duration for {updated} fertilizers")
     except Exception as e:
         logger.warning(f"[PLANTATION] Failed to update fertilizers duration: {e}")
+ 
     log_existing_drinks()
     try:
         removed = db.unban_protected_users()
@@ -16135,16 +20346,17 @@ def main():
             logger.info(f"[BOOT] Removed bans from protected users: {removed}")
     except Exception as e:
         logger.warning(f"[BOOT] Failed to unban protected users: {e}")
-    
-    # application = ApplicationBuilder().token(TOKEN).build()
-    application = ApplicationBuilder().token(config.TOKEN).build()
-
-    # Регистрируем обработчики
-    # Диагностический логгер команд в группах (не блокирует выполнение)
-    # Переносим в более позднюю группу, чтобы не влиять на срабатывание CommandHandler("gift", ...)
+ 
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=15.0,
+        pool_timeout=15.0,
+    )
+    application = ApplicationBuilder().token(config.TOKEN).request(request).build()
+ 
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, debug_log_commands), group=2)
-    
-    # Предыдущий глобальный pre-handler бана удалён, чтобы не блокировать /команды.
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
     application.add_handler(CommandHandler("moneyleaderboard", show_money_leaderboard))
@@ -16168,12 +20380,25 @@ def main():
     application.add_handler(CommandHandler("myreceipts", myreceipts_command))
     application.add_handler(CommandHandler("receipt", receipt_command))
     application.add_handler(CommandHandler("verifyreceipt", verifyreceipt_command))
+    # application.add_handler(CommandHandler("addexdrink", addexdrink_command, filters=(filters.TEXT | filters.PHOTO)))
+
+    addex_conv = ConversationHandler(
+        entry_points=[CommandHandler("addexdrink", addexdrink_start)],
+        states={
+            ADDEX_PHOTO: [MessageHandler(filters.PHOTO, addexdrink_photo), CommandHandler("skip", addexdrink_skip)],
+        },
+        fallbacks=[CommandHandler("cancel", addexdrink_cancel)],
+    )
+    application.add_handler(addex_conv)
+    application.add_handler(CommandHandler("giveexdrink", giveexdrink_command))
     application.add_handler(CommandHandler("tgstock", tgstock_command))
     application.add_handler(CommandHandler("tgadd", tgadd_command))
     application.add_handler(CommandHandler("tgset", tgset_command))
     application.add_handler(CommandHandler("stock", stock_command))
     application.add_handler(CommandHandler("stockadd", stockadd_command))
     application.add_handler(CommandHandler("stockset", stockset_command))
+    application.add_handler(CommandHandler("setrareemoji", setrareemoji_command))
+    application.add_handler(CommandHandler("listrareemoji", listrareemoji_command))
     application.add_handler(CommandHandler("addvip", addvip_command))
     application.add_handler(CommandHandler("addautosearch", addautosearch_command))
     application.add_handler(CommandHandler("listboosts", listboosts_command))
@@ -16225,6 +20450,21 @@ def main():
         allow_reentry=True
     )
     application.add_handler(fertilizer_custom_buy_handler)
+
+    seed_custom_buy_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_seed_custom_buy_wrapper, pattern='^seed_buy_custom_')],
+        states={
+            SEED_CUSTOM_QTY: [
+                MessageHandler(filters.TEXT & (~filters.COMMAND), handle_seed_custom_qty_input),
+                CallbackQueryHandler(seed_custom_retry, pattern='^seed_custom_retry$'),
+                CallbackQueryHandler(seed_custom_buy_max, pattern='^seed_custom_buy_max$'),
+                CallbackQueryHandler(cancel_seed_custom_buy, pattern='^seed_custom_cancel$'),
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(cancel_seed_custom_buy, pattern='^seed_custom_cancel$|^plantation_shop$')],
+        allow_reentry=True
+    )
+    application.add_handler(seed_custom_buy_handler)
     
     application.add_handler(CallbackQueryHandler(toggle_plantation_reminder, pattern='^toggle_plantation_rem$'))
     application.add_handler(CallbackQueryHandler(snooze_reminder_handler, pattern='^snooze_remind_'))
@@ -16234,7 +20474,7 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_player_selyuki_show, pattern='^admin_player_selyuki:'))
     application.add_handler(CallbackQueryHandler(button_handler))
     # ВАЖНО: перехватываем ответы на ForceReply с причиной отклонения до общего текстового обработчика
-    application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply, block=True), group=0)
+    application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply), group=0)
     # Общий текстовый обработчик — после reply-хендлера
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=1)
     application.add_handler(MessageHandler(filters.PHOTO, photo_message_handler), group=1)
@@ -16430,6 +20670,15 @@ def main():
         farmer_harvest_interval = 10 * 60  # 10 минут
         farmer_harvest_delay = 60  # начинаем через 1 минуту после старта
         application.job_queue.run_repeating(global_farmer_harvest_job, interval=farmer_harvest_interval, first=farmer_harvest_delay)
+
+        farmer_fertilize_interval = 5 * 60
+        farmer_fertilize_delay = 75
+        application.job_queue.run_repeating(global_farmer_fertilize_job, interval=farmer_fertilize_interval, first=farmer_fertilize_delay)
+
+        # Сводки фермера (для тихого режима)
+        farmer_summary_interval = 5 * 60
+        farmer_summary_delay = 90
+        application.job_queue.run_repeating(farmer_summary_job, interval=farmer_summary_interval, first=farmer_summary_delay)
 
         # --- Восстановление задач автопоиска VIP после рестарта ---
         try:
