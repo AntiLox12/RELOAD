@@ -8,6 +8,11 @@
 SEARCH_COOLDOWN = 1200            # 20 минут в секундах
 DAILY_BONUS_COOLDOWN = 86400      # 24 часа в секундах
 ENERGY_IMAGES_DIR = 'energy_images'
+PLANTATION_FERTILIZER_MAX_PER_BED = 5
+PLANTATION_NEG_EVENT_INTERVAL_SEC = 900
+PLANTATION_NEG_EVENT_CHANCE = 0.15
+PLANTATION_NEG_EVENT_MAX_ACTIVE = 0.25
+PLANTATION_NEG_EVENT_DURATION_SEC = 3600
 
 # --- Игровые константы ---
 RARITIES = {
@@ -28,7 +33,7 @@ COLOR_EMOJIS = {
 }
 RARITY_ORDER = ['Plant', 'Special', 'Majestic', 'Absolute', 'Elite', 'Medium', 'Basic']
 ITEMS_PER_PAGE = 10               # кол-во предметов на страницу инвентаря
-FAVORITE_DRINK_WEIGHT_MULT = 1.5  # множитель веса при поиске для энергетиков из избранного
+FAVORITE_DRINK_WEIGHT_MULT = 3  # множитель веса при поиске для энергетиков из избранного
 
 # --- Рулетка ежедневного бонуса ---
 DAILY_BONUS_REWARDS = {

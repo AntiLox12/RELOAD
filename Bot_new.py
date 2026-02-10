@@ -106,6 +106,11 @@ from constants import (
     CRASH_UPDATE_INTERVAL,
     CRASH_GROWTH_RATE,
     CRASH_MAX_MULTIPLIER,
+    PLANTATION_FERTILIZER_MAX_PER_BED,
+    PLANTATION_NEG_EVENT_INTERVAL_SEC,
+    PLANTATION_NEG_EVENT_CHANCE,
+    PLANTATION_NEG_EVENT_MAX_ACTIVE,
+    PLANTATION_NEG_EVENT_DURATION_SEC,
 )
 import silk_ui
 # --- Настройки ---
@@ -717,6 +722,7 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("📈 Статистика бота", callback_data='admin_bot_stats')],
         [InlineKeyboardButton("📊 Расширенная аналитика", callback_data='admin_analytics')],
         [InlineKeyboardButton("👤 Управление игроками", callback_data='admin_players_menu')],
+        [InlineKeyboardButton("🎁 Быстрые выдачи", callback_data='admin_grants_menu')],
         [InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')],
         [InlineKeyboardButton("📦 Управление складом", callback_data='admin_stock_menu')],
         [InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')],
@@ -752,6 +758,41 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pass
 
 
+async def show_admin_grants_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Быстрые выдачи: монеты, VIP, VIP+."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    text = (
+        "🎁 <b>Быстрые выдачи</b>\n\n"
+        "Выберите, что выдать:\n"
+        "• Монеты\n"
+        "• VIP / VIP+\n\n"
+        "Форматы ввода:\n"
+        "• <code>@username количество</code> или <code>количество @username</code>\n"
+        "• <code>@username дни</code> или <code>дни @username</code>\n"
+        "• Можно использовать <code>user_id</code> вместо @username"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("💰 Выдать монеты", callback_data='creator_give_coins')],
+        [InlineKeyboardButton("👑 Выдать VIP", callback_data='admin_vip_give')],
+        [InlineKeyboardButton("💎 Выдать VIP+", callback_data='admin_vip_plus_give')],
+        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
 async def show_admin_settings_autosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -781,6 +822,93 @@ async def show_admin_settings_autosearch(update: Update, context: ContextTypes.D
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
     except BadRequest:
         pass
+
+
+async def show_admin_settings_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает настройки удачи в казино."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    win_prob = db.get_setting_float('casino_win_prob', CASINO_WIN_PROB)
+    win_prob = max(0.0, min(1.0, float(win_prob)))
+    percent = round(win_prob * 100, 2)
+    luck_mult = db.get_setting_float('casino_luck_mult', 1.0)
+    try:
+        luck_mult = float(luck_mult)
+    except Exception:
+        luck_mult = 1.0
+    luck_mult = max(0.1, min(5.0, luck_mult))
+
+    text = (
+        "🎰 <b>Настройки казино — удача</b>\n\n"
+        f"Шанс победы (классические ставки): <b>{percent}%</b>\n"
+        f"Внутреннее значение: <b>{win_prob}</b>\n\n"
+        f"Множитель удачи (все игры): <b>x{luck_mult}</b>\n\n"
+        "Применяется к:\n"
+        "• Быстрые ставки в казино\n"
+        "• Пользовательские ставки\n\n"
+        "• Все игры в казино (общий шанс)\n\n"
+        "Выберите действие:"
+    )
+
+    kb = [
+        [InlineKeyboardButton("🎲 Изменить шанс победы", callback_data='admin_settings_set_casino_win_prob')],
+        [InlineKeyboardButton("🍀 Множитель удачи", callback_data='admin_settings_set_casino_luck_mult')],
+        [InlineKeyboardButton("♻️ Сбросить шанс", callback_data='admin_settings_casino_reset_prob')],
+        [InlineKeyboardButton("♻️ Сбросить удачу", callback_data='admin_settings_casino_reset_luck')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
+    ]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_settings_set_casino_win_prob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_casino')]]
+    text = (
+        "🎲 <b>Шанс победы в казино</b>\n\n"
+        "Введите число:\n"
+        "• от 0 до 1 (например, 0.35)\n"
+        "• или в процентах 1–99 (например, 35)\n\n"
+        "Текущая настройка влияет на классические ставки."
+    )
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_casino_win_prob'
+
+
+async def admin_settings_set_casino_luck_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_casino')]]
+    text = (
+        "🍀 <b>Множитель удачи в казино</b>\n\n"
+        "Увеличивает шанс победы во всех играх.\n"
+        "Введите число (например 1.2, 1.5, 2):\n"
+        "• 1.0 — без изменений\n"
+        "• 1.5 — +50% к шансам\n"
+        "• 2.0 — в 2 раза больше\n"
+    )
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_casino_luck_mult'
 
 
 async def admin_settings_set_auto_base_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1300,8 +1428,9 @@ async def creator_give_coins_start(update: Update, context: ContextTypes.DEFAULT
     text = (
         "💰 <b>Выдача монет</b>\n\n"
         "Отправьте в формате:\n"
-        "<code>@username количество</code>\n\n"
-        "Пример: <code>@user 1000</code>\n\n"
+        "<code>@username количество</code> или <code>количество @username</code>\n"
+        "<code>user_id количество</code> также подходит\n\n"
+        "Пример: <code>@user 1000</code> или <code>1000 @user</code>\n\n"
         "Или нажмите Отмена"
     )
     
@@ -1587,6 +1716,108 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
                 await update.message.reply_html("❌ Введите число (≥ 0), например 2", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_fertilizer_max':
+            kb = [[InlineKeyboardButton("💰 Лимиты", callback_data='admin_settings_limits')]]
+            try:
+                new_val = int(text_input.strip())
+                if new_val < 1:
+                    raise ValueError
+                ok = db.set_setting_int('plantation_fertilizer_max_per_bed', new_val)
+                if ok:
+                    await update.message.reply_html(f"✅ Лимит удобрений обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число (≥ 1)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_neg_interval':
+            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
+            try:
+                new_val = int(text_input.strip())
+                if new_val < 60:
+                    raise ValueError
+                ok = db.set_setting_int('plantation_negative_event_interval_sec', new_val)
+                if ok:
+                    await update.message.reply_html(f"✅ Интервал обновлён: <b>{new_val}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число (≥ 60)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_neg_chance':
+            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
+            raw = (text_input or '').strip().replace(',', '.')
+            try:
+                val = float(raw)
+                if val > 1:
+                    val = val / 100.0
+                if val <= 0 or val > 1:
+                    raise ValueError
+                ok = db.set_setting_float('plantation_negative_event_chance', val)
+                if ok:
+                    await update.message.reply_html(f"✅ Шанс обновлён: <b>{round(val * 100, 2)}%</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите число 0..1 или проценты 1–100", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_neg_max_active':
+            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
+            raw = (text_input or '').strip().replace(',', '.')
+            try:
+                val = float(raw)
+                if val > 1:
+                    val = val / 100.0
+                if val <= 0 or val > 1:
+                    raise ValueError
+                ok = db.set_setting_float('plantation_negative_event_max_active', val)
+                if ok:
+                    await update.message.reply_html(f"✅ Лимит активных обновлён: <b>{round(val * 100, 2)}%</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите число 0..1 или проценты 1–100", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_neg_duration':
+            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
+            try:
+                new_val = int(text_input.strip())
+                if new_val < 60:
+                    raise ValueError
+                ok = db.set_setting_int('plantation_negative_event_duration_sec', new_val)
+                if ok:
+                    await update.message.reply_html(f"✅ Длительность обновлена: <b>{new_val}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число (≥ 60)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_casino_win_prob':
+            kb = [[InlineKeyboardButton("🎰 Казино", callback_data='admin_settings_casino')]]
+            raw = (text_input or '').strip().replace(',', '.')
+            try:
+                val = float(raw)
+                # Если ввели в процентах (1..99), переводим в доли
+                if val > 1:
+                    val = val / 100.0
+                if val <= 0 or val >= 1:
+                    raise ValueError
+                ok = db.set_setting_float('casino_win_prob', val)
+                if ok:
+                    await update.message.reply_html(f"✅ Шанс победы обновлён: <b>{round(val * 100, 2)}%</b> (={val})", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите число от 0 до 1 или процент 1–99", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_casino_luck_mult':
+            kb = [[InlineKeyboardButton("🎰 Казино", callback_data='admin_settings_casino')]]
+            raw = (text_input or '').strip().replace(',', '.')
+            try:
+                val = float(raw)
+                if val < 0.1 or val > 5:
+                    raise ValueError
+                ok = db.set_setting_float('casino_luck_mult', val)
+                if ok:
+                    await update.message.reply_html(f"✅ Множитель удачи обновлён: <b>x{val}</b>", reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите число от 0.1 до 5.0 (например 1.5)", reply_markup=InlineKeyboardMarkup(kb))
         elif action == 'mod_ban':
             # Формат: <id|@username> [duration] [reason...]
             parts = text_input.split(maxsplit=2)
@@ -1940,11 +2171,16 @@ async def handle_give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     parts = (text_input or '').split()
     if len(parts) != 2:
-        response = "❌ Неверный формат! Используйте: @username количество"
+        response = "❌ Неверный формат! Используйте: @username количество или количество @username"
     else:
         ident = parts[0]
         try:
-            amount = int(parts[1])
+            # Разрешаем формат "количество @username"
+            if parts[0].lstrip('+-').isdigit() and not parts[1].lstrip('+-').isdigit():
+                ident = parts[1]
+                amount = int(parts[0])
+            else:
+                amount = int(parts[1])
             res = db.find_player_by_identifier(ident)
             if res.get('ok') and res.get('player'):
                 player = res['player']
@@ -2370,11 +2606,16 @@ async def handle_vip_give(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     
     parts = text_input.split()
     if len(parts) != 2:
-        response = "❌ Неверный формат! Используйте: @username дни"
+        response = "❌ Неверный формат! Используйте: @username дни или дни @username"
     else:
         ident = parts[0]
         try:
-            days = int(parts[1])
+            # Разрешаем формат "дни @username"
+            if parts[0].lstrip('+-').isdigit() and not parts[1].lstrip('+-').isdigit():
+                ident = parts[1]
+                days = int(parts[0])
+            else:
+                days = int(parts[1])
             res = db.find_player_by_identifier(ident)
             if res.get('reason') == 'multiple':
                 lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
@@ -2410,11 +2651,16 @@ async def handle_vip_plus_give(update: Update, context: ContextTypes.DEFAULT_TYP
     
     parts = text_input.split()
     if len(parts) != 2:
-        response = "❌ Неверный формат! Используйте: @username дни"
+        response = "❌ Неверный формат! Используйте: @username дни или дни @username"
     else:
         ident = parts[0]
         try:
-            days = int(parts[1])
+            # Разрешаем формат "дни @username"
+            if parts[0].lstrip('+-').isdigit() and not parts[1].lstrip('+-').isdigit():
+                ident = parts[1]
+                days = int(parts[0])
+            else:
+                days = int(parts[1])
             res = db.find_player_by_identifier(ident)
             if res.get('reason') == 'multiple':
                 lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
@@ -2778,7 +3024,7 @@ async def show_admin_players_menu(update: Update, context: ContextTypes.DEFAULT_
     keyboard = [
         [InlineKeyboardButton("🔍 Поиск игрока", callback_data='admin_player_search')],
         [InlineKeyboardButton("📋 Список игроков", callback_data='admin_players_list')],
-        [InlineKeyboardButton("💰 Выдать монеты", callback_data='creator_give_coins')],
+        [InlineKeyboardButton("🎁 Быстрые выдачи", callback_data='admin_grants_menu')],
         [InlineKeyboardButton("🔄 Сбросить бонус", callback_data='creator_reset_bonus')],
         [InlineKeyboardButton("📊 Статистика игрока", callback_data='creator_user_stats')],
         [InlineKeyboardButton("💎 Топ игроков", callback_data='admin_players_top')],
@@ -3500,8 +3746,9 @@ async def admin_vip_give_start(update: Update, context: ContextTypes.DEFAULT_TYP
     text = (
         "➕ <b>Выдача VIP</b>\n\n"
         "Отправьте в формате:\n"
-        "<code>@username дни</code>\n\n"
-        "Пример: <code>@user 30</code>\n\n"
+        "<code>@username дни</code> или <code>дни @username</code>\n"
+        "<code>user_id дни</code> также подходит\n\n"
+        "Пример: <code>@user 30</code> или <code>30 @user</code>\n\n"
         "Или нажмите Отмена"
     )
     
@@ -3529,8 +3776,9 @@ async def admin_vip_plus_give_start(update: Update, context: ContextTypes.DEFAUL
     text = (
         "➕ <b>Выдача VIP+</b>\n\n"
         "Отправьте в формате:\n"
-        "<code>@username дни</code>\n\n"
-        "Пример: <code>@user 30</code>\n\n"
+        "<code>@username дни</code> или <code>дни @username</code>\n"
+        "<code>user_id дни</code> также подходит\n\n"
+        "Пример: <code>@user 30</code> или <code>30 @user</code>\n\n"
         "Или нажмите Отмена"
     )
     
@@ -4949,11 +5197,12 @@ async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT
     keyboard = [
         [InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')],
         [InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')],
-        [InlineKeyboardButton("💰 Лимиты монет", callback_data='admin_settings_limits')],
+        [InlineKeyboardButton("💰 Лимиты", callback_data='admin_settings_limits')],
         [InlineKeyboardButton("🎰 Настройки казино", callback_data='admin_settings_casino')],
         [InlineKeyboardButton("🏪 Настройки магазина", callback_data='admin_settings_shop')],
         [InlineKeyboardButton("🔔 Уведомления", callback_data='admin_settings_notifications')],
         [InlineKeyboardButton("🌐 Локализация", callback_data='admin_settings_localization')],
+        [InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')],
         [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -4975,6 +5224,139 @@ async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT
         await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest:
         pass
+
+
+async def show_admin_settings_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает настройки лимитов."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    fert_max = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
+
+    text = (
+        "💰 <b>Лимиты</b>\n\n"
+        f"🌿 Лимит удобрений на грядку: <b>{int(fert_max)}</b>\n\n"
+        "Выберите действие:"
+    )
+    kb = [
+        [InlineKeyboardButton("🧪 Изменить лимит удобрений", callback_data='admin_settings_set_fertilizer_max')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
+    ]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_settings_set_fertilizer_max_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_limits')]]
+    try:
+        await query.message.edit_text("Введите новый лимит удобрений на грядку (целое число ≥ 1):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_fertilizer_max'
+
+
+async def show_admin_settings_negative_effects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки негативных эффектов на плантациях."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    interval = db.get_setting_int('plantation_negative_event_interval_sec', PLANTATION_NEG_EVENT_INTERVAL_SEC)
+    chance = db.get_setting_float('plantation_negative_event_chance', PLANTATION_NEG_EVENT_CHANCE)
+    max_active = db.get_setting_float('plantation_negative_event_max_active', PLANTATION_NEG_EVENT_MAX_ACTIVE)
+    duration = db.get_setting_int('plantation_negative_event_duration_sec', PLANTATION_NEG_EVENT_DURATION_SEC)
+
+    text = (
+        "⚠️ <b>Негативные эффекты</b>\n\n"
+        f"⏱️ Интервал: <b>{int(interval)}</b> сек.\n"
+        f"🎲 Шанс: <b>{round(float(chance) * 100, 2)}%</b>\n"
+        f"📊 Лимит активных: <b>{round(float(max_active) * 100, 2)}%</b>\n"
+        f"⌛ Длительность: <b>{int(duration)}</b> сек.\n\n"
+        "Выберите, что изменить:"
+    )
+    kb = [
+        [InlineKeyboardButton("⏱️ Интервал", callback_data='admin_settings_set_neg_interval')],
+        [InlineKeyboardButton("🎲 Шанс", callback_data='admin_settings_set_neg_chance')],
+        [InlineKeyboardButton("📊 Лимит активных", callback_data='admin_settings_set_neg_max_active')],
+        [InlineKeyboardButton("⌛ Длительность", callback_data='admin_settings_set_neg_duration')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
+    ]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_settings_set_neg_interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
+    try:
+        await query.message.edit_text("Введите интервал в секундах (целое число ≥ 60):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_neg_interval'
+
+
+async def admin_settings_set_neg_chance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
+    try:
+        await query.message.edit_text("Введите шанс (0..1 или проценты 1–100):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_neg_chance'
+
+
+async def admin_settings_set_neg_max_active_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
+    try:
+        await query.message.edit_text("Введите лимит активных (0..1 или проценты 1–100):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_neg_max_active'
+
+
+async def admin_settings_set_neg_duration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
+    try:
+        await query.message.edit_text("Введите длительность эффекта в секундах (целое число ≥ 60):", reply_markup=InlineKeyboardMarkup(kb))
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_neg_duration'
 
 
 # --- Модерация ---
@@ -5579,6 +5961,40 @@ async def global_farmer_harvest_job(context: ContextTypes.DEFAULT_TYPE):
                                 await context.bot.send_message(chat_id=user_id, text=plant_text, parse_mode='HTML')
                             except Exception:
                                 pass
+
+                        try:
+                            jq = None
+                            if hasattr(context, 'job_queue') and context.job_queue:
+                                jq = context.job_queue
+                            elif context.application and context.application.job_queue:
+                                jq = context.application.job_queue
+                            if jq:
+                                for p in planted:
+                                    try:
+                                        bed_idx = int(p.get('bed_index') or 0)
+                                    except Exception:
+                                        bed_idx = 0
+                                    if bed_idx <= 0:
+                                        continue
+                                    try:
+                                        current_jobs = jq.get_jobs_by_name(f"plantation_water_reminder_{user_id}_{bed_idx}")
+                                        for job in current_jobs:
+                                            job.schedule_removal()
+                                    except Exception:
+                                        pass
+
+                                    try:
+                                        jq.run_once(
+                                            plantation_water_reminder_job,
+                                            when=1,
+                                            chat_id=int(user_id),
+                                            data={'bed_index': bed_idx},
+                                            name=f"plantation_water_reminder_{user_id}_{bed_idx}",
+                                        )
+                                    except Exception as ex:
+                                        logger.warning(f"Не удалось запланировать автополив после автопосадки для user {user_id}, bed {bed_idx}: {ex}")
+                        except Exception as ex:
+                            logger.warning(f"Не удалось обработать планирование автополива после автопосадки для user {user_id}: {ex}")
                 except Exception as e:
                     logger.warning(f"Ошибка автопосадки для user {user_id}: {e}")
     except Exception as ex:
@@ -5599,6 +6015,20 @@ async def global_farmer_fertilize_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Ошибка автоудобрения для user {user_id}: {e}")
     except Exception as ex:
         logger.warning(f"Ошибка в global_farmer_fertilize_job: {ex}")
+
+
+async def global_negative_effects_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        now_ts = int(time.time())
+        interval = db.get_setting_int('plantation_negative_event_interval_sec', PLANTATION_NEG_EVENT_INTERVAL_SEC)
+        last_ts = int(context.bot_data.get('neg_effects_last_ts', 0) or 0)
+        if interval > 0 and (now_ts - last_ts) < int(interval):
+            return
+        res = db.apply_negative_effects_job()
+        if res.get('ok'):
+            context.bot_data['neg_effects_last_ts'] = now_ts
+    except Exception as ex:
+        logger.warning(f"Ошибка в global_negative_effects_job: {ex}")
 
 
 async def farmer_summary_job(context: ContextTypes.DEFAULT_TYPE):
@@ -9122,12 +9552,14 @@ async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_
     win = False
     multiplier = 0.0
     result_text = ""
+    base_prob = 0.0
     
     # Логика для разных игр
     if game_type == 'dice':
         # Кости: угадать число (1-6)
         target = int(player_choice)
         win = (value == target)
+        base_prob = 1 / 6
         multiplier = CASINO_GAMES['dice']['multiplier']
         result_text = f"🎲 Выпало: <b>{value}</b> (Ваш выбор: {target})"
         
@@ -9137,6 +9569,7 @@ async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_
         # 43: Виноград (x5)
         # 22: Лимон (x3)
         # 1: BAR (x2)
+        base_prob = 4 / 64
         if value == 64:
             win = True
             multiplier = 10.0
@@ -9166,6 +9599,7 @@ async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_
         else:
             win = False
             result_text = "🏀 Промах..."
+        base_prob = 2 / 6
             
     elif game_type == 'football':
         # Футбол: 3, 4, 5 - гол
@@ -9176,6 +9610,7 @@ async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_
         else:
             win = False
             result_text = "⚽ Мимо ворот..."
+        base_prob = 3 / 6
             
     elif game_type == 'bowling':
         # Боулинг: 6 - страйк
@@ -9186,6 +9621,7 @@ async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_
         else:
             win = False
             result_text = f"🎳 Сбито кеглей: {value}"
+        base_prob = 1 / 6
             
     elif game_type == 'darts':
         # Дартс: 6 - яблочко
@@ -9196,6 +9632,17 @@ async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_
         else:
             win = False
             result_text = "🎯 Мимо центра..."
+        base_prob = 1 / 6
+
+    # Лаки-оверрайд: повышенная удача для всех нативных игр
+    if not win and base_prob > 0:
+        extra = _casino_extra_win_chance(base_prob)
+        if extra > 0 and random.random() < extra:
+            win = True
+            if multiplier <= 0:
+                # Фоллбек множителя, если его не было
+                multiplier = CASINO_GAMES.get(game_type, {}).get('multiplier', 2.0)
+            result_text += "\n🍀 Удача сработала!"
 
     # Обработка результата
     winnings = 0
@@ -9272,7 +9719,7 @@ async def play_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         elif game_type == 'slots':
             win, result_text, multiplier = play_slots(game_info)
         else:
-            win = random.random() < game_info['win_prob']
+            win = _casino_roll_win(game_info['win_prob'])
             result_text = "🎲 Результат определён"
 
         # Начисляем выигрыш
@@ -9320,11 +9767,35 @@ async def play_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
                               new_balance, result_text, achievement_bonus, context)
 
 
+def _casino_luck_mult() -> float:
+    try:
+        m = float(db.get_setting_float('casino_luck_mult', 1.0))
+    except Exception:
+        m = 1.0
+    return max(0.1, min(5.0, m))
+
+
+def _casino_adjusted_prob(base_prob: float) -> float:
+    base = max(0.0, min(1.0, float(base_prob)))
+    adj = base * _casino_luck_mult()
+    return max(0.0, min(0.95, adj))
+
+
+def _casino_roll_win(base_prob: float) -> bool:
+    return random.random() < _casino_adjusted_prob(base_prob)
+
+
+def _casino_extra_win_chance(base_prob: float) -> float:
+    base = max(0.0, min(1.0, float(base_prob)))
+    adj = _casino_adjusted_prob(base)
+    return max(0.0, adj - base)
+
+
 def play_coin_flip(game_info, player_choice):
     """Игра: подбрасывание монеты."""
     # player_choice: 'heads' или 'tails'
-    result = random.choice(['heads', 'tails'])
-    win = (result == player_choice)
+    win = _casino_roll_win(0.5)
+    result = player_choice if win else ('tails' if player_choice == 'heads' else 'heads')
     
     result_emoji = '🦅 Орёл' if result == 'heads' else '🪙 Решка'
     choice_emoji = '🦅 Орёл' if player_choice == 'heads' else '🪙 Решка'
@@ -9341,8 +9812,12 @@ def play_dice(game_info, player_choice):
     """Игра: игральная кость."""
     # player_choice: '1' до '6'
     player_number = int(player_choice)
-    dice_result = random.randint(1, 6)
-    win = (dice_result == player_number)
+    win = _casino_roll_win(1 / 6)
+    if win:
+        dice_result = player_number
+    else:
+        other = [n for n in range(1, 7) if n != player_number]
+        dice_result = random.choice(other)
     
     result_text = (
         f"🎯 Ваше число: <b>{player_number}</b>\n"
@@ -9356,11 +9831,19 @@ def play_dice(game_info, player_choice):
 def play_high_low(game_info, player_choice):
     """Игра: больше/меньше 50."""
     # player_choice: 'high' или 'low'
-    number = random.randint(1, 100)
+    win = _casino_roll_win(0.49)
+    if player_choice == 'high':
+        if win:
+            number = random.randint(51, 100)
+        else:
+            number = random.randint(1, 50)
+    else:
+        if win:
+            number = random.randint(1, 49)
+        else:
+            number = random.randint(50, 100)
     
     is_higher = number > 50
-    is_correct = (is_higher and player_choice == 'high') or (not is_higher and player_choice == 'low')
-    win = is_correct
     
     choice_text = '📈 Больше 50' if player_choice == 'high' else '📉 Меньше 50'
     actual_text = '📈 Больше 50' if is_higher else '📉 Меньше 50'
@@ -9375,19 +9858,33 @@ def play_high_low(game_info, player_choice):
 def play_roulette_color(game_info, player_choice):
     """Игра: рулетка - красное/чёрное."""
     # player_choice: 'red' или 'black'
-    number = random.randint(0, 36)
-    
-    if number == 0:
-        color = '🟢 Зелёное'
-        color_code = 'green'
-        win = False
+    red_numbers = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
+    black_numbers = [2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35]
+    win = _casino_roll_win(18 / 37)
+    if win:
+        if player_choice == 'red':
+            number = random.choice(red_numbers)
+            color_code = 'red'
+            color = '🔴 Красное'
+        else:
+            number = random.choice(black_numbers)
+            color_code = 'black'
+            color = '⚫ Чёрное'
     else:
-        # Красные: 1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36
-        red_numbers = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
-        is_red = number in red_numbers
-        color = '🔴 Красное' if is_red else '⚫ Чёрное'
-        color_code = 'red' if is_red else 'black'
-        win = (color_code == player_choice)
+        # Проигрыш: либо противоположный цвет, либо 0
+        if random.random() < 0.15:
+            number = 0
+            color_code = 'green'
+            color = '🟢 Зелёное'
+        else:
+            if player_choice == 'red':
+                number = random.choice(black_numbers)
+                color_code = 'black'
+                color = '⚫ Чёрное'
+            else:
+                number = random.choice(red_numbers)
+                color_code = 'red'
+                color = '🔴 Красное'
     
     choice_text = '🔴 Красное' if player_choice == 'red' else '⚫ Чёрное'
     result_text = (
@@ -9402,8 +9899,12 @@ def play_roulette_number(game_info, player_choice):
     """Игра: рулетка - угадай число."""
     # player_choice: '0' до '36'
     player_number = int(player_choice)
-    number = random.randint(0, 36)
-    win = (number == player_number)
+    win = _casino_roll_win(1 / 37)
+    if win:
+        number = player_number
+    else:
+        other = [n for n in range(0, 37) if n != player_number]
+        number = random.choice(other)
     
     result_text = (
         f"🎯 Ваше число: <b>{player_number}</b>\n"
@@ -9416,17 +9917,21 @@ def play_roulette_number(game_info, player_choice):
 
 def play_slots(game_info):
     """Игра: слоты."""
-    # Взвешенная вероятность для символов
-    symbols_weights = [20, 15, 12, 10, 8, 3, 2]  # Вероятности для каждого символа
-    slot1 = random.choices(SLOT_SYMBOLS, weights=symbols_weights)[0]
-    slot2 = random.choices(SLOT_SYMBOLS, weights=symbols_weights)[0]
-    slot3 = random.choices(SLOT_SYMBOLS, weights=symbols_weights)[0]
-    
-    combination = f"{slot1}{slot2}{slot3}"
-    win = (slot1 == slot2 == slot3)
-    
-    # Определяем множитель выплаты
-    multiplier = SLOT_PAYOUTS.get(combination, 3.0) if win else 0
+    win = _casino_roll_win(CASINO_GAMES['slots']['win_prob'])
+    if win:
+        combination = random.choice(list(SLOT_PAYOUTS.keys()))
+        slot1, slot2, slot3 = combination[0], combination[1], combination[2]
+        multiplier = SLOT_PAYOUTS.get(combination, 3.0)
+    else:
+        # Генерируем комбинацию без выигрыша
+        while True:
+            slot1 = random.choice(SLOT_SYMBOLS)
+            slot2 = random.choice(SLOT_SYMBOLS)
+            slot3 = random.choice(SLOT_SYMBOLS)
+            if not (slot1 == slot2 == slot3):
+                break
+        combination = f"{slot1}{slot2}{slot3}"
+        multiplier = 0
     
     # Формируем красивый результат
     if win:
@@ -9827,6 +10332,13 @@ async def finish_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TY
     
     winnings = 0
     win = False
+    luck_applied = False
+    # Шанс удачи: если проигрыш, пробуем перевернуть исход
+    if result in ('bust', 'lose'):
+        extra = _casino_extra_win_chance(0.45)
+        if extra > 0 and random.random() < extra:
+            result = 'win'
+            luck_applied = True
     
     # Определяем выплату
     if result == 'blackjack':
@@ -9904,6 +10416,8 @@ async def finish_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TY
         text += f"💸 Потеряно: <b>{bet}</b> септимов\n"
     
     text += f"💵 Баланс: <b>{new_balance}</b> септимов"
+    if luck_applied:
+        text += "\n🍀 Удача изменила исход!"
     
     if achievement_bonus:
         ach = achievement_bonus['achievement']
@@ -10103,6 +10617,9 @@ async def show_mines_game_screen(update: Update, context: ContextTypes.DEFAULT_T
         f"💵 Выигрыш: <b>{potential_win}</b>\n"
         f"✅ Открыто: <b>{len(revealed)}</b> ячеек\n"
     )
+    if game.get('luck_saved'):
+        text += "🍀 <b>Удача:</b> мина обезврежена!\n"
+        game['luck_saved'] = False
     
     # Строим клавиатуру-поле
     keyboard = []
@@ -10149,9 +10666,20 @@ async def handle_mines_click(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
     # Проверяем, мина ли это
     if game['grid'][cell_idx]:
-        # Попали на мину!
-        await finish_mines_game(update, context, user.id, 'exploded', cell_idx)
-    else:
+        # Попали на мину! Проверяем удачу
+        total = MINES_GRID_SIZE * MINES_GRID_SIZE
+        safe_cells = total - game['mines_count']
+        revealed_count = len(game['revealed'])
+        base_prob = (safe_cells - revealed_count) / max(1, (total - revealed_count))
+        extra = _casino_extra_win_chance(base_prob)
+        if extra > 0 and random.random() < extra:
+            game['grid'][cell_idx] = False
+            game['luck_saved'] = True
+        else:
+            await finish_mines_game(update, context, user.id, 'exploded', cell_idx)
+            return
+
+    if not game['grid'][cell_idx]:
         # Безопасная ячейка
         game['revealed'].add(cell_idx)
         game['multiplier'] = calculate_mines_multiplier(game['mines_count'], len(game['revealed']))
@@ -10323,6 +10851,7 @@ def generate_crash_point() -> float:
     
     # Формула: crash_point = 0.99 / (1 - r)
     crash = 0.99 / (1 - r)
+    crash = crash * _casino_luck_mult()
     return min(round(crash, 2), CRASH_MAX_MULTIPLIER)
 
 
@@ -10738,7 +11267,9 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             return
 
         # Разыгрываем исход — вероятность задаётся константой
-        win = random.random() < CASINO_WIN_PROB
+        win_prob = db.get_setting_float('casino_win_prob', CASINO_WIN_PROB)
+        win_prob = max(0.0, min(1.0, float(win_prob)))
+        win = random.random() < _casino_adjusted_prob(win_prob)
         coins_after = after_debit
         result_line = ""
         if win:
@@ -10908,7 +11439,9 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         
         # Разыгрываем исход
-        win = random.random() < CASINO_WIN_PROB
+        win_prob = db.get_setting_float('casino_win_prob', CASINO_WIN_PROB)
+        win_prob = max(0.0, min(1.0, float(win_prob)))
+        win = random.random() < _casino_adjusted_prob(win_prob)
         coins_after = after_debit
         result_line = ""
         if win:
@@ -11170,6 +11703,7 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
     user = query.from_user
     context.user_data['last_plantation_screen'] = 'beds'
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    max_fert = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
     lang = getattr(player, 'language', 'ru') or 'ru'
     # Гарантируем грядки и читаем текущее состояние
     try:
@@ -11228,8 +11762,11 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
             except Exception:
                 info_list = []
             slots_used = len(info_list)
-            fert_header = f"🧪 Удобрения: {slots_used}/3"
+            total_count = _count_bed_total_fertilizers(b)
+            fert_header = f"🧪 Удобрения: {slots_used}/{max_fert} | всего {total_count}/{max_fert}"
             fert_lines.append(fert_header)
+            if total_count >= max_fert:
+                fert_lines.append("⚠️ Лимит удобрений исчерпан до сбора")
 
             try:
                 total_mult = float(fert_total_status.get('total_multiplier') or 1.0)
@@ -11258,6 +11795,7 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
                     'growth': '⚡',
                     'nutrition': '🌿',
                     'bio': '🌿',
+                    'resilience': '🛡️',
                     'basic': '🧪',
                 }
 
@@ -11276,11 +11814,24 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
             else:
                 try:
                     if growth_line and base_grow_time > 0 and actual_grow_time > 0 and actual_grow_time < base_grow_time:
-                        fert_lines[-1] = f"{fert_header} (ускорение сохранено)"
+                        fert_lines[0] = f"{fert_header} (ускорение сохранено)"
                 except Exception:
                     pass
 
+            status_line = None
+            try:
+                se = (getattr(b, 'status_effect', '') or '').strip().lower()
+                if se:
+                    lvl = int(getattr(b, 'status_effect_level', 1) or 1)
+                    status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
+                    status_h = status_map.get(se, se)
+                    status_line = f"⚠️ Негатив: {status_h} (ур.{lvl})"
+            except Exception:
+                status_line = None
+
             block = [f"🌱 Грядка {idx}: Растёт {name}", prog, water_info]
+            if status_line:
+                block.append(status_line)
             if growth_line:
                 block.append(growth_line)
             block.extend(fert_lines)
@@ -11951,16 +12502,31 @@ async def show_plantation_stats(update: Update, context: ContextTypes.DEFAULT_TY
 
 def get_fertilizer_category(fertilizer) -> str:
     """Определяет категорию удобрения по его эффекту."""
+    effect_type = getattr(fertilizer, 'effect_type', None)
+    if effect_type:
+        if effect_type in ('growth', 'time', 'growth_quality'):
+            return 'growth'
+        if effect_type in ('yield', 'mega_yield', 'nutrition'):
+            return 'yield'
+        if effect_type in ('quality',):
+            return 'quality'
+        if effect_type in ('complex', 'bio'):
+            return 'complex'
+        if effect_type in ('resilience',):
+            return 'resilience'
+        return 'other'
+
     effect = str(getattr(fertilizer, 'effect', '') or '').lower()
     name = str(getattr(fertilizer, 'name', '') or '').lower()
-    
+    if 'стойк' in effect or 'иммун' in effect or 'защит' in effect:
+        return 'resilience'
     if 'время' in effect or 'рост' in effect or 'суперрост' in name:
         return 'growth'  # Ускорение роста
-    elif 'урожай' in effect or 'мегаурожай' in name or 'питание' in effect:
+    if 'урожай' in effect or 'мегаурожай' in name or 'питание' in effect:
         return 'yield'  # Увеличение урожая
-    elif 'качество' in effect or 'калийное' in name or 'минерал' in name:
+    if 'качество' in effect or 'калийное' in name or 'минерал' in name:
         return 'quality'  # Повышение качества
-    elif 'всё' in effect or 'био' in effect or 'комплекс' in name:
+    if 'всё' in effect or 'био' in effect or 'комплекс' in name:
         return 'complex'  # Комплексные
     return 'other'
 
@@ -11971,6 +12537,7 @@ def get_category_emoji(category: str) -> str:
         'yield': '🌾',
         'quality': '💎',
         'complex': '🌟',
+        'resilience': '🛡️',
         'other': '🧪'
     }
     return emojis.get(category, '🧪')
@@ -11982,6 +12549,7 @@ def get_category_name(category: str) -> str:
         'yield': 'Увеличение урожая',
         'quality': 'Повышение качества',
         'complex': 'Комплексные',
+        'resilience': 'Защита',
         'other': 'Прочие',
         'all': 'Все удобрения'
     }
@@ -11994,6 +12562,12 @@ async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     
+    # Гарантируем наличие дефолтных удобрений (и новых) перед выводом
+    try:
+        db.ensure_default_fertilizers()
+    except Exception:
+        pass
+
     # Получаем удобрения и инвентарь
     try:
         fertilizers = db.list_fertilizers() or []
@@ -12029,7 +12603,7 @@ async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes
     
     # Фильтры по категориям
     filter_buttons = []
-    categories = ['all', 'growth', 'yield', 'quality', 'complex']
+    categories = ['all', 'growth', 'yield', 'quality', 'complex', 'resilience']
     for cat in categories:
         emoji = get_category_emoji(cat) if cat != 'all' else '🌐'
         cat_name = get_category_name(cat)
@@ -12067,7 +12641,7 @@ async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes
                 categories_group[cat].append(fz)
             
             # Показываем по категориям
-            for cat in ['growth', 'yield', 'quality', 'complex', 'other']:
+            for cat in ['growth', 'yield', 'quality', 'complex', 'resilience', 'other']:
                 if cat in categories_group:
                     cat_emoji = get_category_emoji(cat)
                     cat_name = get_category_name(cat)
@@ -12363,6 +12937,7 @@ async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("Обработка…", show_alert=False)
         return
     async with lock:
+        max_fert = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
         res = db.apply_fertilizer(user.id, int(bed_index), int(fertilizer_id))
         if not res.get('ok'):
             reason = res.get('reason')
@@ -12373,7 +12948,7 @@ async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_
             elif reason == 'no_fertilizer_in_inventory':
                 await query.answer('Нет такого удобрения в инвентаре', show_alert=True)
             elif reason == 'max_fertilizers_reached':
-                await query.answer('Достигнут лимит удобрений (макс. 3 на грядку)', show_alert=True)
+                await query.answer(f'Достигнут лимит удобрений (макс. {max_fert} на грядку)', show_alert=True)
             else:
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         else:
@@ -12385,6 +12960,7 @@ async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     user = query.from_user
+    max_fert = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
     inv = db.get_fertilizer_inventory(user.id) or []
     beds = db.get_player_beds(user.id) or []
     bed = None
@@ -12402,7 +12978,10 @@ async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEF
             fs = db.get_fertilizer_status(bed)
             info_list = list(fs.get('fertilizers_info', []) or [])
             used = len(info_list)
-            lines.append(f"\n🧪 Сейчас на грядке: {used}/3")
+            total_count = _count_bed_total_fertilizers(bed)
+            lines.append(f"\n🧪 Сейчас активно: {used}/{max_fert} | всего {total_count}/{max_fert}")
+            if total_count >= max_fert:
+                lines.append("⚠️ Лимит удобрений исчерпан до сбора")
             for fi in info_list[:3]:
                 fn = html.escape(str(fi.get('name') or 'Удобрение'))
                 tl = int(fi.get('time_left') or 0)
@@ -12460,6 +13039,24 @@ async def show_plantation_water_all(update: Update, context: ContextTypes.DEFAUL
 
 async def show_plantation_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("🚧 Функция в разработке", show_alert=True)
+
+
+def _count_bed_total_fertilizers(bed) -> int:
+    total = 0
+    try:
+        if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
+            for bf in bed.active_fertilizers:
+                if getattr(bf, 'fertilizer', None):
+                    total += 1
+    except Exception:
+        total = 0
+    if total == 0:
+        try:
+            if getattr(bed, 'fertilizer_id', None):
+                total = 1
+        except Exception:
+            pass
+    return int(total)
 
 
 def _fmt_time(seconds: int) -> str:
@@ -12782,6 +13379,7 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
             fert_active = bool(eff.get('fertilizer_active'))
             fert_names = eff.get('fertilizer_names') or []
             status_raw = (eff.get('status_effect') or '').lower()
+            status_lvl = int(eff.get('status_effect_level') or 1)
             yield_mult = float(eff.get('yield_multiplier') or 1.0)
             status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
             status_h = status_map.get(status_raw, '—' if not status_raw else status_raw)
@@ -12797,7 +13395,10 @@ async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAUL
                         lines.append(f"  - {html.escape(fname)}")
             else:
                 lines.append("• Удобрение: нет")
-            lines.append(f"• Негативный статус: {status_h}")
+            if status_raw:
+                lines.append(f"• Негативный статус: {status_h} (ур.{status_lvl})")
+            else:
+                lines.append(f"• Негативный статус: {status_h}")
             lines.append(f"• Множитель урожая: x{yield_mult:.2f}")
 
             text = "\n".join(lines)
@@ -12914,6 +13515,7 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
             fert_active = bool(eff.get('fertilizer_active'))
             fert_names = eff.get('fertilizer_names') or []
             status_raw = (eff.get('status_effect') or '').lower()
+            status_lvl = int(eff.get('status_effect_level') or 1)
             yield_mult = float(eff.get('yield_multiplier') or 1.0)
             status_map = {'weeds': 'сорняки', 'pests': 'вредители', 'drought': 'засуха'}
             status_h = status_map.get(status_raw, '—' if not status_raw else status_raw)
@@ -12929,7 +13531,10 @@ async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DE
                         lines.append(f"  - {html.escape(fname)}")
             else:
                 lines.append("• Удобрение: нет")
-            lines.append(f"• Негативный статус: {status_h}")
+            if status_raw:
+                lines.append(f"• Негативный статус: {status_h} (ур.{status_lvl})")
+            else:
+                lines.append(f"• Негативный статус: {status_h}")
             lines.append(f"• Множитель урожая: x{yield_mult:.2f}")
             text = "\n".join(lines)
 
@@ -14309,6 +14914,7 @@ async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAU
         return
 
     lvl = int(getattr(farmer, 'level', 1) or 1)
+    max_fert = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
     
     if lvl >= 4:
         text = (
@@ -14317,7 +14923,7 @@ async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAU
             "✅ Стоимость полива снижена до 45 септимов.\n"
             "✅ Автоматический сбор урожая включен.\n"
             "✅ Автоматическая посадка семян включена.\n"
-            "✅ Автоматическое удобрение (до 3 слотов на грядку) включено."
+            f"✅ Автоматическое удобрение (до {max_fert} слотов на грядку) включено."
         )
         keyboard = [[InlineKeyboardButton("🔙 Назад к фермеру", callback_data='selyuk_farmer_manage')]]
     elif lvl == 3:
@@ -14326,7 +14932,7 @@ async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAU
             "Текущий уровень: 3\n"
             "Следующий уровень: 4\n\n"
             "<b>Бонусы 4 уровня:</b>\n"
-            "🧪 <b>Автоудобрение:</b> селюк поддерживает удобрения на грядках (до 3 слотов).\n"
+            f"🧪 <b>Автоудобрение:</b> селюк поддерживает удобрения на грядках (до {max_fert} слотов).\n"
             "(Выбор удобрений — по приоритету в настройках)\n\n"
             "<b>Стоимость улучшения:</b>\n"
             "💰 250 000 септимов\n"
@@ -15575,6 +16181,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await promo_button_cancel(update, context)
     elif data == 'creator_panel':
         await show_creator_panel(update, context)
+    elif data == 'admin_grants_menu':
+        await show_admin_grants_menu(update, context)
     elif data == 'creator_wipe':
         await creator_wipe_start(update, context)
     elif data == 'creator_wipe_confirm':
@@ -15691,6 +16299,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_promo_wizard_start(update, context)
     elif data == 'admin_settings_menu':
         await show_admin_settings_menu(update, context)
+    elif data == 'admin_settings_limits':
+        await show_admin_settings_limits(update, context)
+    elif data == 'admin_settings_set_fertilizer_max':
+        await admin_settings_set_fertilizer_max_start(update, context)
+    elif data == 'admin_settings_negative_effects':
+        await show_admin_settings_negative_effects(update, context)
+    elif data == 'admin_settings_set_neg_interval':
+        await admin_settings_set_neg_interval_start(update, context)
+    elif data == 'admin_settings_set_neg_chance':
+        await admin_settings_set_neg_chance_start(update, context)
+    elif data == 'admin_settings_set_neg_max_active':
+        await admin_settings_set_neg_max_active_start(update, context)
+    elif data == 'admin_settings_set_neg_duration':
+        await admin_settings_set_neg_duration_start(update, context)
     elif data == 'admin_settings_cooldowns':
         await show_admin_settings_cooldowns(update, context)
     elif data == 'admin_settings_set_search_cd':
@@ -15705,6 +16327,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_settings_set_auto_vip_mult_start(update, context)
     elif data == 'admin_settings_set_auto_vip_plus_mult':
         await admin_settings_set_auto_vip_plus_mult_start(update, context)
+    elif data == 'admin_settings_casino':
+        await show_admin_settings_casino(update, context)
+    elif data == 'admin_settings_set_casino_win_prob':
+        await admin_settings_set_casino_win_prob_start(update, context)
+    elif data == 'admin_settings_set_casino_luck_mult':
+        await admin_settings_set_casino_luck_mult_start(update, context)
+    elif data == 'admin_settings_casino_reset_prob':
+        if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        ok = db.set_setting_float('casino_win_prob', CASINO_WIN_PROB)
+        await query.answer("✅ Сброшено" if ok else "❌ Ошибка", show_alert=True)
+        await show_admin_settings_casino(update, context)
+    elif data == 'admin_settings_casino_reset_luck':
+        if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        ok = db.set_setting_float('casino_luck_mult', 1.0)
+        await query.answer("✅ Сброшено" if ok else "❌ Ошибка", show_alert=True)
+        await show_admin_settings_casino(update, context)
     elif data == 'admin_moderation_menu':
         await show_admin_moderation_menu(update, context)
     elif data == 'admin_mod_ban':
@@ -15839,7 +16481,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Заглушки для остальных подразделов (временно возвращают в меню)
     elif data in [
-                  'admin_settings_limits', 'admin_settings_casino', 'admin_settings_shop', 'admin_settings_notifications',
+                  'admin_settings_shop', 'admin_settings_notifications',
                   'admin_settings_localization',
                   'admin_econ_shop_prices', 'admin_econ_casino_bets', 'admin_econ_rewards',
                   'admin_econ_inflation', 'admin_econ_vip_prices', 'admin_econ_exchange', 'admin_event_create',
@@ -20674,6 +21316,7 @@ def main():
         farmer_fertilize_interval = 5 * 60
         farmer_fertilize_delay = 75
         application.job_queue.run_repeating(global_farmer_fertilize_job, interval=farmer_fertilize_interval, first=farmer_fertilize_delay)
+        application.job_queue.run_repeating(global_negative_effects_job, interval=60, first=90)
 
         # Сводки фермера (для тихого режима)
         farmer_summary_interval = 5 * 60

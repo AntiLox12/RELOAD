@@ -11,7 +11,18 @@ import random
 import json
 import logging
 import traceback
-from constants import RARITIES, RECEIVER_PRICES, RECEIVER_COMMISSION, SHOP_PRICES, ADMIN_USERNAMES
+from constants import (
+    RARITIES,
+    RECEIVER_PRICES,
+    RECEIVER_COMMISSION,
+    SHOP_PRICES,
+    ADMIN_USERNAMES,
+    PLANTATION_FERTILIZER_MAX_PER_BED,
+    PLANTATION_NEG_EVENT_INTERVAL_SEC,
+    PLANTATION_NEG_EVENT_CHANCE,
+    PLANTATION_NEG_EVENT_MAX_ACTIVE,
+    PLANTATION_NEG_EVENT_DURATION_SEC,
+)
 
 # --- Настройка базы данных ---
 DATABASE_FILE = "bot_data.db"
@@ -473,6 +484,7 @@ class Fertilizer(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, unique=True, index=True)
     description = Column(String, nullable=True)
+    effect_type = Column(String, nullable=True)  # Тип эффекта (см. FERT_EFFECTS)
     effect = Column(String, nullable=True)  # произвольное описание эффекта/модификаторов
     duration_sec = Column(Integer, default=7200)  # длительность действия в секундах
     price_coins = Column(Integer, default=0)
@@ -533,6 +545,9 @@ class PlantationBed(Base):
     fertilizer_id = Column(Integer, ForeignKey('fertilizers.id'), nullable=True)
     fertilizer_applied_at = Column(Integer, default=0)
     status_effect = Column(String, nullable=True)  # e.g. 'weeds' | 'pests' | 'drought'
+    status_effect_level = Column(Integer, default=1)
+    status_effect_applied_at = Column(Integer, default=0)
+    status_effect_expires_at = Column(Integer, default=0)
 
     owner = relationship('Player')
     seed_type = relationship('SeedType')
@@ -561,6 +576,75 @@ class BedFertilizer(Base):
         Index('idx_bed_fertilizer_bed', 'bed_id'),
         Index('idx_bed_fertilizer_fertilizer', 'fertilizer_id'),
     )
+
+
+class PlantationStatusEvent(Base):
+    __tablename__ = 'plantation_status_events'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bed_id = Column(Integer, ForeignKey('plantation_beds.id'), index=True)
+    owner_id = Column(BigInteger, index=True)
+    effect = Column(String, index=True)
+    level = Column(Integer, default=1)
+    applied_at = Column(Integer, default=lambda: int(time.time()), index=True)
+    expires_at = Column(Integer, default=0, index=True)
+    source = Column(String, default='system')  # system | admin | debug
+
+
+FERT_EFFECTS = {
+    'mega_yield': {'multiplier': 1.35, 'growth_factor': None, 'rarity_group': 'yield'},
+    'yield': {'multiplier': 1.27, 'growth_factor': None, 'rarity_group': 'yield'},
+    'quality': {'multiplier': 1.18, 'growth_factor': None, 'rarity_group': 'quality'},
+    'complex': {'multiplier': 1.3, 'growth_factor': 0.7, 'rarity_group': 'quality'},
+    'growth_quality': {'multiplier': 1.32, 'growth_factor': 0.7, 'rarity_group': 'quality'},
+    'time': {'multiplier': 1.22, 'growth_factor': 0.4, 'rarity_group': 'yield'},
+    'growth': {'multiplier': 1.22, 'growth_factor': 0.75, 'rarity_group': 'basic'},
+    'nutrition': {'multiplier': 1.26, 'growth_factor': None, 'rarity_group': 'basic'},
+    'bio': {'multiplier': 1.25, 'growth_factor': None, 'rarity_group': 'basic'},
+    'resilience': {'multiplier': 1.08, 'growth_factor': None, 'rarity_group': 'basic'},
+    'basic': {'multiplier': 1.16, 'growth_factor': None, 'rarity_group': 'basic'},
+}
+
+
+def _infer_fert_effect_type(effect: str, name: str) -> str:
+    try:
+        eff = (effect or '').lower()
+    except Exception:
+        eff = ''
+    try:
+        nm = (name or '').lower()
+    except Exception:
+        nm = ''
+
+    if 'урожай++' in eff or 'мегаурожай' in nm:
+        return 'mega_yield'
+    if 'урожай' in eff or 'мегаурожай' in nm:
+        return 'yield'
+    if 'качество' in eff or 'калийное' in nm or 'минерал' in nm:
+        return 'quality'
+    if 'стойк' in eff or 'иммун' in eff or 'защит' in eff:
+        return 'resilience'
+    if 'всё' in eff or 'комплекс' in nm:
+        return 'complex'
+    if 'рост+кач' in eff:
+        return 'growth_quality'
+    if 'время' in eff:
+        return 'time'
+    if 'рост' in eff or 'суперрост' in nm:
+        return 'growth'
+    if 'питание' in eff:
+        return 'nutrition'
+    if 'био' in eff:
+        return 'bio'
+    return 'basic'
+
+
+def _get_fert_effect_type(fert) -> str:
+    if not fert:
+        return 'basic'
+    et = getattr(fert, 'effect_type', None)
+    if et:
+        return str(et)
+    return _infer_fert_effect_type(getattr(fert, 'effect', '') or '', getattr(fert, 'name', '') or '')
 
 
 class CommunityPlantation(Base):
@@ -1621,6 +1705,7 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
         )
 
         now_ts = int(time.time())
+        max_fert = max(1, int(get_setting_int('plantation_fertilizer_max_per_bed', int(PLANTATION_FERTILIZER_MAX_PER_BED))))
         applied = []
 
         def _pick_fertilizer_id() -> int | None:
@@ -1644,12 +1729,11 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
                 pass
 
             try:
-                fs = get_fertilizer_status(bed, check_duration=True)
-                active_count = len(list(fs.get('fertilizers_info', []) or []))
+                total_count = _count_total_fertilizers(bed)
             except Exception:
-                active_count = 0
+                total_count = 0
 
-            while active_count < 3:
+            while total_count < max_fert:
                 fid = _pick_fertilizer_id()
                 if not fid:
                     break
@@ -1666,12 +1750,12 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
 
                 try:
                     fert = getattr(row, 'fertilizer', None)
-                    new_growth_factor = _fert_growth_factor(getattr(fert, 'effect', '') or '') if fert else None
+                    new_growth_factor = _fert_growth_factor_from_fert(fert) if fert else None
                     if new_growth_factor is not None:
                         try:
                             cur_growth_factor = None
                             if getattr(bed, 'fertilizer', None):
-                                cur_growth_factor = _fert_growth_factor(getattr(bed.fertilizer, 'effect', '') or '')
+                                cur_growth_factor = _fert_growth_factor_from_fert(getattr(bed, 'fertilizer', None))
                             if cur_growth_factor is None or float(new_growth_factor) < float(cur_growth_factor):
                                 bed.fertilizer_id = fid
                                 bed.fertilizer_applied_at = now_ts
@@ -1686,7 +1770,7 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
                 except Exception:
                     row.quantity = 0
 
-                active_count += 1
+                total_count += 1
                 applied.append({'bed_index': int(getattr(bed, 'bed_index', 0) or 0), 'fertilizer_id': int(fid)})
 
                 if int(getattr(row, 'quantity', 0) or 0) <= 0:
@@ -1718,29 +1802,43 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
         dbs.close()
 
 
-def _fert_growth_factor(effect: str) -> float | None:
-    try:
-        eff = (effect or '').lower()
-    except Exception:
-        eff = ''
-    if not eff:
+def _fert_growth_factor(effect: str, effect_type: str | None = None) -> float | None:
+    et = effect_type or _infer_fert_effect_type(effect, '')
+    cfg = FERT_EFFECTS.get(et, FERT_EFFECTS['basic'])
+    return cfg.get('growth_factor')
+
+
+def _fert_growth_factor_from_fert(fert) -> float | None:
+    if not fert:
         return None
-    if 'время' in eff:
-        return 0.4
-    if 'рост+кач' in eff:
-        return 0.7
-    if 'всё' in eff:
-        return 0.7
-    if 'рост' in eff:
-        return 0.75
-    return None
+    et = _get_fert_effect_type(fert)
+    cfg = FERT_EFFECTS.get(et, FERT_EFFECTS['basic'])
+    return cfg.get('growth_factor')
+
+
+def _count_total_fertilizers(bed: PlantationBed) -> int:
+    total = 0
+    try:
+        if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
+            for bf in bed.active_fertilizers:
+                if getattr(bf, 'fertilizer', None):
+                    total += 1
+    except Exception:
+        total = 0
+    if total == 0:
+        try:
+            if getattr(bed, 'fertilizer_id', None):
+                total = 1
+        except Exception:
+            pass
+    return int(total)
 
 
 def _best_growth_factor_from_bed(bed: PlantationBed) -> float | None:
     best: float | None = None
     try:
         if getattr(bed, 'fertilizer', None):
-            f = _fert_growth_factor(getattr(bed.fertilizer, 'effect', '') or '')
+            f = _fert_growth_factor_from_fert(getattr(bed, 'fertilizer', None))
             if f is not None:
                 best = f if best is None else min(best, f)
     except Exception:
@@ -1751,7 +1849,7 @@ def _best_growth_factor_from_bed(bed: PlantationBed) -> float | None:
                 fert = getattr(bf, 'fertilizer', None)
                 if not fert:
                     continue
-                f = _fert_growth_factor(getattr(fert, 'effect', '') or '')
+                f = _fert_growth_factor_from_fert(fert)
                 if f is None:
                     continue
                 best = f if best is None else min(best, f)
@@ -1771,11 +1869,6 @@ def _cleanup_expired_bed_fertilizers(dbs, bed: PlantationBed, now_ts: int) -> No
                     dbs.delete(bf)
                 except Exception:
                     pass
-                continue
-            dur = int(getattr(fert, 'duration_sec', 0) or 0)
-            appl = int(getattr(bf, 'applied_at', 0) or 0)
-            if dur <= 0 or appl <= 0:
-                continue
     except Exception:
         pass
 
@@ -2332,28 +2425,36 @@ def ensure_default_fertilizers() -> int:
     """Создаёт 10 дефолтных удобрений, если их нет. Возвращает количество добавленных записей."""
     dbs = SessionLocal()
     try:
-        existing = dbs.query(Fertilizer).count()
-        if existing > 0:
-            return 0
+        existing_names = set()
+        try:
+            existing_names = {str(r[0]) for r in dbs.query(Fertilizer.name).all() if r and r[0]}
+        except Exception:
+            existing_names = set()
         data = [
-            {"name": "Азотное",       "description": "Ускоряет вегетацию",           "effect": "+рост",       "duration_sec": 1500,  "price_coins": 75},   # 25 мин
-            {"name": "Фосфорное",     "description": "Усиливает образование плодов", "effect": "+урожай",     "duration_sec": 1800,  "price_coins": 90},   # 30 мин
-            {"name": "Калийное",      "description": "Повышает устойчивость",        "effect": "+качество",   "duration_sec": 2250,  "price_coins": 110},  # 37.5 мин
-            {"name": "Комплексное",   "description": "Сбалансированная смесь",       "effect": "+всё",        "duration_sec": 2700,  "price_coins": 180},  # 45 мин
-            {"name": "Биоактив",      "description": "Органический стимулятор",      "effect": "+био",        "duration_sec": 1800,  "price_coins": 130},  # 30 мин
-            {"name": "Стимул-Х",      "description": "Мощный стимулятор роста",       "effect": "+рост+кач",   "duration_sec": 2250,  "price_coins": 200},  # 37.5 мин
-            {"name": "Минерал+",      "description": "Минеральный комплекс",         "effect": "+качество",   "duration_sec": 1800,  "price_coins": 150},  # 30 мин
-            {"name": "Гумат",         "description": "Гуминовый концентрат",          "effect": "+питание",    "duration_sec": 1500,  "price_coins": 120},  # 25 мин
-            {"name": "СуперРост",     "description": "Сокращает время роста",         "effect": "-время",      "duration_sec": 1050,  "price_coins": 250},  # 17.5 мин
-            {"name": "МегаУрожай",    "description": "Повышает выход урожая",         "effect": "+урожай++",   "duration_sec": 2700,  "price_coins": 300},  # 45 мин
+            {"name": "Азотное",       "description": "Ускоряет вегетацию",           "effect": "+рост",       "effect_type": "growth",        "duration_sec": 1500,  "price_coins": 75},   # 25 мин
+            {"name": "Фосфорное",     "description": "Усиливает образование плодов", "effect": "+урожай",     "effect_type": "yield",         "duration_sec": 1800,  "price_coins": 90},   # 30 мин
+            {"name": "Калийное",      "description": "Повышает устойчивость",        "effect": "+качество",   "effect_type": "quality",       "duration_sec": 2250,  "price_coins": 110},  # 37.5 мин
+            {"name": "Комплексное",   "description": "Сбалансированная смесь",       "effect": "+всё",        "effect_type": "complex",       "duration_sec": 2700,  "price_coins": 180},  # 45 мин
+            {"name": "Биоактив",      "description": "Органический стимулятор",      "effect": "+био",        "effect_type": "bio",           "duration_sec": 1800,  "price_coins": 130},  # 30 мин
+            {"name": "Стимул-Х",      "description": "Мощный стимулятор роста",       "effect": "+рост+кач",   "effect_type": "growth_quality","duration_sec": 2250,  "price_coins": 200},  # 37.5 мин
+            {"name": "Минерал+",      "description": "Минеральный комплекс",         "effect": "+качество",   "effect_type": "quality",       "duration_sec": 1800,  "price_coins": 150},  # 30 мин
+            {"name": "Гумат",         "description": "Гуминовый концентрат",          "effect": "+питание",    "effect_type": "nutrition",     "duration_sec": 1500,  "price_coins": 120},  # 25 мин
+            {"name": "Супер Рост",     "description": "Сокращает время роста",         "effect": "-время",      "effect_type": "time",          "duration_sec": 1050,  "price_coins": 250},  # 17.5 мин
+            {"name": "МегаУрожай",    "description": "Повышает выход урожая",         "effect": "+урожай++",   "effect_type": "mega_yield",    "duration_sec": 2700,  "price_coins": 300},  # 45 мин
+            {"name": "Антистресс",    "description": "Снижает потери от негативных статусов", "effect": "+стойкость", "effect_type": "resilience", "duration_sec": 2100, "price_coins": 160},  # 35 мин
+            {"name": "Иммунофит",    "description": "Укрепляет защиту от стресса",           "effect": "+иммунитет", "effect_type": "resilience", "duration_sec": 2400, "price_coins": 190},  # 40 мин
+            {"name": "Стойкость+",    "description": "Помогает справляться с негативом",     "effect": "+защита",     "effect_type": "resilience", "duration_sec": 2700, "price_coins": 230},  # 45 мин
         ]
         created = 0
         for d in data:
             try:
+                if d.get("name") in existing_names:
+                    continue
                 dbs.add(Fertilizer(
                     name=d["name"],
                     description=d.get("description"),
                     effect=d.get("effect"),
+                    effect_type=d.get("effect_type") or _infer_fert_effect_type(d.get("effect", ""), d.get("name", "")),
                     duration_sec=int(d.get("duration_sec", 7200) or 7200),
                     price_coins=int(d.get("price_coins", 0) or 0),
                 ))
@@ -2372,16 +2473,20 @@ def update_fertilizers_duration() -> int:
     dbs = SessionLocal()
     try:
         duration_map = {
-            "Азотное": 1500,     # 25 мин
-            "Фосфорное": 1800,   # 30 мин
-            "Калийное": 2250,    # 37.5 мин
-            "Комплексное": 2700, # 45 мин
-            "Биоактив": 1800,    # 30 мин
-            "Стимул-Х": 2250,    # 37.5 мин
-            "Минерал+": 1800,    # 30 мин
-            "Гумат": 1500,       # 25 мин
-            "СуперРост": 1050,   # 17.5 мин
-            "МегаУрожай": 2700,  # 45 мин
+            "???????": 1500,     # 25 ???
+            "?????????": 1800,   # 30 ???
+            "????????": 2250,    # 37.5 ???
+            "???????????": 2700, # 45 ???
+            "????????": 1800,    # 30 ???
+            "??????-?": 2250,    # 37.5 ???
+            "???????+": 1800,    # 30 ???
+            "?????": 1500,       # 25 ???
+            "?????????": 1050,   # 17.5 ???
+            "????? ????": 1050,   # 17.5 ???
+            "??????????": 2700,  # 45 ???
+            "??????????": 2100,  # 35 ???
+            "?????????": 2400,   # 40 ???
+            "?????????+": 2700,  # 45 ???
         }
         
         updated = 0
@@ -2396,6 +2501,29 @@ def update_fertilizers_duration() -> int:
         
         dbs.commit()
         return updated
+    finally:
+        dbs.close()
+
+
+def ensure_fertilizer_effect_types() -> int:
+    """Заполняет effect_type для существующих удобрений (если не задан). Возвращает количество обновлений."""
+    dbs = SessionLocal()
+    try:
+        rows = (
+            dbs.query(Fertilizer)
+            .filter(or_(Fertilizer.effect_type == None, Fertilizer.effect_type == ''))
+            .all()
+        )
+        updated = 0
+        for fert in rows:
+            try:
+                fert.effect_type = _infer_fert_effect_type(getattr(fert, 'effect', '') or '', getattr(fert, 'name', '') or '')
+                updated += 1
+            except Exception:
+                pass
+        if updated:
+            dbs.commit()
+        return int(updated)
     finally:
         dbs.close()
 
@@ -2469,7 +2597,7 @@ def purchase_fertilizer(user_id: int, fertilizer_id: int, quantity: int) -> dict
 def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
     """Применяет удобрение к грядке. Возвращает dict: {ok, reason?, bed_state?}
     Возможные reason: no_such_bed, not_growing, not_watered, no_such_fertilizer, no_fertilizer_in_inventory, max_fertilizers_reached
-    Теперь поддерживает накопление нескольких удобрений на одной грядке (максимум 3).
+    Теперь поддерживает накопление нескольких удобрений на одной грядке (лимит задаётся в настройках).
     Требует, чтобы растение было полито хотя бы один раз (water_count > 0).
     """
     dbs = SessionLocal()
@@ -2500,14 +2628,15 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
         if int(bed.water_count or 0) <= 0:
             return {"ok": False, "reason": "not_watered", "bed_state": bed.state}
 
-        # Проверяем количество активных удобрений (максимум 3)
-        # Используем check_duration=True, чтобы считать только удобрения с активным временем действия
+        # Проверяем количество удобрений на грядке (лимит на цикл роста)
         now_ts = int(time.time())
         _cleanup_expired_bed_fertilizers(dbs, bed, now_ts)
-        fert_status = get_fertilizer_status(bed, check_duration=True)
-        active_count = len(fert_status.get('fertilizers_info', []))
-        
-        if active_count >= 3:
+        try:
+            total_count = _count_total_fertilizers(bed)
+        except Exception:
+            total_count = 0
+        max_fert = max(1, int(get_setting_int('plantation_fertilizer_max_per_bed', int(PLANTATION_FERTILIZER_MAX_PER_BED))))
+        if total_count >= max_fert:
             return {"ok": False, "reason": "max_fertilizers_reached", "bed_state": bed.state}
 
         inv = (
@@ -2528,12 +2657,12 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
         dbs.add(bed_fert)
         
         # Также обновляем старые поля для обратной совместимости.
-        new_growth_factor = _fert_growth_factor(getattr(fert, 'effect', '') or '')
+        new_growth_factor = _fert_growth_factor_from_fert(fert)
         if new_growth_factor is not None:
             try:
                 cur_growth_factor = None
                 if getattr(bed, 'fertilizer', None):
-                    cur_growth_factor = _fert_growth_factor(getattr(bed.fertilizer, 'effect', '') or '')
+                    cur_growth_factor = _fert_growth_factor_from_fert(getattr(bed, 'fertilizer', None))
                 if cur_growth_factor is None or float(new_growth_factor) < float(cur_growth_factor):
                     bed.fertilizer_id = fertilizer_id
                     bed.fertilizer_applied_at = now_ts
@@ -2592,22 +2721,53 @@ def ensure_player_beds(user_id: int, total_beds: int = 1) -> list[PlantationBed]
 def get_player_beds(user_id: int) -> list[PlantationBed]:
     dbs = SessionLocal()
     try:
-        beds = list(
-            dbs.query(PlantationBed)
-            .options(
-                joinedload(PlantationBed.seed_type), 
-                joinedload(PlantationBed.fertilizer),
-                joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+        try:
+            beds = list(
+                dbs.query(PlantationBed)
+                .options(
+                    joinedload(PlantationBed.seed_type), 
+                    joinedload(PlantationBed.fertilizer),
+                    joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+                )
+                .filter(PlantationBed.owner_id == user_id)
+                .order_by(PlantationBed.bed_index.asc())
+                .all()
             )
-            .filter(PlantationBed.owner_id == user_id)
-            .order_by(PlantationBed.bed_index.asc())
-            .all()
-        )
+        except OperationalError as e:
+            if "no such column: plantation_beds.status_effect_level" in str(e):
+                try:
+                    dbs.rollback()
+                except Exception:
+                    pass
+                try:
+                    dbs.close()
+                except Exception:
+                    pass
+                try:
+                    ensure_schema()
+                except Exception:
+                    pass
+                dbs = SessionLocal()
+                beds = list(
+                    dbs.query(PlantationBed)
+                    .options(
+                        joinedload(PlantationBed.seed_type), 
+                        joinedload(PlantationBed.fertilizer),
+                        joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer)
+                    )
+                    .filter(PlantationBed.owner_id == user_id)
+                    .order_by(PlantationBed.bed_index.asc())
+                    .all()
+                )
+            else:
+                raise
         
         # Обновляем состояние грядок (ленивая проверка)
         updated = False
         for bed in beds:
             if _update_bed_ready_if_due(dbs, bed):
+                updated = True
+            if _clear_expired_status_effect(bed, int(time.time())):
                 updated = True
         
         if updated:
@@ -2640,8 +2800,8 @@ def get_fertilizer_status(bed: PlantationBed, check_duration: bool = True) -> di
     
     try:
         if not hasattr(bed, 'active_fertilizers'):
-            return result
-        
+            bed.active_fertilizers = []
+
         now_ts = int(time.time())
         active_fertilizers = []
         total_bonus = 0.0  # Сумма бонусов (без базового 1.0)
@@ -2664,40 +2824,9 @@ def get_fertilizer_status(bed: PlantationBed, check_duration: bool = True) -> di
                     fert_name = getattr(fert, 'name', 'Удобрение')
                     effect = getattr(fert, 'effect', '') or ''
                     
-                    # Определяем множитель для этого удобрения
-                    multiplier = 1.0
-                    effect_type = 'basic'
-                    
-                    if 'урожай++' in effect:
-                        multiplier = 1.4
-                        effect_type = 'mega_yield'
-                    elif 'урожай' in effect:
-                        multiplier = 1.25
-                        effect_type = 'yield'
-                    elif 'качество' in effect:
-                        multiplier = 1.15
-                        effect_type = 'quality'
-                    elif 'всё' in effect:
-                        multiplier = 1.3
-                        effect_type = 'complex'
-                    elif 'рост+кач' in effect:
-                        multiplier = 1.35
-                        effect_type = 'growth_quality'
-                    elif 'время' in effect:
-                        multiplier = 1.25
-                        effect_type = 'time'
-                    elif 'рост' in effect:
-                        multiplier = 1.2
-                        effect_type = 'growth'
-                    elif 'питание' in effect:
-                        multiplier = 1.3
-                        effect_type = 'nutrition'
-                    elif 'био' in effect:
-                        multiplier = 1.28
-                        effect_type = 'bio'
-                    else:
-                        multiplier = 1.15
-                        effect_type = 'basic'
+                    effect_type = _get_fert_effect_type(fert)
+                    cfg = FERT_EFFECTS.get(effect_type, FERT_EFFECTS['basic'])
+                    multiplier = float(cfg.get('multiplier', 1.0) or 1.0)
                     
                     # Добавляем бонус (без базового 1.0) к общей сумме
                     total_bonus += (multiplier - 1.0)
@@ -2708,7 +2837,30 @@ def get_fertilizer_status(bed: PlantationBed, check_duration: bool = True) -> di
                         'time_left': time_left,
                         'effect_type': effect_type
                     })
-        
+
+        # Legacy fallback: если нет active_fertilizers, но есть fertilizer_id на грядке
+        if not active_fertilizers:
+            try:
+                legacy_fert = getattr(bed, 'fertilizer', None)
+                if legacy_fert and getattr(bed, 'fertilizer_id', None):
+                    f_dur = int(getattr(legacy_fert, 'duration_sec', 0) or 0)
+                    f_appl = int(getattr(bed, 'fertilizer_applied_at', 0) or 0)
+                    time_left = max(0, f_dur - (now_ts - f_appl)) if f_dur > 0 and f_appl > 0 else 0
+                    if not check_duration or time_left > 0:
+                        fert_name = getattr(legacy_fert, 'name', 'Удобрение')
+                        effect_type = _get_fert_effect_type(legacy_fert)
+                        cfg = FERT_EFFECTS.get(effect_type, FERT_EFFECTS['basic'])
+                        multiplier = float(cfg.get('multiplier', 1.0) or 1.0)
+                        total_bonus += (multiplier - 1.0)
+                        active_fertilizers.append({
+                            'name': fert_name,
+                            'multiplier': multiplier,
+                            'time_left': time_left,
+                            'effect_type': effect_type
+                        })
+            except Exception:
+                pass
+
         if active_fertilizers:
             result['active'] = True
             result['fertilizer_names'] = [f['name'] for f in active_fertilizers]
@@ -2733,10 +2885,25 @@ def get_actual_grow_time(bed: PlantationBed) -> int:
     best_factor = _best_growth_factor_from_bed(bed)
     if best_factor is not None:
         try:
-            return int(base_grow_time * float(best_factor))
+            grow_time = int(base_grow_time * float(best_factor))
+            try:
+                se = (bed.status_effect or '').strip().lower()
+            except Exception:
+                se = ''
+            if se == 'weeds':
+                lvl = int(getattr(bed, 'status_effect_level', 1) or 1)
+                grow_time = int(grow_time * (1.0 + 0.1 * max(1, lvl)))
+            return grow_time
         except Exception:
             return base_grow_time
 
+    try:
+        se = (bed.status_effect or '').strip().lower()
+    except Exception:
+        se = ''
+    if se == 'weeds':
+        lvl = int(getattr(bed, 'status_effect_level', 1) or 1)
+        return int(base_grow_time * (1.0 + 0.1 * max(1, lvl)))
     return base_grow_time
 
 
@@ -2747,6 +2914,11 @@ def _update_bed_ready_if_due(dbs, bed: PlantationBed) -> bool:
     """
     try:
         if bed and bed.state == 'growing' and bed.seed_type and bed.planted_at:
+            try:
+                if (bed.status_effect or '').strip().lower() == 'drought' and int(getattr(bed, 'water_count', 0) or 0) <= 0:
+                    return False
+            except Exception:
+                pass
             now_ts = int(time.time())
             actual_grow_time = get_actual_grow_time(bed)
             
@@ -2803,6 +2975,18 @@ def plant_seed(user_id: int, bed_index: int, seed_type_id: int) -> dict:
         except Exception:
             pass
         try:
+            bed.status_effect_level = 1
+            bed.status_effect_applied_at = 0
+            bed.status_effect_expires_at = 0
+        except Exception:
+            pass
+        try:
+            bed.status_effect_level = 1
+            bed.status_effect_applied_at = 0
+            bed.status_effect_expires_at = 0
+        except Exception:
+            pass
+        try:
             if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
                 for bf in list(bed.active_fertilizers):
                     dbs.delete(bf)
@@ -2850,8 +3034,114 @@ def _water_bed_core(dbs, bed: PlantationBed) -> dict:
 
     bed.last_watered_at = now_ts
     bed.water_count = int(bed.water_count or 0) + 1
+    try:
+        if (bed.status_effect or '').strip().lower() == 'drought':
+            lvl = int(getattr(bed, 'status_effect_level', 1) or 1)
+            if lvl > 1:
+                bed.status_effect_level = lvl - 1
+            else:
+                bed.status_effect = None
+                bed.status_effect_level = 1
+                bed.status_effect_applied_at = 0
+                bed.status_effect_expires_at = 0
+    except Exception:
+        pass
     _update_bed_ready_if_due(dbs, bed)
     return {"ok": True, "bed_state": bed.state, "water_interval_sec": interval}
+
+
+def _clear_expired_status_effect(bed: PlantationBed, now_ts: int) -> bool:
+    try:
+        exp = int(getattr(bed, 'status_effect_expires_at', 0) or 0)
+        if exp > 0 and now_ts >= exp:
+            bed.status_effect = None
+            bed.status_effect_level = 1
+            bed.status_effect_applied_at = 0
+            bed.status_effect_expires_at = 0
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def apply_negative_effects_job() -> dict:
+    """Фоновое применение негативных эффектов к растущим грядкам."""
+    dbs = SessionLocal()
+    try:
+        now_ts = int(time.time())
+        chance = float(get_setting_float('plantation_negative_event_chance', PLANTATION_NEG_EVENT_CHANCE))
+        max_active = float(get_setting_float('plantation_negative_event_max_active', PLANTATION_NEG_EVENT_MAX_ACTIVE))
+        duration = int(get_setting_int('plantation_negative_event_duration_sec', PLANTATION_NEG_EVENT_DURATION_SEC))
+        if chance <= 0 or max_active <= 0:
+            return {"ok": True, "applied": 0}
+
+        beds = (
+            dbs.query(PlantationBed)
+            .filter(PlantationBed.state == 'growing')
+            .all()
+        )
+        total = len(beds)
+        if total <= 0:
+            return {"ok": True, "applied": 0}
+
+        active = 0
+        updated = False
+        for b in beds:
+            try:
+                if _clear_expired_status_effect(b, now_ts):
+                    updated = True
+                    continue
+            except Exception:
+                pass
+            if (getattr(b, 'status_effect', None) or ''):
+                active += 1
+        max_active_abs = int(max(1, int(round(total * max_active))))
+        if active >= max_active_abs:
+            return {"ok": True, "applied": 0, "reason": "limit"}
+
+        applied = 0
+        effects = ['weeds', 'pests', 'drought']
+        weights = [0.4, 0.3, 0.3]
+        for bed in beds:
+            if applied + active >= max_active_abs:
+                break
+            if (getattr(bed, 'status_effect', None) or ''):
+                continue
+            if random.random() > chance:
+                continue
+            effect = random.choices(effects, weights=weights, k=1)[0]
+            bed.status_effect = effect
+            bed.status_effect_level = 1
+            bed.status_effect_applied_at = now_ts
+            bed.status_effect_expires_at = now_ts + duration if duration > 0 else 0
+            applied += 1
+            try:
+                dbs.add(PlantationStatusEvent(
+                    bed_id=bed.id,
+                    owner_id=bed.owner_id,
+                    effect=effect,
+                    level=1,
+                    applied_at=now_ts,
+                    expires_at=bed.status_effect_expires_at,
+                    source='system',
+                ))
+            except Exception:
+                pass
+
+        if applied or updated:
+            dbs.commit()
+        return {"ok": True, "applied": int(applied)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        try:
+            dbs.close()
+        except Exception:
+            pass
 
 
 def _farmer_day_int(ts: int | None = None) -> int:
@@ -3095,7 +3385,21 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
                 'pests': 0.8,
                 'drought': 0.85,
             }
-            yield_mult *= penalty_map.get(se, 0.95)
+            try:
+                if fert_effect_types and 'resilience' in fert_effect_types:
+                    penalty_map = {
+                        'weeds': 0.95,
+                        'pests': 0.9,
+                        'drought': 0.93,
+                    }
+            except Exception:
+                pass
+            try:
+                lvl = int(getattr(bed, 'status_effect_level', 1) or 1)
+            except Exception:
+                lvl = 1
+            penalty = penalty_map.get(se, 0.95)
+            yield_mult *= (penalty ** max(1, lvl))
 
         amount = max(0, int(round(base_amount * yield_mult)))
         if base_amount > 0 and amount == 0:
@@ -3261,6 +3565,7 @@ def harvest_bed(user_id: int, bed_index: int) -> dict:
                 "fertilizer_active": fert_applied,
                 "yield_multiplier": yield_mult,
                 "status_effect": se,
+                "status_effect_level": int(getattr(bed, 'status_effect_level', 1) or 1),
                 "water_count": wc,
             },
         }
@@ -5598,6 +5903,15 @@ def ensure_schema():
         if 'plantation_index' not in cols_drinks:
             conn.exec_driver_sql("ALTER TABLE energy_drinks ADD COLUMN plantation_index INTEGER")
 
+        # Обновления для fertilizers
+        try:
+            res_ferts = conn.exec_driver_sql("PRAGMA table_info(fertilizers)")
+            cols_ferts = [row[1] for row in res_ferts]
+        except Exception:
+            cols_ferts = []
+        if 'effect_type' not in cols_ferts:
+            conn.exec_driver_sql("ALTER TABLE fertilizers ADD COLUMN effect_type TEXT")
+
         # Обновления для admin_users
         res_adm = conn.exec_driver_sql("PRAGMA table_info(admin_users)")
         cols_adm = [row[1] for row in res_adm]
@@ -5677,6 +5991,12 @@ def ensure_schema():
                 conn.exec_driver_sql("ALTER TABLE plantation_beds ADD COLUMN fertilizer_applied_at INTEGER DEFAULT 0")
             if 'status_effect' not in cols_beds:
                 conn.exec_driver_sql("ALTER TABLE plantation_beds ADD COLUMN status_effect TEXT")
+            if 'status_effect_level' not in cols_beds:
+                conn.exec_driver_sql("ALTER TABLE plantation_beds ADD COLUMN status_effect_level INTEGER DEFAULT 1")
+            if 'status_effect_applied_at' not in cols_beds:
+                conn.exec_driver_sql("ALTER TABLE plantation_beds ADD COLUMN status_effect_applied_at INTEGER DEFAULT 0")
+            if 'status_effect_expires_at' not in cols_beds:
+                conn.exec_driver_sql("ALTER TABLE plantation_beds ADD COLUMN status_effect_expires_at INTEGER DEFAULT 0")
             # Индекс для ускорения выборок по удобрениям
             try:
                 conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_plantation_fertilizer ON plantation_beds(fertilizer_id)")
@@ -5685,6 +6005,14 @@ def ensure_schema():
         except Exception:
             # Если таблицы plantation_beds ещё нет — она будет создана выше через Base.metadata.create_all
             pass
+
+
+    try:
+        ensure_fertilizer_effect_types()
+    except Exception:
+        pass
+
+
 
 def get_receipt_by_id(receipt_id: int) -> PurchaseReceipt | None:
     dbs = SessionLocal()
