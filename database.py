@@ -32,6 +32,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=
 Base = declarative_base()
 
 logger = logging.getLogger(__name__)
+PLANTATION_PROTECTION_SLOT_MAX = 1
 
 # --- Описание таблиц в базе данных ---
 
@@ -603,6 +604,17 @@ FERT_EFFECTS = {
     'resilience': {'multiplier': 1.08, 'growth_factor': None, 'rarity_group': 'basic'},
     'basic': {'multiplier': 1.16, 'growth_factor': None, 'rarity_group': 'basic'},
 }
+
+
+def _fert_yield_multiplier(effect_type: str) -> float:
+    """Return fertilizer contribution to yield multiplier.
+    Quality/protection effects should not increase amount directly.
+    """
+    et = str(effect_type or 'basic')
+    if et in ('quality', 'resilience'):
+        return 1.0
+    cfg = FERT_EFFECTS.get(et, FERT_EFFECTS['basic'])
+    return float(cfg.get('multiplier', 1.0) or 1.0)
 
 
 def _infer_fert_effect_type(effect: str, name: str) -> str:
@@ -1708,12 +1720,20 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
         max_fert = max(1, int(get_setting_int('plantation_fertilizer_max_per_bed', int(PLANTATION_FERTILIZER_MAX_PER_BED))))
         applied = []
 
-        def _pick_fertilizer_id() -> int | None:
+        def _pick_fertilizer_id(*, want_resilience: bool) -> int | None:
+            def _row_matches(fid: int) -> bool:
+                row = inv_map.get(fid)
+                if not row or int(getattr(row, 'quantity', 0) or 0) <= 0:
+                    return False
+                fert = getattr(row, 'fertilizer', None)
+                is_res = _is_resilience_fertilizer(fert)
+                return is_res if want_resilience else (not is_res)
+
             for x in prio_ids:
-                if x in inv_map and int(getattr(inv_map[x], 'quantity', 0) or 0) > 0:
+                if _row_matches(int(x)):
                     return int(x)
             for x in inv_order:
-                if x in inv_map and int(getattr(inv_map[x], 'quantity', 0) or 0) > 0:
+                if _row_matches(int(x)):
                     return int(x)
             return None
 
@@ -1733,8 +1753,15 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
             except Exception:
                 total_count = 0
 
-            while total_count < max_fert:
-                fid = _pick_fertilizer_id()
+            try:
+                resilience_count = _count_resilience_fertilizers(bed)
+            except Exception:
+                resilience_count = 0
+            non_res_count = max(0, int(total_count) - int(resilience_count))
+
+            # Fill main fertilizer slots (non-resilience only).
+            while non_res_count < max_fert:
+                fid = _pick_fertilizer_id(want_resilience=False)
                 if not fid:
                     break
 
@@ -1771,6 +1798,7 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
                     row.quantity = 0
 
                 total_count += 1
+                non_res_count += 1
                 applied.append({'bed_index': int(getattr(bed, 'bed_index', 0) or 0), 'fertilizer_id': int(fid)})
 
                 if int(getattr(row, 'quantity', 0) or 0) <= 0:
@@ -1779,6 +1807,40 @@ def try_farmer_auto_fertilize(user_id: int) -> dict:
                     except Exception:
                         pass
 
+                if not inv_map:
+                    break
+
+            # Fill dedicated protection slot (+1) with resilience fertilizer.
+            while resilience_count < PLANTATION_PROTECTION_SLOT_MAX:
+                fid = _pick_fertilizer_id(want_resilience=True)
+                if not fid:
+                    break
+                row = inv_map.get(fid)
+                if not row or int(getattr(row, 'quantity', 0) or 0) <= 0:
+                    try:
+                        inv_map.pop(fid, None)
+                    except Exception:
+                        pass
+                    continue
+                # Extra safety: keep total within main + protection cap.
+                if total_count >= (max_fert + PLANTATION_PROTECTION_SLOT_MAX):
+                    break
+
+                dbs.add(BedFertilizer(bed_id=bed.id, fertilizer_id=fid, applied_at=now_ts))
+                try:
+                    row.quantity = int(getattr(row, 'quantity', 0) or 0) - 1
+                except Exception:
+                    row.quantity = 0
+
+                total_count += 1
+                resilience_count += 1
+                applied.append({'bed_index': int(getattr(bed, 'bed_index', 0) or 0), 'fertilizer_id': int(fid)})
+
+                if int(getattr(row, 'quantity', 0) or 0) <= 0:
+                    try:
+                        inv_map.pop(fid, None)
+                    except Exception:
+                        pass
                 if not inv_map:
                     break
 
@@ -1828,6 +1890,33 @@ def _count_total_fertilizers(bed: PlantationBed) -> int:
     if total == 0:
         try:
             if getattr(bed, 'fertilizer_id', None):
+                total = 1
+        except Exception:
+            pass
+    return int(total)
+
+
+def _is_resilience_fertilizer(fert) -> bool:
+    try:
+        return _get_fert_effect_type(fert) == 'resilience'
+    except Exception:
+        return False
+
+
+def _count_resilience_fertilizers(bed: PlantationBed) -> int:
+    total = 0
+    try:
+        if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
+            for bf in bed.active_fertilizers:
+                fert = getattr(bf, 'fertilizer', None)
+                if fert and _is_resilience_fertilizer(fert):
+                    total += 1
+    except Exception:
+        total = 0
+    if total == 0:
+        try:
+            legacy_fert = getattr(bed, 'fertilizer', None)
+            if legacy_fert and getattr(bed, 'fertilizer_id', None) and _is_resilience_fertilizer(legacy_fert):
                 total = 1
         except Exception:
             pass
@@ -2596,7 +2685,8 @@ def purchase_fertilizer(user_id: int, fertilizer_id: int, quantity: int) -> dict
 
 def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
     """Применяет удобрение к грядке. Возвращает dict: {ok, reason?, bed_state?}
-    Возможные reason: no_such_bed, not_growing, not_watered, no_such_fertilizer, no_fertilizer_in_inventory, max_fertilizers_reached
+    Возможные reason: no_such_bed, not_growing, not_watered, no_such_fertilizer, no_fertilizer_in_inventory,
+    max_fertilizers_reached, resilience_slot_occupied
     Теперь поддерживает накопление нескольких удобрений на одной грядке (лимит задаётся в настройках).
     Требует, чтобы растение было полито хотя бы один раз (water_count > 0).
     """
@@ -2636,8 +2726,19 @@ def apply_fertilizer(user_id: int, bed_index: int, fertilizer_id: int) -> dict:
         except Exception:
             total_count = 0
         max_fert = max(1, int(get_setting_int('plantation_fertilizer_max_per_bed', int(PLANTATION_FERTILIZER_MAX_PER_BED))))
-        if total_count >= max_fert:
-            return {"ok": False, "reason": "max_fertilizers_reached", "bed_state": bed.state}
+        resilience_count = _count_resilience_fertilizers(bed)
+        non_resilience_count = max(0, int(total_count) - int(resilience_count))
+        is_resilience = _is_resilience_fertilizer(fert)
+
+        if is_resilience:
+            # Dedicated +1 protection slot: only one resilience fertilizer per bed.
+            if resilience_count >= PLANTATION_PROTECTION_SLOT_MAX:
+                return {"ok": False, "reason": "resilience_slot_occupied", "bed_state": bed.state}
+            if total_count >= (max_fert + PLANTATION_PROTECTION_SLOT_MAX):
+                return {"ok": False, "reason": "max_fertilizers_reached", "bed_state": bed.state}
+        else:
+            if non_resilience_count >= max_fert:
+                return {"ok": False, "reason": "max_fertilizers_reached", "bed_state": bed.state}
 
         inv = (
             dbs.query(FertilizerInventory)
@@ -2825,8 +2926,7 @@ def get_fertilizer_status(bed: PlantationBed, check_duration: bool = True) -> di
                     effect = getattr(fert, 'effect', '') or ''
                     
                     effect_type = _get_fert_effect_type(fert)
-                    cfg = FERT_EFFECTS.get(effect_type, FERT_EFFECTS['basic'])
-                    multiplier = float(cfg.get('multiplier', 1.0) or 1.0)
+                    multiplier = _fert_yield_multiplier(effect_type)
                     
                     # Добавляем бонус (без базового 1.0) к общей сумме
                     total_bonus += (multiplier - 1.0)
@@ -2849,8 +2949,7 @@ def get_fertilizer_status(bed: PlantationBed, check_duration: bool = True) -> di
                     if not check_duration or time_left > 0:
                         fert_name = getattr(legacy_fert, 'name', 'Удобрение')
                         effect_type = _get_fert_effect_type(legacy_fert)
-                        cfg = FERT_EFFECTS.get(effect_type, FERT_EFFECTS['basic'])
-                        multiplier = float(cfg.get('multiplier', 1.0) or 1.0)
+                        multiplier = _fert_yield_multiplier(effect_type)
                         total_bonus += (multiplier - 1.0)
                         active_fertilizers.append({
                             'name': fert_name,
@@ -3064,6 +3163,21 @@ def _clear_expired_status_effect(bed: PlantationBed, now_ts: int) -> bool:
     return False
 
 
+def _has_active_resilience_protection(bed: PlantationBed, now_ts: int) -> bool:
+    try:
+        for bed_fert in list(getattr(bed, 'active_fertilizers', []) or []):
+            fert = getattr(bed_fert, 'fertilizer', None)
+            if not fert or not _is_resilience_fertilizer(fert):
+                continue
+            f_dur = int(getattr(fert, 'duration_sec', 0) or 0)
+            f_appl = int(getattr(bed_fert, 'applied_at', 0) or 0)
+            if f_dur > 0 and f_appl > 0 and max(0, f_dur - (now_ts - f_appl)) > 0:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def apply_negative_effects_job() -> dict:
     """Фоновое применение негативных эффектов к растущим грядкам."""
     dbs = SessionLocal()
@@ -3077,6 +3191,7 @@ def apply_negative_effects_job() -> dict:
 
         beds = (
             dbs.query(PlantationBed)
+            .options(joinedload(PlantationBed.active_fertilizers).joinedload(BedFertilizer.fertilizer))
             .filter(PlantationBed.state == 'growing')
             .all()
         )
@@ -3106,6 +3221,8 @@ def apply_negative_effects_job() -> dict:
             if applied + active >= max_active_abs:
                 break
             if (getattr(bed, 'status_effect', None) or ''):
+                continue
+            if _has_active_resilience_protection(bed, now_ts):
                 continue
             if random.random() > chance:
                 continue

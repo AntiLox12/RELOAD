@@ -8941,6 +8941,294 @@ async def show_favorites_pick_inventory(update: Update, context: ContextTypes.DE
 
 
 # --- Приёмник: обработка продажи ---
+async def show_profile_favorites_v2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    context.user_data.pop('awaiting_favorites_search', None)
+    context.user_data.pop('awaiting_favorites_search_slot', None)
+    context.user_data.pop('favorites_last_search_query', None)
+    context.user_data.pop('favorites_last_search_slot', None)
+
+    title = t(lang, 'favorites_title')
+    inventory_items = db.get_player_inventory_with_details(user_id) or []
+    by_item_id = {int(getattr(it, 'id', 0) or 0): it for it in inventory_items}
+
+    rarity_slot_counts = {rarity: 0 for rarity in RARITY_ORDER}
+    rarity_qty_counts = {rarity: 0 for rarity in RARITY_ORDER}
+    slot_values = []
+    for i in (1, 2, 3):
+        item_id = int(getattr(player, f'favorite_drink_{i}', 0) or 0)
+        inv_item = by_item_id.get(item_id)
+        if item_id > 0 and inv_item and getattr(inv_item, 'drink', None):
+            rarity = str(getattr(inv_item, 'rarity', '') or 'Unknown')
+            qty = int(getattr(inv_item, 'quantity', 0) or 0)
+            name = str(getattr(inv_item.drink, 'name', '') or '').strip() or ("Энергетик" if lang == 'ru' else "Energy drink")
+            emoji = COLOR_EMOJIS.get(rarity, '⚫')
+            slot_values.append((i, f"{emoji} {name} x{qty}", True))
+            if rarity in rarity_slot_counts:
+                rarity_slot_counts[rarity] += 1
+                rarity_qty_counts[rarity] += max(0, qty)
+        else:
+            slot_values.append((i, t(lang, 'favorites_empty'), False))
+
+    lines = [title, "━━━━━━━━━━━━━━━━━━━", ""]
+    for i, val, _ in slot_values:
+        lines.append(t(lang, 'favorites_slot').format(n=i, value=val))
+
+    lines.append("")
+    lines.append("<b>🎨 По редкостям избранного:</b>" if lang == 'ru' else "<b>🎨 Favorite rarities:</b>")
+    for rarity in RARITY_ORDER:
+        emoji = COLOR_EMOJIS.get(rarity, '⚫')
+        slots_count = int(rarity_slot_counts.get(rarity, 0) or 0)
+        qty_count = int(rarity_qty_counts.get(rarity, 0) or 0)
+        if lang == 'ru':
+            lines.append(f"• {emoji} {rarity}: слотов {slots_count}, суммарно {qty_count} шт.")
+        else:
+            lines.append(f"• {emoji} {rarity}: slots {slots_count}, total {qty_count} pcs")
+
+    text = "\n".join(lines)
+
+    keyboard = []
+    for i, val, is_filled in slot_values:
+        keyboard.append([InlineKeyboardButton(f"{i}. {val}", callback_data=f"fav_slot_{i}")])
+        keyboard.append([InlineKeyboardButton("🔎 Поиск по названию" if lang == 'ru' else "🔎 Search by name", callback_data=f"fav_search_start_{i}")])
+        if is_filled:
+            keyboard.append([InlineKeyboardButton(f"🗑 Очистить слот {i}" if lang == 'ru' else f"🗑 Clear slot {i}", callback_data=f"fav_clear_{i}")])
+    keyboard.append([InlineKeyboardButton(t(lang, 'favorites_back_profile'), callback_data='my_profile')])
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_favorites_pick_inventory_v2(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: int, page: int = 1):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    slot = int(slot or 0)
+    if slot not in (1, 2, 3):
+        await query.answer("Ошибка" if lang == 'ru' else "Error", show_alert=True)
+        return
+
+    inventory_items = db.get_player_inventory_with_details(user_id)
+    if not inventory_items:
+        await query.answer(t(lang, 'favorites_pick_empty_inventory'), show_alert=True)
+        await show_profile_favorites_v2(update, context)
+        return
+
+    sorted_items = sorted(
+        inventory_items,
+        key=lambda i: (
+            RARITY_ORDER.index(i.rarity) if i.rarity in RARITY_ORDER else len(RARITY_ORDER),
+            i.drink.name.lower(),
+        )
+    )
+
+    total_items = len(sorted_items)
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+    start_idx = (page - 1) * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    page_items = sorted_items[start_idx:end_idx]
+
+    text = (
+        f"{t(lang, 'favorites_pick_title').format(n=slot)}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{t(lang, 'inventory')}: {total_items}\n"
+        f"{('Страница' if lang == 'ru' else 'Page')} {page}/{total_pages}"
+    )
+
+    keyboard_rows = []
+    current_row = []
+    for item in page_items:
+        display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity, '⚫')} {display_name}"
+        callback = f"fav_pick_{slot}_{item.id}_p{page}"
+        current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
+        if len(current_row) == 2:
+            keyboard_rows.append(current_row)
+            current_row = []
+    if current_row:
+        keyboard_rows.append(current_row)
+
+    if total_pages > 1:
+        prev_page = total_pages if page == 1 else page - 1
+        next_page = 1 if page == total_pages else page + 1
+        keyboard_rows.append([
+            InlineKeyboardButton("⬅️", callback_data=f"fav_pick_page_{slot}_{prev_page}"),
+            InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
+            InlineKeyboardButton("➡️", callback_data=f"fav_pick_page_{slot}_{next_page}"),
+        ])
+
+    keyboard_rows.append([InlineKeyboardButton("🔎 Поиск по названию" if lang == 'ru' else "🔎 Search by name", callback_data=f"fav_search_start_{slot}")])
+    keyboard_rows.append([InlineKeyboardButton(t(lang, 'favorites_back_profile'), callback_data='profile_favorites')])
+    reply_markup = InlineKeyboardMarkup(keyboard_rows)
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def start_favorites_search(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: int):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    slot = int(slot or 0)
+    if slot not in (1, 2, 3):
+        await query.answer("Ошибка" if lang == 'ru' else "Error", show_alert=True)
+        return
+
+    context.user_data['awaiting_favorites_search'] = True
+    context.user_data['awaiting_favorites_search_slot'] = slot
+
+    prompt_text = (
+        f"🔎 <b>{'Поиск для избранного' if lang == 'ru' else 'Search for favorite'}</b>\n\n"
+        f"{'Введите название или часть названия энергетика.' if lang == 'ru' else 'Send a drink name or part of it.'}\n"
+        f"{'Поиск нечувствителен к регистру.' if lang == 'ru' else 'Search is case-insensitive.'}"
+    )
+    kb = [[InlineKeyboardButton("❌ Отмена" if lang == 'ru' else "❌ Cancel", callback_data=f"fav_slot_{slot}")]]
+    try:
+        await query.edit_message_text(prompt_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user_id, text=prompt_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def show_favorites_search_results(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    slot: int,
+    search_query: str,
+    page: int = 1,
+):
+    user_id = update.effective_user.id
+    player = db.get_or_create_player(user_id, update.effective_user.username or update.effective_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    slot = int(slot or 0)
+    if slot not in (1, 2, 3):
+        return
+
+    inventory_items = db.get_player_inventory_with_details(user_id) or []
+    search_lower = (search_query or '').strip().lower()
+    filtered_items = [it for it in inventory_items if search_lower and search_lower in str(getattr(getattr(it, 'drink', None), 'name', '')).lower()]
+
+    context.user_data['favorites_last_search_query'] = search_query
+    context.user_data['favorites_last_search_slot'] = slot
+
+    if page < 1:
+        page = 1
+
+    if not filtered_items:
+        text = (
+            f"🔎 <b>{'Результаты поиска' if lang == 'ru' else 'Search results'}: \"{html.escape(search_query)}\"</b>\n\n"
+            f"{'❌ Ничего не найдено в инвентаре.' if lang == 'ru' else '❌ No items found in your inventory.'}"
+        )
+        kb = [
+            [InlineKeyboardButton("🔄 Новый поиск" if lang == 'ru' else "🔄 New search", callback_data=f"fav_search_start_{slot}")],
+            [InlineKeyboardButton("📋 К выбору из списка" if lang == 'ru' else "📋 Back to list", callback_data=f"fav_slot_{slot}")],
+            [InlineKeyboardButton(t(lang, 'favorites_back_profile'), callback_data='profile_favorites')],
+        ]
+        if update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        else:
+            await update.effective_message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    sorted_items = sorted(
+        filtered_items,
+        key=lambda i: (
+            RARITY_ORDER.index(i.rarity) if i.rarity in RARITY_ORDER else len(RARITY_ORDER),
+            i.drink.name.lower(),
+        )
+    )
+
+    total_items = len(sorted_items)
+    total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+    if page > total_pages:
+        page = total_pages
+
+    start_idx = (page - 1) * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    page_items = sorted_items[start_idx:end_idx]
+
+    text = (
+        f"🔎 <b>{'Результаты поиска' if lang == 'ru' else 'Search results'}: \"{html.escape(search_query)}\"</b>\n"
+        f"{'Слот' if lang == 'ru' else 'Slot'}: {slot}\n"
+        f"{'Найдено' if lang == 'ru' else 'Found'}: {total_items}\n"
+        f"{'Страница' if lang == 'ru' else 'Page'} {page}/{total_pages}\n"
+    )
+
+    kb_rows = []
+    row = []
+    for item in page_items:
+        name = item.drink.name or ("Энергетик" if lang == 'ru' else "Energy drink")
+        emoji = COLOR_EMOJIS.get(item.rarity, '⚫')
+        row.append(InlineKeyboardButton(f"{emoji} {name}", callback_data=f"fav_pick_{slot}_{item.id}_p{page}"))
+        if len(row) == 2:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+
+    if total_pages > 1:
+        prev_page = total_pages if page == 1 else page - 1
+        next_page = 1 if page == total_pages else page + 1
+        kb_rows.append([
+            InlineKeyboardButton("⬅️", callback_data=f"fav_search_page_{slot}_{prev_page}"),
+            InlineKeyboardButton(f"{page}/{total_pages}", callback_data='noop'),
+            InlineKeyboardButton("➡️", callback_data=f"fav_search_page_{slot}_{next_page}"),
+        ])
+
+    kb_rows.append([InlineKeyboardButton("🔄 Новый поиск" if lang == 'ru' else "🔄 New search", callback_data=f"fav_search_start_{slot}")])
+    kb_rows.append([InlineKeyboardButton("📋 К выбору из списка" if lang == 'ru' else "📋 Back to list", callback_data=f"fav_slot_{slot}")])
+    kb_rows.append([InlineKeyboardButton(t(lang, 'favorites_back_profile'), callback_data='profile_favorites')])
+
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode='HTML')
+    else:
+        await update.effective_message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+
+
 async def handle_sell_action(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int, sell_all: bool):
     """Обрабатывает продажу одного предмета или всего количества через Приёмник."""
     query = update.callback_query
@@ -11763,9 +12051,16 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
                 info_list = []
             slots_used = len(info_list)
             total_count = _count_bed_total_fertilizers(b)
-            fert_header = f"🧪 Удобрения: {slots_used}/{max_fert} | всего {total_count}/{max_fert}"
+            protection_used = _count_bed_resilience_fertilizers(b)
+            main_used = max(0, total_count - protection_used)
+            total_limit = max_fert + 1
+            fert_header = (
+                f"🧪 Удобрения: {main_used}/{max_fert} | "
+                f"🛡️ защита {protection_used}/1 | "
+                f"всего {total_count}/{total_limit}"
+            )
             fert_lines.append(fert_header)
-            if total_count >= max_fert:
+            if total_count >= total_limit:
                 fert_lines.append("⚠️ Лимит удобрений исчерпан до сбора")
 
             try:
@@ -11799,7 +12094,7 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
                     'basic': '🧪',
                 }
 
-                for fi in info_list[:3]:
+                for fi in info_list:
                     try:
                         fn = html.escape(str(fi.get('name') or 'Удобрение'))
                         mult = float(fi.get('multiplier') or 1.0)
@@ -11809,8 +12104,6 @@ async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_
                         fert_lines.append(f"• {fn} {ico} x{mult:.2f} — {_fmt_time(tl)}")
                     except Exception:
                         continue
-                if len(info_list) > 3:
-                    fert_lines.append(f"• …и ещё {len(info_list) - 3}")
             else:
                 try:
                     if growth_line and base_grow_time > 0 and actual_grow_time > 0 and actual_grow_time < base_grow_time:
@@ -12573,6 +12866,28 @@ async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes
         fertilizers = db.list_fertilizers() or []
     except Exception:
         fertilizers = []
+    if fertilizers:
+        # Hide legacy duplicates with cosmetically different names,
+        # e.g. "СуперРост" vs "Супер Рост".
+        deduped = {}
+        for fz in fertilizers:
+            name = str(getattr(fz, 'name', '') or '')
+            normalized = ''.join(name.lower().split())
+            if not normalized:
+                normalized = f"id:{int(getattr(fz, 'id', 0) or 0)}"
+            current = deduped.get(normalized)
+            if current is None:
+                deduped[normalized] = fz
+                continue
+            cur_name = str(getattr(current, 'name', '') or '')
+            new_has_space = (' ' in name)
+            cur_has_space = (' ' in cur_name)
+            if new_has_space and not cur_has_space:
+                deduped[normalized] = fz
+            elif new_has_space == cur_has_space:
+                if int(getattr(fz, 'id', 0) or 0) < int(getattr(current, 'id', 0) or 0):
+                    deduped[normalized] = fz
+        fertilizers = sorted(deduped.values(), key=lambda x: int(getattr(x, 'id', 0) or 0))
     
     try:
         inv = db.get_fertilizer_inventory(user.id) or []
@@ -12948,7 +13263,9 @@ async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_
             elif reason == 'no_fertilizer_in_inventory':
                 await query.answer('Нет такого удобрения в инвентаре', show_alert=True)
             elif reason == 'max_fertilizers_reached':
-                await query.answer(f'Достигнут лимит удобрений (макс. {max_fert} на грядку)', show_alert=True)
+                await query.answer(f'Достигнут лимит удобрений (макс. {max_fert} + 1 защитный слот)', show_alert=True)
+            elif reason == 'resilience_slot_occupied':
+                await query.answer('Защитный слот уже занят. На грядку доступен только 1 защитный эффект.', show_alert=True)
             else:
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         else:
@@ -12979,15 +13296,16 @@ async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEF
             info_list = list(fs.get('fertilizers_info', []) or [])
             used = len(info_list)
             total_count = _count_bed_total_fertilizers(bed)
-            lines.append(f"\n🧪 Сейчас активно: {used}/{max_fert} | всего {total_count}/{max_fert}")
-            if total_count >= max_fert:
+            protection_used = _count_bed_resilience_fertilizers(bed)
+            main_used = max(0, total_count - protection_used)
+            total_limit = max_fert + 1
+            lines.append(f"\n🧪 Сейчас активно: {used} | основные: {main_used}/{max_fert} | 🛡️ защита: {protection_used}/1 | всего {total_count}/{total_limit}")
+            if total_count >= total_limit:
                 lines.append("⚠️ Лимит удобрений исчерпан до сбора")
-            for fi in info_list[:3]:
+            for fi in info_list:
                 fn = html.escape(str(fi.get('name') or 'Удобрение'))
                 tl = int(fi.get('time_left') or 0)
                 lines.append(f"• {fn} — {_fmt_time(tl)}")
-            if len(info_list) > 3:
-                lines.append(f"• …и ещё {len(info_list) - 3}")
         except Exception:
             pass
     keyboard = []
@@ -13053,6 +13371,26 @@ def _count_bed_total_fertilizers(bed) -> int:
     if total == 0:
         try:
             if getattr(bed, 'fertilizer_id', None):
+                total = 1
+        except Exception:
+            pass
+    return int(total)
+
+
+def _count_bed_resilience_fertilizers(bed) -> int:
+    total = 0
+    try:
+        if hasattr(bed, 'active_fertilizers') and bed.active_fertilizers:
+            for bf in bed.active_fertilizers:
+                fert = getattr(bf, 'fertilizer', None)
+                if fert and get_fertilizer_category(fert) == 'resilience':
+                    total += 1
+    except Exception:
+        total = 0
+    if total == 0:
+        try:
+            legacy_fert = getattr(bed, 'fertilizer', None)
+            if legacy_fert and getattr(bed, 'fertilizer_id', None) and get_fertilizer_category(legacy_fert) == 'resilience':
                 total = 1
         except Exception:
             pass
@@ -16561,7 +16899,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'profile_friends':
         await show_profile_friends(update, context)
     elif data == 'profile_favorites':
-        await show_profile_favorites(update, context)
+        await show_profile_favorites_v2(update, context)
     elif data.startswith('fav_slot_'):
         query = update.callback_query
         try:
@@ -16575,6 +16913,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         lock = _get_lock(f"favorites:{user_id}")
         async with lock:
+            await show_favorites_pick_inventory_v2(update, context, slot=slot, page=1)
+            return
             player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
             lang = getattr(player, 'language', 'ru') or 'ru'
             item_id = int(getattr(player, f'favorite_drink_{slot}', 0) or 0)
@@ -16585,9 +16925,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.answer('Ошибка', show_alert=True)
                     return
                 await query.answer('✅ Удалено' if lang == 'ru' else '✅ Removed')
-                await show_profile_favorites(update, context)
+                await show_profile_favorites_v2(update, context)
             else:
-                await show_favorites_pick_inventory(update, context, slot=slot, page=1)
+                await show_favorites_pick_inventory_v2(update, context, slot=slot, page=1)
+    elif data.startswith('fav_clear_'):
+        query = update.callback_query
+        try:
+            slot = int(data.split('_')[-1])
+        except Exception:
+            slot = 0
+        if slot not in (1, 2, 3):
+            await query.answer('Ошибка', show_alert=True)
+            return
+        user_id = query.from_user.id
+        lock = _get_lock(f"favorites:{user_id}")
+        async with lock:
+            player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+            lang = getattr(player, 'language', 'ru') or 'ru'
+            res = db.clear_favorite_drink_slot(user_id, slot)
+            if not res or not res.get('ok'):
+                await query.answer('Ошибка' if lang == 'ru' else 'Error', show_alert=True)
+                return
+            await query.answer('✅ Слот очищен' if lang == 'ru' else '✅ Slot cleared')
+            await show_profile_favorites_v2(update, context)
+    elif data.startswith('fav_search_start_'):
+        query = update.callback_query
+        try:
+            slot = int(data.split('_')[-1])
+        except Exception:
+            slot = 0
+        if slot not in (1, 2, 3):
+            await query.answer('Ошибка', show_alert=True)
+            return
+        await start_favorites_search(update, context, slot=slot)
+    elif data.startswith('fav_search_page_'):
+        query = update.callback_query
+        try:
+            _, _, _, slot_str, page_str = data.split('_', 4)
+            slot = int(slot_str)
+            page = int(page_str)
+        except Exception:
+            await query.answer('Ошибка', show_alert=True)
+            return
+        search_query = str(context.user_data.get('favorites_last_search_query') or '').strip()
+        last_slot = int(context.user_data.get('favorites_last_search_slot') or 0)
+        if search_query and slot == last_slot:
+            await show_favorites_search_results(update, context, slot=slot, search_query=search_query, page=page)
+        else:
+            await show_favorites_pick_inventory_v2(update, context, slot=slot, page=1)
     elif data.startswith('fav_pick_page_'):
         query = update.callback_query
         try:
@@ -16597,7 +16982,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await query.answer('Ошибка', show_alert=True)
             return
-        await show_favorites_pick_inventory(update, context, slot=slot, page=page)
+        await show_favorites_pick_inventory_v2(update, context, slot=slot, page=page)
     elif data.startswith('fav_pick_'):
         query = update.callback_query
         try:
@@ -16626,11 +17011,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     msg = '❌ Ошибка.' if lang == 'ru' else '❌ Error.'
                 await query.answer(msg, show_alert=True)
-                await show_favorites_pick_inventory(update, context, slot=slot, page=page)
+                await show_favorites_pick_inventory_v2(update, context, slot=slot, page=page)
                 return
 
             await query.answer('✅ Сохранено' if lang == 'ru' else '✅ Saved')
-            await show_profile_favorites(update, context)
+            await show_profile_favorites_v2(update, context)
     elif data == 'friends_add_start':
         await friends_add_start(update, context)
     elif data.startswith('friends_add_search:'):
@@ -19972,6 +20357,19 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     # Проверяем, ждём ли мы ввод для поиска по инвентарю
+    if context.user_data.get('awaiting_favorites_search'):
+        context.user_data.pop('awaiting_favorites_search', None)
+        slot = int(context.user_data.get('awaiting_favorites_search_slot') or 0)
+        context.user_data.pop('awaiting_favorites_search_slot', None)
+        search_query = incoming.strip()
+        if slot not in (1, 2, 3):
+            return
+        if not search_query:
+            await msg.reply_text("❌ Пустой запрос. Попробуйте снова.")
+            return
+        await show_favorites_search_results(update, context, slot=slot, search_query=search_query, page=1)
+        return
+
     if context.user_data.get('awaiting_inventory_search'):
         # Очищаем флаг ожидания
         context.user_data.pop('awaiting_inventory_search', None)
