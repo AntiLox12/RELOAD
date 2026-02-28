@@ -1,4 +1,4 @@
-# file: Bot_new.py
+﻿# file: Bot_new.py
 
 import os
 import logging
@@ -115,6 +115,15 @@ from constants import (
 import silk_ui
 import swagashop
 import swaga_admin
+from admin_permissions import (
+    get_effective_admin_level,
+    has_admin_level,
+    has_admin_panel_access,
+    has_creator_panel_access,
+    get_required_level_for_callback,
+    ADMIN_TEXT_ACTION_LEVELS,
+    CREATOR_TEXT_ACTION_LEVELS,
+)
 # --- Настройки ---
 # Константы импортируются из constants.py
 
@@ -641,10 +650,8 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
     ]
     
-    # Добавляем кнопку "Админ панель" для Создателя и админов 3 уровня
-    is_creator = user.username and user.username in ADMIN_USERNAMES
-    is_level3_admin = db.get_admin_level(user.id) >= 3
-    if is_creator or is_level3_admin:
+    # Добавляем кнопку "Админ панель" для всех админ-уровней и Создателя
+    if has_admin_panel_access(user.id, user.username):
         keyboard.append([InlineKeyboardButton("⚙️ Админ панель", callback_data='creator_panel')])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -692,12 +699,10 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- Админ панель для Создателя ---
-
-def has_creator_panel_access(user_id: int, username: str | None) -> bool:
-    """Проверяет, имеет ли пользователь доступ к админ панели (Создатель или админ 3 уровня)."""
-    is_creator = username and username in ADMIN_USERNAMES
-    is_level3_admin = db.get_admin_level(user_id) >= 3
-    return is_creator or is_level3_admin
+# Функции прав (get_effective_admin_level, has_admin_level, has_admin_panel_access,
+# has_creator_panel_access, get_required_level_for_callback) и словари
+# (ADMIN_TEXT_ACTION_LEVELS, CREATOR_TEXT_ACTION_LEVELS) импортируются
+# из admin_permissions.py (см. строки 118-126).
 
 
 async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -707,8 +712,8 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     user = query.from_user
     
-    # Проверка доступа (Создатель или админ 3 уровня)
-    if not has_creator_panel_access(user.id, user.username):
+    # Проверка доступа (любой админский уровень или Создатель)
+    if not has_admin_panel_access(user.id, user.username):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -721,24 +726,35 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except:
         total_users = active_vip = active_vip_plus = total_admins = 0
     
-    keyboard = [
-        [InlineKeyboardButton("📈 Статистика бота", callback_data='admin_bot_stats')],
-        [InlineKeyboardButton("📊 Расширенная аналитика", callback_data='admin_analytics')],
-        [InlineKeyboardButton("👤 Управление игроками", callback_data='admin_players_menu')],
-        [InlineKeyboardButton("🎁 Быстрые выдачи", callback_data='admin_grants_menu')],
-        [InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')],
-        [InlineKeyboardButton("📦 Управление складом", callback_data='admin_stock_menu')],
-        [InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')],
-        [InlineKeyboardButton("👥 Админы", callback_data='creator_admins')],
-        [InlineKeyboardButton("📢 Рассылка", callback_data='admin_broadcast_menu')],
-        [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
-        [InlineKeyboardButton("⚙️ Настройки бота", callback_data='admin_settings_menu')],
-        [InlineKeyboardButton("🚫 Модерация", callback_data='admin_moderation_menu')],
-        [InlineKeyboardButton("📝 Логи системы", callback_data='admin_logs_menu')],
-        [InlineKeyboardButton("💼 Экономика", callback_data='admin_economy_menu')],
-        [InlineKeyboardButton("🎮 События", callback_data='admin_events_menu')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
-    ]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    admin_level = get_effective_admin_level(user.id, user.username)
+
+    # Уровень 1: обзорные разделы (без влияния на экономику/пользователей)
+    if admin_level >= 1:
+        keyboard.append([InlineKeyboardButton("📈 Статистика бота", callback_data='admin_bot_stats')])
+        keyboard.append([InlineKeyboardButton("📊 Расширенная аналитика", callback_data='admin_analytics')])
+        keyboard.append([InlineKeyboardButton("📝 Логи системы", callback_data='admin_logs_menu')])
+
+    # Уровень 2: модерация пользователей
+    if admin_level >= 2:
+        keyboard.append([InlineKeyboardButton("🚫 Модерация", callback_data='admin_moderation_menu')])
+
+    # Уровень 3: полный доступ к операционным разделам
+    if admin_level >= 3:
+        keyboard.extend([
+            [InlineKeyboardButton("👤 Управление игроками", callback_data='admin_players_menu')],
+            [InlineKeyboardButton("🎁 Быстрые выдачи", callback_data='admin_grants_menu')],
+            [InlineKeyboardButton("💎 Управление VIP", callback_data='admin_vip_menu')],
+            [InlineKeyboardButton("📦 Управление складом", callback_data='admin_stock_menu')],
+            [InlineKeyboardButton("🔧 Управление энергетиками", callback_data='admin_drinks_menu')],
+            [InlineKeyboardButton("👥 Админы", callback_data='creator_admins')],
+            [InlineKeyboardButton("📢 Рассылка", callback_data='admin_broadcast_menu')],
+            [InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')],
+            [InlineKeyboardButton("⚙️ Настройки бота", callback_data='admin_settings_menu')],
+            [InlineKeyboardButton("💼 Экономика", callback_data='admin_economy_menu')],
+            [InlineKeyboardButton("🎮 События", callback_data='admin_events_menu')],
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data='menu')])
     try:
         is_creator = bool(user.username) and (user.username in ADMIN_USERNAMES)
     except Exception:
@@ -748,7 +764,7 @@ async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     text = (
-        "⚙️ <b>Админ панель Создателя</b>\n\n"
+        "⚙️ <b>Админ панель</b>\n\n"
         f"👥 Всего пользователей: <b>{total_users}</b>\n"
         f"💎 VIP: <b>{active_vip}</b> | VIP+: <b>{active_vip_plus}</b>\n"
         f"🛡️ Администраторов: <b>{total_admins}</b>\n\n"
@@ -1093,7 +1109,7 @@ async def admin_mod_ban_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
@@ -1112,7 +1128,7 @@ async def admin_mod_unban_start(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
@@ -1131,7 +1147,7 @@ async def admin_mod_banlist_show(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     items = db.list_active_bans(limit=50)
@@ -1157,7 +1173,7 @@ async def admin_mod_check_start(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
@@ -1176,7 +1192,7 @@ async def admin_mod_history_show(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     logs = db.get_moderation_logs(limit=30)
@@ -1202,7 +1218,7 @@ async def admin_mod_warnings_menu(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = InlineKeyboardMarkup([
@@ -1220,7 +1236,7 @@ async def admin_mod_warnings_menu(update: Update, context: ContextTypes.DEFAULT_
 async def admin_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+    if not has_admin_level(query.from_user.id, query.from_user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
@@ -1238,7 +1254,7 @@ async def admin_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admin_warn_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+    if not has_admin_level(query.from_user.id, query.from_user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
@@ -1256,7 +1272,7 @@ async def admin_warn_list_start(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_warn_clear_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+    if not has_admin_level(query.from_user.id, query.from_user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
@@ -1481,11 +1497,17 @@ async def creator_handle_input(update: Update, context: ContextTypes.DEFAULT_TYP
     """Обрабатывает текстовый ввод для админ команд."""
     user = update.effective_user
     
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_panel_access(user.id, user.username):
         return
     
     action = context.user_data.get('awaiting_creator_action')
     if not action:
+        return
+
+    required_level = CREATOR_TEXT_ACTION_LEVELS.get(action, 3)
+    if not has_admin_level(user.id, user.username, required_level):
+        await update.message.reply_html("⛔ Недостаточный уровень доступа для этого действия.")
+        context.user_data.pop('awaiting_creator_action', None)
         return
     
     text_input = (update.message.text or update.message.caption or "").strip()
@@ -1525,7 +1547,7 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Обрабатывает текстовый ввод для новых админ команд (энергетики, логи, управление игроками)."""
     user = update.effective_user
     
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_panel_access(user.id, user.username):
         return
     
     action = context.user_data.get('awaiting_admin_action')
@@ -1536,6 +1558,19 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     text_input = (update.message.text or update.message.caption or "").strip()
+
+    # Ограничиваем текстовые админ-действия по единой матрице, даже если состояние уже было установлено.
+    action_required_level = ADMIN_TEXT_ACTION_LEVELS.get(action, 3)
+
+    if action and not has_admin_level(user.id, user.username, action_required_level):
+        await update.message.reply_html("⛔ Недостаточный уровень доступа для этого действия.")
+        context.user_data.pop('awaiting_admin_action', None)
+        return
+    if player_action and not has_admin_level(user.id, user.username, 3):
+        await update.message.reply_html("⛔ Недостаточный уровень доступа для этого действия.")
+        context.user_data.pop('admin_player_action', None)
+        context.user_data.pop('admin_player_id', None)
+        return
     
     if player_action == 'balance':
         await handle_player_balance(update, context, text_input)
@@ -2961,7 +2996,7 @@ async def show_bot_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -3913,7 +3948,7 @@ async def show_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5370,7 +5405,7 @@ async def show_admin_moderation_menu(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 2):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5421,7 +5456,7 @@ async def show_admin_logs_menu(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.error("show_admin_logs_menu: user is None")
             return
         
-        if not has_creator_panel_access(user.id, user.username):
+        if not has_admin_level(user.id, user.username, 1):
             await query.answer("⛔ Доступ запрещён!", show_alert=True)
             return
         
@@ -5482,7 +5517,7 @@ async def show_admin_logs_recent(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5523,7 +5558,7 @@ async def show_admin_logs_transactions(update: Update, context: ContextTypes.DEF
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5563,7 +5598,7 @@ async def show_admin_logs_casino(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5603,7 +5638,7 @@ async def show_admin_logs_purchases(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5642,7 +5677,7 @@ async def show_admin_logs_player_start(update: Update, context: ContextTypes.DEF
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -5669,7 +5704,7 @@ async def show_admin_logs_errors(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     
     user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
+    if not has_admin_level(user.id, user.username, 1):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
     
@@ -16563,6 +16598,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         await query.answer()
         return
+
+    # Централизованная проверка прав для админских callback'ов по матрице.
+    required_level = get_required_level_for_callback(data)
+    if required_level is not None:
+        actor = query.from_user
+        if not has_admin_level(actor.id, actor.username, required_level):
+            msg = "⛔ Доступ только для Создателя." if required_level >= 99 else "⛔ Недостаточный уровень доступа."
+            await query.answer(msg, show_alert=True)
+            return
 
     if data == 'menu':
         await show_menu(update, context)
