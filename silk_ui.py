@@ -603,7 +603,7 @@ async def _edit_or_send_message(query, text: str, reply_markup: InlineKeyboardMa
             await message.delete()
         except BadRequest:
             pass
-        await query.bot.send_message(
+        await query.get_bot().send_message(
             chat_id=message.chat_id,
             text=text,
             reply_markup=reply_markup,
@@ -616,8 +616,12 @@ async def _edit_or_send_message(query, text: str, reply_markup: InlineKeyboardMa
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
-        except BadRequest:
-            await query.bot.send_message(
+        except BadRequest as e:
+            # Игнорируем ошибку "сообщение не изменено" — это нормальная ситуация
+            if "Message is not modified" in str(e):
+                return
+            # Для других BadRequest ошибок — отправляем новое сообщение
+            await query.get_bot().send_message(
                 chat_id=message.chat_id,
                 text=text,
                 reply_markup=reply_markup,
