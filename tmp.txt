@@ -1,0 +1,402 @@
+126: async def _tg_call_with_retry(call, *, retries=3, base_delay=1.5, **kwargs):
+147: async def _send_photo_long(call, **kwargs):
+155: async def _send_media_group_long(call, **kwargs):
+548: async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+700: async def show_creator_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+761: async def show_admin_grants_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+796: async def show_admin_settings_autosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+827: async def show_admin_settings_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+871: async def admin_settings_set_casino_win_prob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+892: async def admin_settings_set_casino_luck_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+914: async def admin_settings_set_auto_base_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+928: async def admin_settings_set_auto_vip_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+942: async def admin_settings_set_auto_vip_plus_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+956: async def admin_player_rating_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1012: async def creator_wipe_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1036: async def creator_wipe_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1089: async def admin_mod_ban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1108: async def admin_mod_unban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1127: async def admin_mod_banlist_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1153: async def admin_mod_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1172: async def admin_mod_history_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1198: async def admin_mod_warnings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1217: async def admin_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1235: async def admin_warn_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1253: async def admin_warn_clear_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1301: async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+1334: async def show_admin_settings_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1360: async def admin_settings_set_search_cd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1374: async def admin_settings_set_bonus_cd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1387: async def creator_reset_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1418: async def creator_give_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1449: async def creator_user_stats_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1477: async def creator_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1521: async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+1960: async def handle_drink_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+1989: async def handle_drink_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2034: async def handle_drink_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2067: async def handle_drink_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2092: async def handle_logs_player(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2132: async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2167: async def handle_give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2218: async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2266: async def handle_player_search(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2289: async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2373: async def handle_player_rating(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2461: async def handle_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2503: async def handle_admin_promote(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2537: async def handle_admin_demote(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2571: async def handle_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2602: async def handle_vip_give(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2647: async def handle_vip_plus_give(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2692: async def handle_vip_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2719: async def handle_vip_plus_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2746: async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+2798: async def show_admins_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+2839: async def creator_admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+2869: async def creator_admin_promote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+2897: async def creator_admin_demote_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+2925: async def creator_admin_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+2955: async def show_bot_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3009: async def show_admin_players_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3048: async def admin_player_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3078: async def admin_players_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3144: async def admin_players_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3192: async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE, player_id: int = None):
+3292: async def admin_player_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3348: async def admin_player_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3412: async def admin_player_logs_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3473: async def admin_player_selyuki_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3548: async def admin_player_reset_bonus_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3590: async def show_admin_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3621: async def show_admin_stock_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3674: async def show_admin_broadcast_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3707: async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3736: async def admin_vip_give_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3766: async def admin_vip_plus_give_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3796: async def admin_vip_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3823: async def admin_vip_plus_remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3850: async def admin_vip_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+3907: async def show_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4022: async def export_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4148: async def show_admin_drinks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4197: async def admin_drink_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4228: async def admin_drink_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4287: async def admin_drink_list_show_ids(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4323: async def admin_drink_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4350: async def admin_drink_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4382: async def admin_drink_rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4402: async def admin_drink_redesc_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4422: async def admin_drink_update_photo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4442: async def admin_drink_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4470: async def admin_promo_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4493: async def admin_promo_list_active_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4517: async def admin_promo_list_all_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4542: async def admin_promo_deactivate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4560: async def admin_promo_stats_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4580: async def handle_promo_create(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4638: async def handle_promo_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4655: async def admin_promo_wizard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4678: async def handle_promo_wiz_code(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4712: async def promo_wiz_kind_select(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
+4739: async def handle_promo_wiz_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4797: async def promo_wiz_rarity_select(update: Update, context: ContextTypes.DEFAULT_TYPE, rarity: str):
+4837: async def handle_promo_wiz_max_uses(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4858: async def handle_promo_wiz_per_user(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4879: async def handle_promo_wiz_expires(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+4917: async def promo_wiz_active_select(update: Update, context: ContextTypes.DEFAULT_TYPE, active: bool):
+4951: async def promo_wiz_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4984: async def promo_wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+4993: async def admin_promo_deactivate_pick_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5038: async def admin_promo_deactivate_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, promo_id: int):
+5074: async def admin_promo_deactivate_do(update: Update, context: ContextTypes.DEFAULT_TYPE, promo_id: int):
+5092: async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
+5113: async def handle_admin_broadcast_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, caption_input: str):
+5144: async def show_admin_promo_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5187: async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5229: async def show_admin_settings_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5256: async def admin_settings_set_fertilizer_max_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5270: async def show_admin_settings_negative_effects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5306: async def admin_settings_set_neg_interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5320: async def admin_settings_set_neg_chance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5334: async def admin_settings_set_neg_max_active_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5348: async def admin_settings_set_neg_duration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5364: async def show_admin_moderation_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5406: async def show_admin_logs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5476: async def show_admin_logs_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5517: async def show_admin_logs_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5557: async def show_admin_logs_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5597: async def show_admin_logs_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5636: async def show_admin_logs_player_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5663: async def show_admin_logs_errors(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5702: async def show_admin_economy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5744: async def show_admin_events_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+5785: async def search_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+5792: async def plantation_water_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+5912: async def global_farmer_harvest_job(context: ContextTypes.DEFAULT_TYPE):
+6004: async def global_farmer_fertilize_job(context: ContextTypes.DEFAULT_TYPE):
+6020: async def global_negative_effects_job(context: ContextTypes.DEFAULT_TYPE):
+6034: async def farmer_summary_job(context: ContextTypes.DEFAULT_TYPE):
+6066: async def plantation_harvest_job(context: ContextTypes.DEFAULT_TYPE):
+6107: async def snooze_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+6146: async def _send_auto_search_summary(user_id: int, player: Player, context: ContextTypes.DEFAULT_TYPE, reason: str = 'limit'):
+6186: async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
+6455: async def silk_harvest_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+6483: async def send_silk_harvest_notification(context: ContextTypes.DEFAULT_TYPE, user_id: int, plantations: list):
+6526: async def _perform_energy_search(user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE):
+6779: async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+6877: async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, selected_reward: str) -> None:
+6960: async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TYPE, already_answered: bool = False) -> None:
+7047: async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+7293: async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+7406: async def start_inventory_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+7437: async def show_inventory_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE, search_query: str, page: int = 1):
+7568: async def inventory_search_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+7581: async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+7824: async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+7976: async def show_profile_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
+8028: async def friends_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+8050: async def friends_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE, search_query: str, page: int = 0):
+8138: async def friends_add_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+8180: async def friends_requests_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+8221: async def friends_open_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, friend_user_id: int):
+8296: async def friends_start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, to_user_id: int):
+8320: async def friends_request_open(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+8359: async def friends_req_accept(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+8382: async def friends_req_reject(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+8405: async def friends_list_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+8454: async def show_selyuk_farmer_fert_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+8512: async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+8574: async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+8698: async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+8810: async def show_profile_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+8859: async def show_favorites_pick_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: int, page: int = 1):
+8944: async def show_profile_favorites_v2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9018: async def show_favorites_pick_inventory_v2(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: int, page: int = 1):
+9102: async def start_favorites_search(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: int):
+9130: async def show_favorites_search_results(
+9232: async def handle_sell_action(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int, sell_all: bool):
+9293: async def handle_sell_all_but_one(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int):
+9341: async def handle_sell_absolutely_all_but_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9389: async def receiver_sell_all_confirm_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9411: async def receiver_sell_all_confirm_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9432: async def handle_sell_all_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9490: async def show_extra_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9539: async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9595: async def show_casino_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+9655: async def show_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str):
+9673: async def show_game_choice_screen(update, context, game_type: str, game_info: dict, coins: int):
+9741: async def show_bet_selection_screen(update, context, game_type: str, game_info: dict, coins: int, choice):
+9797: async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, bet_amount: int, player_choice: str = None):
+9958: async def play_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, player_choice: str, bet_amount: int):
+10265: async def show_game_result(query, user, game_info, bet_amount, win, winnings, 
+10342: async def show_blackjack_bet_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+10379: async def start_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_amount: int):
+10436: async def show_blackjack_game_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+10488: async def handle_blackjack_hit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+10514: async def handle_blackjack_stand(update: Update, context: ContextTypes.DEFAULT_TYPE):
+10548: async def handle_blackjack_double(update: Update, context: ContextTypes.DEFAULT_TYPE):
+10590: async def handle_blackjack_surrender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+10604: async def finish_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, result: str):
+10769: async def show_mines_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+10806: async def show_mines_bet_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, mines_count: int):
+10846: async def start_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, mines_count: int, bet_amount: int):
+10886: async def show_mines_game_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+10941: async def handle_mines_click(update: Update, context: ContextTypes.DEFAULT_TYPE, cell_idx: int):
+10985: async def handle_mines_cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11003: async def handle_mines_forfeit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11017: async def finish_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, result: str, exploded_cell: int = -1):
+11146: async def show_crash_bet_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11182: async def start_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, bet_amount: int):
+11235: async def show_crash_game_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+11271: async def crash_animation_loop(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str):
+11328: async def handle_crash_cashout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11348: async def finish_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, result: str):
+11431: async def finish_crash_game_internal(context: ContextTypes.DEFAULT_TYPE, user_id: int, username: str, result: str):
+11489: async def show_casino_achievements_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11523: async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
+11606: async def open_casino_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11646: async def start_custom_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11675: async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11782: async def cancel_custom_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11792: async def show_casino_after_custom_bet(msg, user, context):
+11829: async def buy_steam_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11890: async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11944: async def show_plantation_bed_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+11987: async def show_plantation_my_beds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12155: async def show_plantation_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12271: async def start_seed_custom_buy_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12297: async def start_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, seed_type_id: int):
+12338: async def seed_custom_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12374: async def seed_custom_buy_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12431: async def handle_seed_custom_qty_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12524: async def cancel_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12531: async def show_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12555: async def show_plantation_water(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12586: async def show_plantation_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+12851: async def show_plantation_fertilizers_shop(update: Update, context: ContextTypes.DEFAULT_TYPE, filter_category: str = 'all'):
+13011: async def handle_fertilizer_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int, quantity: int):
+13038: async def start_fertilizer_custom_buy_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13049: async def start_fertilizer_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int):
+13097: async def handle_fertilizer_custom_qty_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13184: async def cancel_fertilizer_custom_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13195: async def show_plantation_fertilizers_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13223: async def show_fertilizer_apply_pick_bed(update: Update, context: ContextTypes.DEFAULT_TYPE, fertilizer_id: int):
+13247: async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int, fertilizer_id: int):
+13275: async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
+13326: async def handle_plantation_buy_bed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13349: async def show_plantation_join_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13352: async def show_plantation_my_contribution(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13355: async def show_plantation_water_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13358: async def show_plantation_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13423: async def show_plantation_choose_seed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
+13444: async def handle_plantation_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, seed_type_id: int, quantity: int):
+13468: async def handle_plantation_plant(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int, seed_type_id: int):
+13579: async def handle_plantation_water(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
+13631: async def handle_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
+13758: async def handle_plantation_harvest_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13926: async def show_market_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+13957: async def show_cities_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14019: async def show_city_hightown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14070: async def show_city_rostov(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14120: async def show_city_powerlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14170: async def show_power_sematori(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14204: async def show_rostov_elite_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14270: async def handle_rostov_elite_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, item_key: str):
+14345: async def show_selyuk_farmer_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14414: async def handle_selyuk_farmer_toggle_setting(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str):
+14424: async def show_selyuk_farmer_min_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14438: async def show_selyuk_farmer_daily_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14452: async def show_selyuk_farmer_summary_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14468: async def show_selyuk_farmer_seed_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14505: async def show_selyuk_farmer_seed_list(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+14540: async def show_selyuk_farmer_seed_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+14587: async def show_power_red_cores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14612: async def show_power_glasswool_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14637: async def show_power_persimmon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14662: async def show_rostov_exchange_sept_to_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14685: async def show_rostov_exchange_sept_to_resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14708: async def show_rostov_exchange_sept_to_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14731: async def show_rostov_exchange_convert_resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14754: async def show_rostov_exchange_resource_rates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14777: async def show_rostov_exchange_daily_deals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14800: async def show_rostov_exchange_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14823: async def show_rostov_exchange_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14845: async def show_rostov_elite_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14889: async def show_rostov_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14936: async def show_rostov_hub_my_selyuki(update: Update, context: ContextTypes.DEFAULT_TYPE):
+14982: async def show_rostov_hub_selyuki_on_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15017: async def show_selyuk_type_farmer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15070: async def show_selyuk_farmer_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15129: async def handle_selyuk_buy_farmer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15154: async def handle_selyuk_farmer_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15192: async def handle_selyuk_farmer_topup(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
+15215: async def show_selyuk_farmer_howto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15244: async def show_selyuk_farmer_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15321: async def handle_selyuk_farmer_upgrade_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15346: async def show_selyuk_farmer_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15367: async def show_selyuk_type_silkmaker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15391: async def show_selyuk_type_trickster(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15415: async def show_selyuk_type_buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15439: async def show_selyuk_type_boss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15463: async def show_rostov_hub_sell_selyuk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15486: async def show_rostov_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15531: async def show_market_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15640: async def handle_shop_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, offer_index: int, page: int):
+15677: async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15741: async def show_stars_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15774: async def buy_vip(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_key: str):
+15830: async def view_receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15909: async def my_receipts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+15961: async def myreceipts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16003: async def show_stars_500(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16047: async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16144: async def show_vip_1d(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16183: async def show_vip_7d(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16222: async def show_vip_30d(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16261: async def show_bonus_tg_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16307: async def buy_stars_500(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16369: async def buy_tg_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16429: async def show_bonus_steam_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16473: async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+16487: async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+17865: async def group_register_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+17872: async def editdrink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+17919: async def send_edit_proposal_to_admin(context: ContextTypes.DEFAULT_TYPE, request_id: int, admin_chat_id: int):
+17941: async def approve_pending_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+17993: async def reject_pending_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18033: async def incadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18092: async def delrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18123: async def inceditdrink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18164: async def incdelrequest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18194: async def send_deletion_proposal_to_admin(context: ContextTypes.DEFAULT_TYPE, request_id: int, admin_chat_id: int):
+18214: async def approve_pending_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18264: async def reject_pending_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18303: async def handle_reject_reason_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18433: async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18445: async def register_group_if_needed(update: Update):
+18456: async def is_group_creator(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
+18468: async def check_group_creator_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+18481: async def check_bot_admin_rights(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> dict:
+18504: async def notify_creator_about_missing_rights(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+18550: async def send_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **kwargs):
+18567: async def reply_auto_delete_message(message, text: str, context: ContextTypes.DEFAULT_TYPE = None, **kwargs):
+18586: async def schedule_auto_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_minutes: int = 5):
+18622: async def auto_delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+18665: async def restore_scheduled_auto_deletes(application):
+18736: async def groupsettings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18760: async def debug_log_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18779: async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18813: async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18818: async def add_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18823: async def add_special(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18829: async def add_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18838: async def skip_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18842: async def finalize_addition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18889: async def addp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18901: async def addp_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18907: async def addp_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18913: async def addp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18922: async def skip_addp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18927: async def finalize_addp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+18970: async def send_proposal_to_admin(context: ContextTypes.DEFAULT_TYPE, request_id: int, admin_chat_id: int):
+19000: async def approve_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19061: async def reject_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19099: async def requests_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19156: async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19185: async def pid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19218: async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19318: async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19426: async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19441: async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19527: async def settings_lang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19539: async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_code: str):
+19548: async def toggle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19560: async def restore_plantation_reminders(application):
+19601: async def toggle_plantation_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19653: async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19715: async def show_autosell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19748: async def toggle_autosell_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE, rarity: str):
+19757: async def reset_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19769: async def reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, confirm: bool):
+19786: async def show_group_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, user_to_check: User):
+19867: async def toggle_group_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19893: async def toggle_group_auto_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+19933: async def _format_display_name(context: ContextTypes.DEFAULT_TYPE, update: Update, user_id: int, username: str | None) -> str:
+19980: async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20016: async def show_money_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20057: async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20127: async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20136: async def promo_button_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20158: async def promo_button_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20166: async def myboosts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20214: async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20602: async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20641: async def audio_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20655: async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20743: async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20816: async def send_gift_selection_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int = 1, search_query: str = None, message_id: int = None):
+20946: async def giftstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+20975: async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+21132: async def handle_select_gift(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: dict):
+21226: async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYPE, gift_id: int, accepted: bool):

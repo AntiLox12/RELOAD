@@ -113,6 +113,8 @@ from constants import (
     PLANTATION_NEG_EVENT_DURATION_SEC,
 )
 import silk_ui
+import swagashop
+import swaga_admin
 # --- Настройки ---
 # Константы импортируются из constants.py
 
@@ -633,6 +635,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(t(lang, 'inventory'), callback_data='inventory'),
             InlineKeyboardButton(t(lang, 'my_profile'), callback_data='my_profile')
         ],
+        [InlineKeyboardButton("🛒 Свага Шоп", callback_data='swaga_shop')],
         [InlineKeyboardButton("🎟 Промокод", callback_data='promo_enter')],
         # Настройки
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
@@ -6636,6 +6639,41 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             'autosell_payout': autosell_payout,
         })
 
+    # Свага-карточки: гарантированно 10 шт. за каждый поиск
+    swaga_cards_found = []
+    try:
+        from constants import SWAGA_RARITIES
+        from database import SessionLocal, SwagaCardInventory
+        swaga_drops = random.choices(list(SWAGA_RARITIES.keys()), weights=list(SWAGA_RARITIES.values()), k=10)
+        
+        # Считаем сколько каждой редкости выпало
+        drop_counts = {}
+        for sr in swaga_drops:
+            swaga_cards_found.append(sr)
+            drop_counts[sr] = drop_counts.get(sr, 0) + 1
+        
+        db_session = SessionLocal()
+        try:
+            for rarity_name, qty in drop_counts.items():
+                rec = db_session.query(SwagaCardInventory).filter_by(user_id=int(user_id), rarity=rarity_name).first()
+                if rec:
+                    rec.quantity += qty
+                else:
+                    db_session.add(SwagaCardInventory(user_id=int(user_id), rarity=rarity_name, quantity=qty))
+            db_session.commit()
+            logger.info(f"[SWAGA] Saved {len(swaga_drops)} swaga cards for user {user_id}")
+        except Exception as e:
+            db_session.rollback()
+            logger.error(f"[SWAGA] Error saving swaga cards for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            db_session.close()
+    except Exception as e:
+        logger.error(f"[SWAGA] Error generating Swaga Cards for user {user_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
     # Обновляем игрока: фиксируем время поиска, новый баланс и рейтинг
     new_rating = db.increment_rating(user_id, 1)
     db.update_player(user_id, last_search=current_time, coins=coins_after)
@@ -6707,6 +6745,14 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
         if new_rating is not None:
             caption_lines.append(f"⭐ <b>Рейтинг:</b> {new_rating}")
+            
+        if swaga_cards_found:
+            swaga_counts = {}
+            for seq in swaga_cards_found:
+                swaga_counts[seq] = swaga_counts.get(seq, 0) + 1
+            swaga_text = ", ".join([f"{c}x {st}" for st, c in swaga_counts.items()])
+            caption_lines.append(f"🎫 <b>Свага-карточки (10):</b> {swaga_text}")
+            
         caption_lines.append("")
         caption_lines.append(f"<i>{found_drink.description}</i>")
     else:
@@ -6752,6 +6798,13 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
         if new_rating is not None:
             caption_lines.append(f"⭐ <b>Рейтинг:</b> {new_rating}")
+
+        if swaga_cards_found:
+            swaga_counts = {}
+            for seq in swaga_cards_found:
+                swaga_counts[seq] = swaga_counts.get(seq, 0) + 1
+            swaga_text = ", ".join([f"{c}x {st}" for st, c in swaga_counts.items()])
+            caption_lines.append(f"🎫 <b>Свага-карточки (10):</b> {swaga_text}")
 
     caption = "\n".join(caption_lines)
     image_paths: list[str | None] = []
@@ -16513,6 +16566,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'menu':
         await show_menu(update, context)
+    elif data == 'swaga_shop':
+        await swagashop.show_swaga_shop(update, context)
+    elif data == 'swaga_cards_inv':
+        await swagashop.show_swaga_cards_inv(update, context)
+    elif data == 'swaga_chests_inv':
+        await swagashop.show_swaga_chests_inv(update, context)
+    elif data == 'swaga_tracks_inv':
+        await swagashop.show_swaga_tracks_inv(update, context, page=1)
+    elif data.startswith('swaga_exchange_'):
+        rarity = data.split('swaga_exchange_')[1]
+        await swagashop.handle_swaga_exchange(update, context, rarity)
+    elif data.startswith('swaga_open_'):
+        rarity = data.split('swaga_open_')[1]
+        await swagashop.handle_swaga_open_chest(update, context, rarity)
+    elif data.startswith('swaga_tracks_page_'):
+        page = int(data.split('swaga_tracks_page_')[1])
+        await swagashop.show_swaga_tracks_inv(update, context, page=page)
+    elif data.startswith('swaga_play_'):
+        track_id = int(data.split('swaga_play_')[1])
+        await swagashop.handle_swaga_play_track(update, context, track_id)
     elif data == 'promo_enter':
         await promo_button_start(update, context)
     elif data == 'promo_cancel':
@@ -21526,6 +21599,13 @@ def main():
     application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("groupsettings", groupsettings_command))
+
+    # Свага Команды
+    application.add_handler(CommandHandler("swagashop", swagashop.show_swaga_shop))
+    application.add_handler(CommandHandler("swagainv", swagashop.show_swaga_shop))
+    application.add_handler(swaga_admin.addswaga_conv_handler)
+    application.add_handler(CommandHandler("giveswagacards", swaga_admin.giveswagacards_command))
+    application.add_handler(CommandHandler("swagaid", swaga_admin.swagaid_command))
     
     # Логируем информацию о боте после старта (диагностика: верный ли бот запущен)
     async def _log_bot_info(context: ContextTypes.DEFAULT_TYPE):

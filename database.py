@@ -755,7 +755,52 @@ class GiftRestriction(Base):
     )
 
 
-# --- Функции для взаимодействия с базой данных ---
+# --- Swaga ---
+
+class SwagaCardInventory(Base):
+    __tablename__ = 'swaga_card_inventory'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    rarity = Column(String, index=True)
+    quantity = Column(Integer, default=0)
+
+    __table_args__ = (
+        Index('idx_swaga_card_user_rarity', 'user_id', 'rarity', unique=True),
+    )
+
+class SwagaChestInventory(Base):
+    __tablename__ = 'swaga_chest_inventory'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    rarity = Column(String, index=True)
+    quantity = Column(Integer, default=0)
+
+    __table_args__ = (
+        Index('idx_swaga_chest_user_rarity', 'user_id', 'rarity', unique=True),
+    )
+
+class SwagaTrack(Base):
+    __tablename__ = 'swaga_tracks'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String)
+    description = Column(String)
+    photo_file_id = Column(String)
+    audio_file_id = Column(String)
+    rarity = Column(String, index=True)
+    created_at = Column(Integer, default=lambda: int(time.time()))
+
+class PlayerSwagaTrack(Base):
+    __tablename__ = 'player_swaga_tracks'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, ForeignKey('players.user_id'), index=True)
+    track_id = Column(Integer, ForeignKey('swaga_tracks.id'), index=True)
+    received_at = Column(Integer, default=lambda: int(time.time()))
+
+    __table_args__ = (
+        Index('idx_player_swaga_track_unique', 'user_id', 'track_id', unique=True),
+    )
+
+# --- Функции для взаимодействия с базы данных ---
 
 def create_db_and_tables():
     """Создает файл базы данных и все таблицы, если их нет."""
