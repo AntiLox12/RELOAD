@@ -262,6 +262,7 @@ TEXTS = {
         'ru': '⚡ <b>Добро пожаловать, {user}!</b>\n\n'
               '💰 <b>Баланс:</b> {coins} септимов\n'
               '🔋 <b>Энергетиков:</b> {energy_count}\n'
+              '🎵 <b>Любимый трек:</b> {favorite_track}\n'
               '⭐ <b>Рейтинг:</b> {rating}\n'
               '{vip_status}\n'
               '━━━━━━━━━━━━━━━━\n'
@@ -269,6 +270,7 @@ TEXTS = {
         'en': '⚡ <b>Welcome, {user}!</b>\n\n'
               '💰 <b>Balance:</b> {coins} septims\n'
               '🔋 <b>Energy drinks:</b> {energy_count}\n'
+              '🎵 <b>Favorite track:</b> {favorite_track}\n'
               '⭐ <b>Rating:</b> {rating}\n'
               '{vip_status}\n'
               '━━━━━━━━━━━━━━━━\n'
@@ -625,6 +627,33 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем количество энергетиков в инвентаре
     energy_count = len(db.get_player_inventory_with_details(user.id))
 
+    favorite_track_display = "Не выбран" if lang == 'ru' else "Not set"
+    fav_track_id = int(getattr(player, 'favorite_swaga_track_id', 0) or 0)
+    if fav_track_id > 0:
+        try:
+            from constants import SWAGA_COLOR_EMOJIS
+        except Exception:
+            SWAGA_COLOR_EMOJIS = {}
+
+        dbs = db.SessionLocal()
+        try:
+            owns = bool(dbs.query(db.PlayerSwagaTrack).filter_by(user_id=int(user.id), track_id=int(fav_track_id)).first())
+            if owns:
+                tr = dbs.query(db.SwagaTrack).filter_by(id=int(fav_track_id)).first()
+            else:
+                tr = None
+        finally:
+            dbs.close()
+
+        if tr:
+            emoji = SWAGA_COLOR_EMOJIS.get(getattr(tr, 'rarity', ''), '⚫')
+            favorite_track_display = f"{emoji} {html.escape(str(getattr(tr, 'name', '') or ''))}"
+        else:
+            try:
+                db.update_player(int(user.id), favorite_swaga_track_id=0)
+            except Exception:
+                pass
+
     # Улучшенная структура кнопок
     bonus_info_label = "ℹ️ Инфо" if lang != 'en' else "ℹ️ Info"
     keyboard = [
@@ -660,6 +689,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user=user.mention_html(),
         coins=player.coins,
         energy_count=energy_count,
+        favorite_track=favorite_track_display,
         rating=int(getattr(player, 'rating', 0) or 0),
         vip_status=vip_status_text
     )
@@ -6674,12 +6704,13 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             'autosell_payout': autosell_payout,
         })
 
-    # Свага-карточки: гарантированно 10 шт. за каждый поиск
+    # Свага-карточки: 10 шт. за каждый найденный энергетик (джекпот x2 => 20)
+    swaga_cards_total = 10 * int(found_count or 1)
     swaga_cards_found = []
     try:
         from constants import SWAGA_RARITIES
         from database import SessionLocal, SwagaCardInventory
-        swaga_drops = random.choices(list(SWAGA_RARITIES.keys()), weights=list(SWAGA_RARITIES.values()), k=10)
+        swaga_drops = random.choices(list(SWAGA_RARITIES.keys()), weights=list(SWAGA_RARITIES.values()), k=swaga_cards_total)
         
         # Считаем сколько каждой редкости выпало
         drop_counts = {}
@@ -6786,7 +6817,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             for seq in swaga_cards_found:
                 swaga_counts[seq] = swaga_counts.get(seq, 0) + 1
             swaga_text = ", ".join([f"{c}x {st}" for st, c in swaga_counts.items()])
-            caption_lines.append(f"🎫 <b>Свага-карточки (10):</b> {swaga_text}")
+            caption_lines.append(f"🎫 <b>Свага-карточки ({swaga_cards_total}):</b> {swaga_text}")
             
         caption_lines.append("")
         caption_lines.append(f"<i>{found_drink.description}</i>")
@@ -6839,7 +6870,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             for seq in swaga_cards_found:
                 swaga_counts[seq] = swaga_counts.get(seq, 0) + 1
             swaga_text = ", ".join([f"{c}x {st}" for st, c in swaga_counts.items()])
-            caption_lines.append(f"🎫 <b>Свага-карточки (10):</b> {swaga_text}")
+            caption_lines.append(f"🎫 <b>Свага-карточки ({swaga_cards_total}):</b> {swaga_text}")
 
     caption = "\n".join(caption_lines)
     image_paths: list[str | None] = []
@@ -8035,12 +8066,14 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip_label = "👑 VIP" if lang == 'ru' else "👑 VIP"
     vip_plus_label = f"{VIP_PLUS_EMOJI} VIP+"
     favorites_label = t(lang, 'favorite_energy_drinks')
+    fav_track_label = "🎵 Любимый трек" if lang == 'ru' else "🎵 Favorite track"
     back_label = "🔙 В меню" if lang == 'ru' else "🔙 Menu"
 
     keyboard = [
         [InlineKeyboardButton(friends_label, callback_data='profile_friends')],
         [InlineKeyboardButton(stats_label, callback_data='profile_stats')],
         [InlineKeyboardButton(boosts_label, callback_data='profile_boosts')],
+        [InlineKeyboardButton(fav_track_label, callback_data='profile_favtrack')],
         [InlineKeyboardButton(favorites_label, callback_data='profile_favorites')],
         [InlineKeyboardButton(promo_label, callback_data='promo_enter')],
         [InlineKeyboardButton(vip_label, callback_data='vip_menu'), InlineKeyboardButton(vip_plus_label, callback_data='vip_plus_menu')],
@@ -8059,6 +8092,152 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         except BadRequest:
             await context.bot.send_message(chat_id=user_id, text=profile_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def show_profile_favorite_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    user = query.from_user
+    user_id = int(user.id)
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    fav_id = int(getattr(player, 'favorite_swaga_track_id', 0) or 0)
+    track = None
+    owns = False
+
+    try:
+        from constants import SWAGA_COLOR_EMOJIS
+    except Exception:
+        SWAGA_COLOR_EMOJIS = {}
+
+    if fav_id > 0:
+        dbs = db.SessionLocal()
+        try:
+            owns = bool(dbs.query(db.PlayerSwagaTrack).filter_by(user_id=user_id, track_id=fav_id).first())
+            if owns:
+                track = dbs.query(db.SwagaTrack).filter_by(id=fav_id).first()
+        finally:
+            dbs.close()
+
+        if (not owns) or (not track):
+            try:
+                db.update_player(user_id, favorite_swaga_track_id=0)
+            except Exception:
+                pass
+            fav_id = 0
+            track = None
+
+    if track:
+        emoji = SWAGA_COLOR_EMOJIS.get(getattr(track, 'rarity', ''), '⚫')
+        track_display = f"{emoji} {html.escape(str(getattr(track, 'name', '') or ''))}"
+    else:
+        track_display = ("Не выбран" if lang == 'ru' else "Not set")
+
+    title = "🎵 <b>Любимый трек</b>" if lang == 'ru' else "🎵 <b>Favorite track</b>"
+    text = (
+        f"{title}\n\n"
+        f"Текущий: <b>{track_display}</b>\n\n"
+        f"Выбери трек из своей коллекции."
+        if lang == 'ru'
+        else f"{title}\n\nCurrent: <b>{track_display}</b>\n\nPick a track from your collection."
+    )
+
+    kb = [[InlineKeyboardButton("🎵 Выбрать трек" if lang == 'ru' else "🎵 Choose track", callback_data='favtrack_pick_page_1')]]
+    if fav_id > 0:
+        kb.append([InlineKeyboardButton("🗑 Сбросить" if lang == 'ru' else "🗑 Clear", callback_data='favtrack_clear')])
+    kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='my_profile')])
+
+    message = query.message
+    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None) or getattr(message, 'audio', None):
+        try:
+            await message.delete()
+        except BadRequest:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    else:
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def show_favorite_track_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    user = query.from_user
+    user_id = int(user.id)
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+
+    try:
+        from constants import SWAGA_COLOR_EMOJIS, SWAGA_RARITY_ORDER
+    except Exception:
+        SWAGA_COLOR_EMOJIS, SWAGA_RARITY_ORDER = {}, []
+
+    fav_id = int(getattr(player, 'favorite_swaga_track_id', 0) or 0)
+
+    dbs = db.SessionLocal()
+    tracks = []
+    try:
+        user_tracks = dbs.query(db.PlayerSwagaTrack).filter_by(user_id=user_id).all()
+        track_ids = [pt.track_id for pt in user_tracks]
+        if track_ids:
+            tracks = dbs.query(db.SwagaTrack).filter(db.SwagaTrack.id.in_(track_ids)).all()
+    finally:
+        dbs.close()
+
+    if not tracks:
+        text = "💿 У тебя нет Свага треков. Сначала открой сундуки!" if lang == 'ru' else "💿 You don't have any Swaga tracks yet. Open chests first!"
+        kb = [[InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_favtrack')]]
+        try:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    # сортировка по редкости + имени
+    rarity_rank = {r: i for i, r in enumerate(SWAGA_RARITY_ORDER or [])}
+    tracks.sort(key=lambda t: (rarity_rank.get(getattr(t, 'rarity', ''), 10_000), str(getattr(t, 'name', '') or '').lower()))
+
+    PER_PAGE = 10
+    total_pages = max(1, (len(tracks) - 1) // PER_PAGE + 1)
+    page = max(1, min(int(page or 1), total_pages))
+    start = (page - 1) * PER_PAGE
+    end = start + PER_PAGE
+    page_tracks = tracks[start:end]
+
+    title = "🎵 <b>Выбор любимого трека</b>" if lang == 'ru' else "🎵 <b>Pick favorite track</b>"
+    text = f"{title} (стр {page}/{total_pages})" if lang == 'ru' else f"{title} (page {page}/{total_pages})"
+
+    kb = []
+    for trk in page_tracks:
+        emoji = SWAGA_COLOR_EMOJIS.get(getattr(trk, 'rarity', ''), '⚫')
+        mark = "✅ " if int(getattr(trk, 'id', 0) or 0) == fav_id else ""
+        kb.append([InlineKeyboardButton(f"{mark}{emoji} {trk.name}", callback_data=f"favtrack_set_{trk.id}")])
+
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"favtrack_pick_page_{page-1}"))
+    if page < total_pages:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"favtrack_pick_page_{page+1}"))
+    if nav:
+        kb.append(nav)
+
+    kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_favtrack')])
+
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
 
 
 async def show_profile_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -16621,6 +16800,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('swaga_exchange_'):
         rarity = data.split('swaga_exchange_')[1]
         await swagashop.handle_swaga_exchange(update, context, rarity)
+    elif data.startswith('swaga_upgrade_'):
+        rarity = data.split('swaga_upgrade_')[1]
+        await swagashop.handle_swaga_upgrade(update, context, rarity)
     elif data.startswith('swaga_open_'):
         rarity = data.split('swaga_open_')[1]
         await swagashop.handle_swaga_open_chest(update, context, rarity)
@@ -17017,6 +17199,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_profile_friends(update, context)
     elif data == 'profile_favorites':
         await show_profile_favorites_v2(update, context)
+    elif data == 'profile_favtrack':
+        await show_profile_favorite_track(update, context)
+    elif data == 'favtrack_clear':
+        user_id = query.from_user.id
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+        try:
+            db.update_player(user_id, favorite_swaga_track_id=0)
+        except Exception:
+            await query.answer("Ошибка" if lang == 'ru' else "Error", show_alert=True)
+            return
+        await query.answer("✅ Сброшено" if lang == 'ru' else "✅ Cleared")
+        await show_profile_favorite_track(update, context)
+    elif data.startswith('favtrack_pick_page_'):
+        try:
+            page = int(data.split('favtrack_pick_page_')[1])
+        except Exception:
+            page = 1
+        await show_favorite_track_pick(update, context, page=page)
+    elif data.startswith('favtrack_set_'):
+        try:
+            track_id = int(data.split('favtrack_set_')[1])
+        except Exception:
+            track_id = 0
+        user_id = query.from_user.id
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+        if track_id <= 0:
+            await query.answer("Ошибка" if lang == 'ru' else "Error", show_alert=True)
+            return
+
+        dbs = db.SessionLocal()
+        try:
+            owns = bool(dbs.query(db.PlayerSwagaTrack).filter_by(user_id=int(user_id), track_id=int(track_id)).first())
+        finally:
+            dbs.close()
+        if not owns:
+            await query.answer("У тебя нет этого трека." if lang == 'ru' else "You don't own this track.", show_alert=True)
+            return
+        try:
+            db.update_player(user_id, favorite_swaga_track_id=int(track_id))
+        except Exception:
+            await query.answer("Ошибка" if lang == 'ru' else "Error", show_alert=True)
+            return
+        await query.answer("✅ Установлено" if lang == 'ru' else "✅ Set")
+        await show_profile_favorite_track(update, context)
     elif data.startswith('fav_slot_'):
         query = update.callback_query
         try:

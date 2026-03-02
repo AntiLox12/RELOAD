@@ -13,6 +13,26 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+SWAGA_CHEST_EXCHANGE_COST = 100
+SWAGA_UPGRADE_SUPER_RARE_TARGETS = {"Swaga", "Мистербист"}
+
+
+def _swaga_higher_rarity(rarity: str) -> str | None:
+    """Вернуть редкость на 1 выше (более редкую) или None."""
+    try:
+        idx = SWAGA_RARITY_ORDER.index(str(rarity))
+    except ValueError:
+        return None
+    if idx <= 0:
+        return None
+    return SWAGA_RARITY_ORDER[idx - 1]
+
+
+def _swaga_upgrade_cost(target_rarity: str) -> int:
+    """Сколько карточек нужно для апгрейда в target_rarity."""
+    return 20 if str(target_rarity) in SWAGA_UPGRADE_SUPER_RARE_TARGETS else 10
+
+
 async def show_swaga_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню магазина Сваги."""
     query = update.callback_query
@@ -26,7 +46,8 @@ async def show_swaga_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛒 <b>Свага Шоп</b>\n\n"
         "Добро пожаловать в Свага Шоп! Здесь ты можешь обменять накопленные "
         "Свага Карточки на Свага Сундуки, а также открыть их, чтобы получить уникальные треки!\n\n"
-        "<i>Курс обмена: 100 карточек = 1 сундук той же редкости.</i>"
+        "<i>Курс обмена: 100 карточек = 1 сундук той же редкости.</i>\n"
+        "<i>Апгрейд карточек: 10 карточек = 1 карточка на 1 редкость выше (в Swaga/Мистербист: 20).</i>"
     )
 
     keyboard = [
@@ -62,7 +83,11 @@ async def show_swaga_cards_inv(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         db_session.close()
 
-    text = "🎴 <b>Мои Свага Карточки</b>\n\nОбменивай 100 карточек на 1 сундук той же редкости.\n\n"
+    text = (
+        "🎴 <b>Мои Свага Карточки</b>\n\n"
+        "• Обмен на сундук: 100 карточек = 1 сундук той же редкости.\n"
+        "• Апгрейд: 10 карточек = 1 карточка на 1 редкость выше (в Swaga/Мистербист: 20).\n\n"
+    )
     has_cards = False
     keyboard = []
 
@@ -72,8 +97,22 @@ async def show_swaga_cards_inv(update: Update, context: ContextTypes.DEFAULT_TYP
         if count > 0:
             has_cards = True
             text += f"{emoji} <b>{rarity}</b>: {count} шт.\n"
-            if count >= 100:
-                keyboard.append([InlineKeyboardButton(f"🔄 Обменять 100 {emoji} {rarity}", callback_data=f"swaga_exchange_{rarity}")])
+
+            higher = _swaga_higher_rarity(rarity)
+            if higher:
+                higher_emoji = SWAGA_COLOR_EMOJIS.get(higher, '⚫')
+                upgrade_cost = _swaga_upgrade_cost(higher)
+                if count >= upgrade_cost:
+                    keyboard.append([InlineKeyboardButton(
+                        f"⬆️ {upgrade_cost} {emoji} {rarity} → 1 {higher_emoji} {higher}",
+                        callback_data=f"swaga_upgrade_{rarity}"
+                    )])
+
+            if count >= SWAGA_CHEST_EXCHANGE_COST:
+                keyboard.append([InlineKeyboardButton(
+                    f"🔄 Обменять {SWAGA_CHEST_EXCHANGE_COST} {emoji} {rarity} → 1 сундук",
+                    callback_data=f"swaga_exchange_{rarity}"
+                )])
 
     if not has_cards:
         text += "<i>У тебя пока нет карточек. Ищи энергетики!</i>\n"
@@ -98,10 +137,11 @@ async def handle_swaga_exchange(update: Update, context: ContextTypes.DEFAULT_TY
 
     db_session = db.SessionLocal()
     success = False
+    cost = SWAGA_CHEST_EXCHANGE_COST
     try:
         card_inv = db_session.query(db.SwagaCardInventory).filter_by(user_id=user_id, rarity=rarity).first()
-        if card_inv and card_inv.quantity >= 100:
-            card_inv.quantity -= 100
+        if card_inv and card_inv.quantity >= cost:
+            card_inv.quantity -= cost
             
             chest_inv = db_session.query(db.SwagaChestInventory).filter_by(user_id=user_id, rarity=rarity).first()
             if chest_inv:
@@ -122,7 +162,53 @@ async def handle_swaga_exchange(update: Update, context: ContextTypes.DEFAULT_TY
 
     if success:
         emoji = SWAGA_COLOR_EMOJIS.get(rarity, '⚫')
-        await query.answer(f"✅ Ты успешно обменял 100 карточек на 1 {emoji} сундук!", show_alert=True)
+        await query.answer(f"✅ Ты успешно обменял {cost} карточек на 1 {emoji} сундук!", show_alert=True)
+        await show_swaga_cards_inv(update, context)
+
+
+async def handle_swaga_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE, rarity: str):
+    """Апгрейд карточек: rarity -> на 1 редкость выше."""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    higher = _swaga_higher_rarity(rarity)
+    if not higher:
+        await query.answer("Эту редкость нельзя улучшить.", show_alert=True)
+        return
+
+    cost = _swaga_upgrade_cost(higher)
+
+    db_session = db.SessionLocal()
+    success = False
+    try:
+        cur = db_session.query(db.SwagaCardInventory).filter_by(user_id=user_id, rarity=rarity).first()
+        if not cur or int(cur.quantity or 0) < int(cost):
+            await query.answer("Недостаточно карточек для апгрейда!", show_alert=True)
+            return
+
+        cur.quantity -= cost
+        up = db_session.query(db.SwagaCardInventory).filter_by(user_id=user_id, rarity=higher).first()
+        if up:
+            up.quantity += 1
+        else:
+            db_session.add(db.SwagaCardInventory(user_id=user_id, rarity=higher, quantity=1))
+
+        db_session.commit()
+        success = True
+    except Exception as e:
+        try:
+            db_session.rollback()
+        except Exception:
+            pass
+        logger.error(f"Error in swaga upgrade: {e}")
+        await query.answer("Ошибка апгрейда!", show_alert=True)
+    finally:
+        db_session.close()
+
+    if success:
+        e_from = SWAGA_COLOR_EMOJIS.get(rarity, '⚫')
+        e_to = SWAGA_COLOR_EMOJIS.get(higher, '⚫')
+        await query.answer(f"✅ Апгрейд: {cost} {e_from} {rarity} → 1 {e_to} {higher}", show_alert=True)
         await show_swaga_cards_inv(update, context)
 
 
@@ -216,6 +302,7 @@ async def handle_swaga_open_chest(update: Update, context: ContextTypes.DEFAULT_
     db_session = db.SessionLocal()
     track_dropped = None
     already_owned = False
+    compensation_qty = 0
     try:
         # Выбираем случайный трек данной выпавшей редкости
         potential_tracks = db_session.query(db.SwagaTrack).filter_by(rarity=dropped_rarity).all()
@@ -228,7 +315,17 @@ async def handle_swaga_open_chest(update: Update, context: ContextTypes.DEFAULT_
                 already_owned = True
             else:
                 db_session.add(db.PlayerSwagaTrack(user_id=user_id, track_id=track_dropped.id))
-                db_session.commit()
+
+            # Компенсация за повторный дроп трека: возвращаем часть карточек редкости сундука
+            if already_owned:
+                compensation_qty = max(1, SWAGA_CHEST_EXCHANGE_COST // 2)
+                inv = db_session.query(db.SwagaCardInventory).filter_by(user_id=user_id, rarity=rarity).first()
+                if inv:
+                    inv.quantity += compensation_qty
+                else:
+                    db_session.add(db.SwagaCardInventory(user_id=user_id, rarity=rarity, quantity=compensation_qty))
+
+            db_session.commit()
     except Exception as e:
         logger.error(f"Error dropping track: {e}")
     finally:
@@ -245,7 +342,10 @@ async def handle_swaga_open_chest(update: Update, context: ContextTypes.DEFAULT_
             text += f"<i>{track_dropped.description}</i>\n"
             
         if already_owned:
-            text += f"\n<i>(У тебя уже есть этот трек, но ты можешь им наслаждаться!)</i>\n"
+            text += f"\n<i>(У тебя уже есть этот трек.)</i>\n"
+            if compensation_qty > 0:
+                chest_emoji = SWAGA_COLOR_EMOJIS.get(rarity, '⚫')
+                text += f"🎁 <b>Компенсация:</b> +{compensation_qty} {chest_emoji} {rarity} карточек\n"
         else:
             text += f"\n<i>Новая находка добавлена в коллекцию!</i>\n"
         

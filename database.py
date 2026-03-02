@@ -88,6 +88,7 @@ class Player(Base):
     favorite_drink_1 = Column(Integer, default=0)
     favorite_drink_2 = Column(Integer, default=0)
     favorite_drink_3 = Column(Integer, default=0)
+    favorite_swaga_track_id = Column(Integer, default=0)
     inventory = relationship("InventoryItem", back_populates="owner", cascade="all, delete-orphan")
 
 
@@ -6021,6 +6022,8 @@ def ensure_schema():
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_drink_2 INTEGER DEFAULT 0")
         if 'favorite_drink_3' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_drink_3 INTEGER DEFAULT 0")
+        if 'favorite_swaga_track_id' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_swaga_track_id INTEGER DEFAULT 0")
 
         if 'farmer_auto_water' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_auto_water INTEGER DEFAULT 1")
