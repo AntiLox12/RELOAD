@@ -27,6 +27,14 @@ from sqlalchemy import func
 from collections import defaultdict
 import config
 from typing import Dict
+from casino_logic import (
+    casino_adjusted_prob,
+    casino_extra_win_chance,
+    casino_roll_win,
+    parse_casino_game_choice,
+)
+import casino_handlers
+import casino_gameplay
 from fullhelp import fullhelp_command
 from admin import admin_command
 from admin2 import (
@@ -86,8 +94,6 @@ from constants import (
     CASINO_MAX_BET,
     CASINO_MIN_BET,
     CASINO_GAMES,
-    SLOT_SYMBOLS,
-    SLOT_PAYOUTS,
     CASINO_ANIMATIONS,
     CASINO_ACHIEVEMENTS,
     RECEIVER_PRICES,
@@ -9805,521 +9811,54 @@ async def show_extra_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_city_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Экран Казино в городе ХайТаун - главное меню с выбором игр."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    coins = int(getattr(player, 'coins', 0) or 0)
-    
-    # Получаем статистику казино
-    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
-    casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
-    casino_total = casino_wins + casino_losses
-    win_rate = (casino_wins / casino_total * 100) if casino_total > 0 else 0
-
-    text = (
-        "<b>🎰 Казино ХайТаун</b>\n\n"
-        f"💰 Ваш баланс: <b>{coins}</b> септимов\n"
-        f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
-        "🎮 <b>Выберите игру:</b>\n"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
-        [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
-         InlineKeyboardButton("📊 Больше/Меньше", callback_data='casino_game_high_low')],
-        [InlineKeyboardButton("🎡 Рулетка (цвет)", callback_data='casino_game_roulette_color'),
-         InlineKeyboardButton("🎯 Рулетка (число)", callback_data='casino_game_roulette_number')],
-        [InlineKeyboardButton("🎰 Слоты", callback_data='casino_game_slots')],
-        [InlineKeyboardButton("🃏 Блэкджек", callback_data='casino_game_blackjack')],
-        [InlineKeyboardButton("💣 Мины", callback_data='casino_game_mines'),
-         InlineKeyboardButton("📈 Краш", callback_data='casino_game_crash')],
-        [InlineKeyboardButton("🏀 Баскетбол", callback_data='casino_game_basketball'),
-         InlineKeyboardButton("⚽ Футбол", callback_data='casino_game_football')],
-        [InlineKeyboardButton("🎳 Боулинг", callback_data='casino_game_bowling'),
-         InlineKeyboardButton("🎯 Дартс", callback_data='casino_game_darts')],
-        [InlineKeyboardButton("🏆 Достижения", callback_data='casino_achievements'),
-         InlineKeyboardButton("📜 Правила", callback_data='casino_rules')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message = query.message
-    if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
-        try:
-            await message.delete()
-        except BadRequest:
-            pass
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
-    else:
-        try:
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        except BadRequest:
-            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+    await casino_handlers.show_city_casino_screen(update, context)
 
 
 async def show_casino_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает правила всех игр казино."""
-    query = update.callback_query
-    await query.answer()
-
-    text = (
-        "<b>📜 Правила Казино ХайТаун</b>\n\n"
-        "🎮 <b>Доступные игры:</b>\n\n"
-        
-        "🪙 <b>Монетка</b>\n"
-        "├ Выберите Орёл или Решка\n"
-        "├ Шанс: 50%\n"
-        "└ Выплата: x2\n\n"
-        
-        "🎲 <b>Кости</b>\n"
-        "├ Выберите число от 1 до 6\n"
-        "├ Шанс: ~17%\n"
-        "└ Выплата: x5.5\n\n"
-        
-        "📊 <b>Больше/Меньше</b>\n"
-        "├ Выберите больше или меньше 50\n"
-        "├ Шанс: 49%\n"
-        "└ Выплата: x1.95\n\n"
-        
-        "🎡 <b>Рулетка (цвет)</b>\n"
-        "├ Выберите Красное или Чёрное\n"
-        "├ Шанс: ~49%\n"
-        "└ Выплата: x2\n\n"
-        
-        "🎯 <b>Рулетка (число)</b>\n"
-        "├ Угадай число 0-36\n"
-        "├ Шанс: ~3%\n"
-        "└ Выплата: x35\n\n"
-        
-        "🎰 <b>Слоты</b>\n"
-        "├ Три символа в ряд\n"
-        "├ Шанс: 15%\n"
-        "└ Выплата: до x20\n\n"
-        
-        f"⚙️ <b>Лимиты:</b>\n"
-        f"• Мин. ставка: {CASINO_MIN_BET} септимов\n"
-        f"• Макс. ставка: {CASINO_MAX_BET} септимов\n\n"
-        
-        "🏆 <b>Достижения:</b>\n"
-        "Получайте награды за победы!\n\n"
-        
-        "⚠️ Играйте ответственно!"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🔙 В Казино", callback_data='city_casino')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
-    ]
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-    except BadRequest:
-        await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await casino_handlers.show_casino_rules_screen(update, context)
 
 
 # === НОВЫЕ ФУНКЦИИ ДЛЯ ИГР КАЗИНО ===
 
 async def show_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str):
     """Показывает экран выбора для конкретной игры - сначала выбор, потом ставка."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    coins = int(getattr(player, 'coins', 0) or 0)
-
-    game_info = CASINO_GAMES.get(game_type, CASINO_GAMES['coin_flip'])
-    
-    # Для игр с выбором показываем экран выбора, для слотов - сразу ставки
-    if game_type in ['coin_flip', 'dice', 'high_low', 'roulette_color', 'roulette_number']:
-        await show_game_choice_screen(update, context, game_type, game_info, coins)
-    else:  # slots и другие игры без выбора
-        await show_bet_selection_screen(update, context, game_type, game_info, coins, None)
+    await casino_handlers.show_casino_game_screen(update, context, game_type)
 
 
 async def show_game_choice_screen(update, context, game_type: str, game_info: dict, coins: int):
     """Показывает экран выбора варианта для игры."""
-    query = update.callback_query
-    user = query.from_user
-    
-    text = (
-        f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
-        f"📋 {game_info['description']}\n"
-        f"🎯 Шанс выигрыша: {int(game_info['win_prob'] * 100)}%\n"
-        f"💰 Множитель: x{game_info['multiplier']}\n\n"
-        f"💵 Ваш баланс: <b>{coins}</b> септимов\n\n"
-    )
-    
-    keyboard = []
-    
-    if game_type == 'coin_flip':
-        text += "Выберите на что ставите:"
-        keyboard = [
-            [InlineKeyboardButton("🦅 Орёл", callback_data=f'casino_choice_{game_type}_heads'),
-             InlineKeyboardButton("🪙 Решка", callback_data=f'casino_choice_{game_type}_tails')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
-        ]
-    
-    elif game_type == 'dice':
-        text += "Выберите число от 1 до 6:"
-        keyboard = [
-            [InlineKeyboardButton("1️⃣", callback_data=f'casino_choice_{game_type}_1'),
-             InlineKeyboardButton("2️⃣", callback_data=f'casino_choice_{game_type}_2'),
-             InlineKeyboardButton("3️⃣", callback_data=f'casino_choice_{game_type}_3')],
-            [InlineKeyboardButton("4️⃣", callback_data=f'casino_choice_{game_type}_4'),
-             InlineKeyboardButton("5️⃣", callback_data=f'casino_choice_{game_type}_5'),
-             InlineKeyboardButton("6️⃣", callback_data=f'casino_choice_{game_type}_6')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
-        ]
-    
-    elif game_type == 'high_low':
-        text += "Число будет больше или меньше 50?"
-        keyboard = [
-            [InlineKeyboardButton("📈 Больше 50", callback_data=f'casino_choice_{game_type}_high'),
-             InlineKeyboardButton("📉 Меньше 50", callback_data=f'casino_choice_{game_type}_low')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
-        ]
-    
-    elif game_type == 'roulette_color':
-        text += "Выберите цвет:"
-        keyboard = [
-            [InlineKeyboardButton("🔴 Красное", callback_data=f'casino_choice_{game_type}_red'),
-             InlineKeyboardButton("⚫ Чёрное", callback_data=f'casino_choice_{game_type}_black')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='city_casino')],
-        ]
-    
-    elif game_type == 'roulette_number':
-        text += "Выберите число от 0 до 36:"
-        # Показываем по 6 чисел в строке
-        keyboard = []
-        for i in range(0, 37, 6):
-            row = []
-            for num in range(i, min(i+6, 37)):
-                row.append(InlineKeyboardButton(str(num), callback_data=f'casino_choice_{game_type}_{num}'))
-            keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='city_casino')])
-    
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-    except BadRequest:
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await casino_handlers.show_game_choice_screen(update, context, game_type, game_info, coins)
 
 
 async def show_bet_selection_screen(update, context, game_type: str, game_info: dict, coins: int, choice):
     """Показывает экран выбора ставки после выбора варианта."""
-    query = update.callback_query
-    user = query.from_user
-    
-    # Формируем текст с выбором игрока
-    choice_text = ""
-    if choice:  # Если был выбор (не слоты)
-        if game_type == 'coin_flip':
-            choice_text = f"Ваш выбор: <b>{'🦅 Орёл' if choice == 'heads' else '🪙 Решка'}</b>\n"
-        elif game_type == 'dice':
-            choice_text = f"Ваше число: <b>{choice}</b>\n"
-        elif game_type == 'high_low':
-            choice_text = f"Ваш выбор: <b>{'📈 Больше 50' if choice == 'high' else '📉 Меньше 50'}</b>\n"
-        elif game_type == 'roulette_color':
-            choice_text = f"Ваш цвет: <b>{'🔴 Красное' if choice == 'red' else '⚫ Чёрное'}</b>\n"
-        elif game_type == 'roulette_number':
-            choice_text = f"Ваше число: <b>{choice}</b>\n"
-    
-    text = (
-        f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
-        f"{choice_text}"
-        f"🎯 Шанс выигрыша: {int(game_info['win_prob'] * 100)}%\n"
-        f"💰 Множитель: до x{game_info['multiplier'] if game_type != 'slots' else '10'}\n\n"
-        f"💵 Ваш баланс: <b>{coins}</b> септимов\n\n"
-        "Выберите ставку:"
-    )
-
-    # Формируем callback_data в зависимости от наличия выбора
-    if choice:
-        bet_callback = f'casino_bet_{game_type}_{choice}'
-        change_button = [InlineKeyboardButton("🔙 Изменить выбор", callback_data=f'casino_game_{game_type}')]
-    else:
-        bet_callback = f'casino_bet_{game_type}_none'
-        change_button = []
-
-    keyboard = [
-        [InlineKeyboardButton("💵 100", callback_data=f'{bet_callback}_100'),
-         InlineKeyboardButton("💵 500", callback_data=f'{bet_callback}_500')],
-        [InlineKeyboardButton("💵 1,000", callback_data=f'{bet_callback}_1000'),
-         InlineKeyboardButton("💵 5,000", callback_data=f'{bet_callback}_5000')],
-        [InlineKeyboardButton("💵 10,000", callback_data=f'{bet_callback}_10000'),
-         InlineKeyboardButton("💵 25,000", callback_data=f'{bet_callback}_25000')],
-    ]
-    
-    if change_button:
-        keyboard.append(change_button)
-    
-    keyboard.append([InlineKeyboardButton("🔙 Назад в казино", callback_data='city_casino')])
-
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-    except BadRequest:
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await casino_handlers.show_bet_selection_screen(update, context, game_type, game_info, coins, choice)
 
 
 async def play_casino_game_native(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, bet_amount: int, player_choice: str = None):
     """Играет в игру с нативной анимацией Telegram (dice)."""
-    query = update.callback_query
-    user = query.from_user
-    chat_id = user.id
-    
-    # Проверяем баланс
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
-    current_coins = int(getattr(player, 'coins', 0) or 0)
-    
-    if current_coins < bet_amount:
-        await query.answer("Недостаточно средств!", show_alert=True)
-        return
-
-    # Списываем ставку
-    db.increment_coins(user.id, -bet_amount)
-    
-    # Отправляем анимацию
-    emoji = CASINO_GAMES[game_type]['emoji']
-    try:
-        # Удаляем сообщение с меню, чтобы не мешало (опционально, но лучше оставить для контекста)
-        # await query.message.delete()
-        pass
-    except Exception:
-        pass
-
-    # Отправляем дайс
-    dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=emoji)
-    value = dice_msg.dice.value
-    
-    # Планируем удаление дайса через 8 секунд
-    async def delete_dice_later(msg, delay):
-        await asyncio.sleep(delay)
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-            
-    asyncio.create_task(delete_dice_later(dice_msg, 8))
-    
-    # Ждем анимацию
-    await asyncio.sleep(4)
-    
-    win = False
-    multiplier = 0.0
-    result_text = ""
-    base_prob = 0.0
-    
-    # Логика для разных игр
-    if game_type == 'dice':
-        # Кости: угадать число (1-6)
-        target = int(player_choice)
-        win = (value == target)
-        base_prob = 1 / 6
-        multiplier = CASINO_GAMES['dice']['multiplier']
-        result_text = f"🎲 Выпало: <b>{value}</b> (Ваш выбор: {target})"
-        
-    elif game_type == 'slots':
-        # Слоты: 1-64
-        # 64: 777 (x10)
-        # 43: Виноград (x5)
-        # 22: Лимон (x3)
-        # 1: BAR (x2)
-        base_prob = 4 / 64
-        if value == 64:
-            win = True
-            multiplier = 10.0
-            result_text = "🎰 <b>ДЖЕКПОТ! (777)</b>"
-        elif value == 43:
-            win = True
-            multiplier = 5.0
-            result_text = "🍇 <b>Виноград!</b>"
-        elif value == 22:
-            win = True
-            multiplier = 3.0
-            result_text = "🍋 <b>Лимон!</b>"
-        elif value == 1:
-            win = True
-            multiplier = 2.0
-            result_text = "🍫 <b>BAR!</b>"
-        else:
-            win = False
-            result_text = "🎰 Попробуйте ещё раз!"
-            
-    elif game_type == 'basketball':
-        # Баскетбол: 4, 5 - попадание
-        if value in [4, 5]:
-            win = True
-            multiplier = CASINO_GAMES['basketball']['multiplier']
-            result_text = "🏀 <b>Попадание!</b>"
-        else:
-            win = False
-            result_text = "🏀 Промах..."
-        base_prob = 2 / 6
-            
-    elif game_type == 'football':
-        # Футбол: 3, 4, 5 - гол
-        if value in [3, 4, 5]:
-            win = True
-            multiplier = CASINO_GAMES['football']['multiplier']
-            result_text = "⚽ <b>ГОООЛ!</b>"
-        else:
-            win = False
-            result_text = "⚽ Мимо ворот..."
-        base_prob = 3 / 6
-            
-    elif game_type == 'bowling':
-        # Боулинг: 6 - страйк
-        if value == 6:
-            win = True
-            multiplier = CASINO_GAMES['bowling']['multiplier']
-            result_text = "🎳 <b>СТРАЙК!</b>"
-        else:
-            win = False
-            result_text = f"🎳 Сбито кеглей: {value}"
-        base_prob = 1 / 6
-            
-    elif game_type == 'darts':
-        # Дартс: 6 - яблочко
-        if value == 6:
-            win = True
-            multiplier = CASINO_GAMES['darts']['multiplier']
-            result_text = "🎯 <b>В ЯБЛОЧКО!</b>"
-        else:
-            win = False
-            result_text = "🎯 Мимо центра..."
-        base_prob = 1 / 6
-
-    # Лаки-оверрайд: повышенная удача для всех нативных игр
-    if not win and base_prob > 0:
-        extra = _casino_extra_win_chance(base_prob)
-        if extra > 0 and random.random() < extra:
-            win = True
-            if multiplier <= 0:
-                # Фоллбек множителя, если его не было
-                multiplier = CASINO_GAMES.get(game_type, {}).get('multiplier', 2.0)
-            result_text += "\n🍀 Удача сработала!"
-
-    # Обработка результата
-    winnings = 0
-    if win:
-        winnings = int(bet_amount * multiplier)
-        db.increment_coins(user.id, winnings)
-        # Обновляем статистику
-        p = db.get_player(user.id)
-        db.update_player_stats(user.id, casino_wins=(p.casino_wins or 0) + 1)
-    else:
-        p = db.get_player(user.id)
-        db.update_player_stats(user.id, casino_losses=(p.casino_losses or 0) + 1)
-
-    # Проверка достижений
-    player = db.get_or_create_player(user.id, user.username)
-    achievement_bonus = check_casino_achievements(user.id, player)
-    
-    # Показываем результат
-    game_info = CASINO_GAMES[game_type]
-    
-    await show_game_result(query, user, game_info, bet_amount, win, winnings, 
-                          player.coins, result_text, achievement_bonus, context)
+    await casino_gameplay.play_casino_game_native(
+        update,
+        context,
+        game_type,
+        bet_amount,
+        player_choice,
+        luck_mult_getter=_casino_luck_mult,
+    )
 
 
 async def play_casino_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game_type: str, player_choice: str, bet_amount: int):
     """Играет в выбранную игру казино с выбором игрока."""
-    # Перенаправляем на нативные игры
-    if game_type in ['dice', 'slots', 'basketball', 'football', 'bowling', 'darts']:
-        await play_casino_game_native(update, context, game_type, bet_amount, player_choice)
-        return
-
-    query = update.callback_query
-    user = query.from_user
-    
-    # Проверка лимитов
-    if bet_amount < CASINO_MIN_BET or bet_amount > CASINO_MAX_BET:
-        await query.answer(f"Ставка должна быть от {CASINO_MIN_BET} до {CASINO_MAX_BET}", show_alert=True)
-        return
-
-    lock = _get_lock(f"user:{user.id}:casino")
-    if lock.locked():
-        await query.answer("Игра уже обрабатывается...", show_alert=True)
-        return
-
-    async with lock:
-        player = db.get_or_create_player(user.id, user.username or user.first_name)
-        coins = int(getattr(player, 'coins', 0) or 0)
-
-        if coins < bet_amount:
-            await query.answer("Недостаточно септимов", show_alert=True)
-            return
-
-        # Списываем ставку
-        db.increment_coins(user.id, -bet_amount)
-
-        # Получаем информацию об игре
-        game_info = CASINO_GAMES.get(game_type, CASINO_GAMES['coin_flip'])
-        
-        # Определяем результат в зависимости от игры с учётом выбора игрока
-        win = False
-        result_text = ""
-        multiplier = game_info['multiplier']
-        
-        if game_type == 'coin_flip':
-            win, result_text = play_coin_flip(game_info, player_choice)
-        elif game_type == 'dice':
-            win, result_text, multiplier = play_dice(game_info, player_choice)
-        elif game_type == 'high_low':
-            win, result_text = play_high_low(game_info, player_choice)
-        elif game_type == 'roulette_color':
-            win, result_text = play_roulette_color(game_info, player_choice)
-        elif game_type == 'roulette_number':
-            win, result_text, multiplier = play_roulette_number(game_info, player_choice)
-        elif game_type == 'slots':
-            win, result_text, multiplier = play_slots(game_info)
-        else:
-            win = _casino_roll_win(game_info['win_prob'])
-            result_text = "🎲 Результат определён"
-
-        # Начисляем выигрыш
-        winnings = 0
-        if win:
-            winnings = int(bet_amount * multiplier)
-            db.increment_coins(user.id, winnings)
-            # Обновляем статистику побед
-            current_wins = int(getattr(player, 'casino_wins', 0) or 0)
-            db.update_player_stats(user.id, casino_wins=current_wins + 1)
-            # Логируем выигрыш
-            db.log_action(
-                user_id=user.id,
-                username=user.username or user.first_name,
-                action_type='casino',
-                action_details=f'{game_type}: ставка {bet_amount}, выигрыш {winnings}',
-                amount=winnings,
-                success=True
-            )
-        else:
-            # Обновляем статистику поражений
-            current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-            db.update_player_stats(user.id, casino_losses=current_losses + 1)
-            # Логируем проигрыш
-            db.log_action(
-                user_id=user.id,
-                username=user.username or user.first_name,
-                action_type='casino',
-                action_details=f'{game_type}: ставка {bet_amount}, проигрыш',
-                amount=-bet_amount,
-                success=False
-            )
-
-        # Проверяем достижения
-        achievement_bonus = check_casino_achievements(user.id, player)
-
-        # Формируем сообщение о результате
-        player = db.get_or_create_player(user.id, user.username or user.first_name)
-        new_balance = int(getattr(player, 'coins', 0) or 0)
-        
-        # Логируем результат для отладки
-        logger.info(f"Casino game result - Type: {game_type}, Win: {win}, Result text: {result_text[:50]}...")
-        
-        await show_game_result(query, user, game_info, bet_amount, win, winnings, 
-                              new_balance, result_text, achievement_bonus, context)
+    await casino_gameplay.play_casino_game(
+        update,
+        context,
+        game_type,
+        player_choice,
+        bet_amount,
+        get_lock=_get_lock,
+        luck_mult_getter=_casino_luck_mult,
+    )
 
 
 def _casino_luck_mult() -> float:
@@ -10331,242 +9870,51 @@ def _casino_luck_mult() -> float:
 
 
 def _casino_adjusted_prob(base_prob: float) -> float:
-    base = max(0.0, min(1.0, float(base_prob)))
-    adj = base * _casino_luck_mult()
-    return max(0.0, min(0.95, adj))
+    return casino_adjusted_prob(base_prob, _casino_luck_mult())
 
 
 def _casino_roll_win(base_prob: float) -> bool:
-    return random.random() < _casino_adjusted_prob(base_prob)
+    return casino_roll_win(base_prob, _casino_luck_mult())
 
 
 def _casino_extra_win_chance(base_prob: float) -> float:
-    base = max(0.0, min(1.0, float(base_prob)))
-    adj = _casino_adjusted_prob(base)
-    return max(0.0, adj - base)
+    return casino_extra_win_chance(base_prob, _casino_luck_mult())
 
 
-def play_coin_flip(game_info, player_choice):
-    """Игра: подбрасывание монеты."""
-    # player_choice: 'heads' или 'tails'
-    win = _casino_roll_win(0.5)
-    result = player_choice if win else ('tails' if player_choice == 'heads' else 'heads')
-    
-    result_emoji = '🦅 Орёл' if result == 'heads' else '🪙 Решка'
-    choice_emoji = '🦅 Орёл' if player_choice == 'heads' else '🪙 Решка'
-    
-    result_text = (
-        f"🎲 Ваш выбор: <b>{choice_emoji}</b>\n"
-        f"🪙 Выпало: <b>{result_emoji}</b>\n"
-        f"{'✅ Совпадение!' if win else '❌ Не угадали'}"
-    )
-    return win, result_text
+def _casino_take_bet(user_id: int, amount: int) -> int | None:
+    return casino_gameplay.casino_take_bet(user_id, amount)
 
 
-def play_dice(game_info, player_choice):
-    """Игра: игральная кость."""
-    # player_choice: '1' до '6'
-    player_number = int(player_choice)
-    win = _casino_roll_win(1 / 6)
-    if win:
-        dice_result = player_number
-    else:
-        other = [n for n in range(1, 7) if n != player_number]
-        dice_result = random.choice(other)
-    
-    result_text = (
-        f"🎯 Ваше число: <b>{player_number}</b>\n"
-        f"🎲 Выпало: <b>{dice_result}</b>\n"
-        f"{'✅ Угадали!' if win else '❌ Не угадали'}"
-    )
-    multiplier = game_info['multiplier'] if win else game_info['multiplier']
-    return win, result_text, multiplier
+def _casino_record_result(user_id: int, win: bool) -> None:
+    casino_gameplay.casino_record_result(user_id, win)
 
 
-def play_high_low(game_info, player_choice):
-    """Игра: больше/меньше 50."""
-    # player_choice: 'high' или 'low'
-    win = _casino_roll_win(0.49)
-    if player_choice == 'high':
-        if win:
-            number = random.randint(51, 100)
-        else:
-            number = random.randint(1, 50)
-    else:
-        if win:
-            number = random.randint(1, 49)
-        else:
-            number = random.randint(50, 100)
-    
-    is_higher = number > 50
-    
-    choice_text = '📈 Больше 50' if player_choice == 'high' else '📉 Меньше 50'
-    actual_text = '📈 Больше 50' if is_higher else '📉 Меньше 50'
-    result_text = (
-        f"🎯 Ваш выбор: <b>{choice_text}</b>\n"
-        f"📊 Выпало: <b>{number}</b> ({actual_text})\n"
-        f"{'✅ Угадали!' if win else '❌ Не угадали'}"
-    )
-    return win, result_text
-
-
-def play_roulette_color(game_info, player_choice):
-    """Игра: рулетка - красное/чёрное."""
-    # player_choice: 'red' или 'black'
-    red_numbers = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
-    black_numbers = [2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35]
-    win = _casino_roll_win(18 / 37)
-    if win:
-        if player_choice == 'red':
-            number = random.choice(red_numbers)
-            color_code = 'red'
-            color = '🔴 Красное'
-        else:
-            number = random.choice(black_numbers)
-            color_code = 'black'
-            color = '⚫ Чёрное'
-    else:
-        # Проигрыш: либо противоположный цвет, либо 0
-        if random.random() < 0.15:
-            number = 0
-            color_code = 'green'
-            color = '🟢 Зелёное'
-        else:
-            if player_choice == 'red':
-                number = random.choice(black_numbers)
-                color_code = 'black'
-                color = '⚫ Чёрное'
-            else:
-                number = random.choice(red_numbers)
-                color_code = 'red'
-                color = '🔴 Красное'
-    
-    choice_text = '🔴 Красное' if player_choice == 'red' else '⚫ Чёрное'
-    result_text = (
-        f"🎯 Ваш выбор: <b>{choice_text}</b>\n"
-        f"🎡 Выпало: <b>{number}</b> ({color})\n"
-        f"{'✅ Угадали!' if win else '❌ Не угадали' if color_code != 'green' else '❌ Выпал зелёный 0'}"
-    )
-    return win, result_text
-
-
-def play_roulette_number(game_info, player_choice):
-    """Игра: рулетка - угадай число."""
-    # player_choice: '0' до '36'
-    player_number = int(player_choice)
-    win = _casino_roll_win(1 / 37)
-    if win:
-        number = player_number
-    else:
-        other = [n for n in range(0, 37) if n != player_number]
-        number = random.choice(other)
-    
-    result_text = (
-        f"🎯 Ваше число: <b>{player_number}</b>\n"
-        f"🎡 Выпало: <b>{number}</b>\n"
-        f"{'✅ Точное попадание!' if win else '❌ Не угадали'}"
-    )
-    multiplier = game_info['multiplier'] if win else game_info['multiplier']
-    return win, result_text, multiplier
-
-
-def play_slots(game_info):
-    """Игра: слоты."""
-    win = _casino_roll_win(CASINO_GAMES['slots']['win_prob'])
-    if win:
-        combination = random.choice(list(SLOT_PAYOUTS.keys()))
-        slot1, slot2, slot3 = combination[0], combination[1], combination[2]
-        multiplier = SLOT_PAYOUTS.get(combination, 3.0)
-    else:
-        # Генерируем комбинацию без выигрыша
-        while True:
-            slot1 = random.choice(SLOT_SYMBOLS)
-            slot2 = random.choice(SLOT_SYMBOLS)
-            slot3 = random.choice(SLOT_SYMBOLS)
-            if not (slot1 == slot2 == slot3):
-                break
-        combination = f"{slot1}{slot2}{slot3}"
-        multiplier = 0
-    
-    # Формируем красивый результат
-    if win:
-        result_text = (
-            f"🎰 Результат:\n"
-            f"┏━━━━━━━━━━━━━┓\n"
-            f"┃  <b>{slot1} {slot2} {slot3}</b>  ┃\n"
-            f"┗━━━━━━━━━━━━━┛\n"
-            f"💫 Множитель: <b>x{int(multiplier)}</b>"
-        )
-    else:
-        result_text = (
-            f"🎰 Результат:\n"
-            f"┏━━━━━━━━━━━━━┓\n"
-            f"┃  <b>{slot1} {slot2} {slot3}</b>  ┃\n"
-            f"┗━━━━━━━━━━━━━┛"
-        )
-    
-    return win, result_text, multiplier
+def _parse_casino_game_choice(payload: str) -> tuple[str | None, str | None]:
+    return parse_casino_game_choice(payload, CASINO_GAMES)
 
 
 def check_casino_achievements(user_id, player):
-    """Проверяет и выдает достижения казино."""
-    casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
-    unlocked_achievements = getattr(player, 'casino_achievements', '') or ''
-    
-    bonus = 0
-    new_achievement = None
-    
-    for ach_id, ach_data in CASINO_ACHIEVEMENTS.items():
-        if ach_id not in unlocked_achievements and casino_wins >= ach_data['wins']:
-            # Выдаем достижение
-            unlocked_achievements += f"{ach_id},"
-            db.update_player_stats(user_id, casino_achievements=unlocked_achievements)
-            bonus = ach_data['reward']
-            new_achievement = ach_data
-            db.increment_coins(user_id, bonus)
-            break
-    
-    return {'bonus': bonus, 'achievement': new_achievement} if new_achievement else None
+    return casino_gameplay.check_casino_achievements(user_id, player)
 
 
-async def show_game_result(query, user, game_info, bet_amount, win, winnings, 
-                           new_balance, result_text, achievement_bonus, context):
+async def show_game_result(query, user, game_info, bet_amount, win, winnings,
+                           new_balance, result_text, achievement_bonus, context,
+                           game_type: str | None = None, player_choice: str | None = None):
     """Показывает результат игры."""
-    if win:
-        profit = winnings - bet_amount
-        result_line = f"🎉 <b>ПОБЕДА!</b> 🎉\n💰 Выигрыш: +{profit} септимов"
-    else:
-        result_line = f"💥 <b>Поражение</b>\n💸 Потеряно: {bet_amount} септимов"
-
-    achievement_text = ""
-    if achievement_bonus:
-        ach = achievement_bonus['achievement']
-        achievement_text = f"\n\n🏆 <b>Достижение разблокировано!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']} септимов"
-
-    # Добавляем разделитель для лучшей читаемости
-    text = (
-        f"<b>{game_info['emoji']} {game_info['name']}</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{result_text}\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"{result_line}\n"
-        f"💵 Баланс: <b>{new_balance}</b> септимов"
-        f"{achievement_text}"
+    await casino_handlers.show_game_result_message(
+        query,
+        user,
+        game_info,
+        bet_amount,
+        win,
+        winnings,
+        new_balance,
+        result_text,
+        achievement_bonus,
+        context,
+        game_type,
+        player_choice,
     )
-    
-    # Логируем для отладки
-    logger.info(f"Showing casino result, text length: {len(text)}, has result_text: {bool(result_text)}")
-
-    keyboard = [
-        [InlineKeyboardButton("🔄 Играть ещё", callback_data=f'casino_game_{list(CASINO_GAMES.keys())[list(CASINO_GAMES.values()).index(game_info)]}')],
-        [InlineKeyboardButton("🎮 Другая игра", callback_data='city_casino')],
-        [InlineKeyboardButton("🔙 Выход", callback_data='city_hightown')],
-    ]
-
-    try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
-    except BadRequest:
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
 # === БЛЭКДЖЕК ===
@@ -10667,7 +10015,10 @@ async def start_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         
         # Списываем ставку
-        db.increment_coins(user.id, -bet_amount)
+        new_balance = _casino_take_bet(user.id, bet_amount)
+        if new_balance is None:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
         
         # Создаём игру
         deck = create_blackjack_deck()
@@ -10839,7 +10190,9 @@ async def handle_blackjack_double(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     
     # Списываем дополнительную ставку
-    db.increment_coins(user.id, -bet)
+    if _casino_take_bet(user.id, bet) is None:
+        await query.answer("Недостаточно септимов для удвоения", show_alert=True)
+        return
     game['bet'] = bet * 2
     
     # Берём ровно одну карту
@@ -10928,11 +10281,9 @@ async def finish_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TY
     # Обновляем статистику
     player = db.get_or_create_player(user_id, user.username or user.first_name)
     if win:
-        current_wins = int(getattr(player, 'casino_wins', 0) or 0)
-        db.update_player_stats(user_id, casino_wins=current_wins + 1)
+        _casino_record_result(user_id, True)
     elif result not in ['push', 'surrender']:
-        current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-        db.update_player_stats(user_id, casino_losses=current_losses + 1)
+        _casino_record_result(user_id, False)
     
     # Логируем
     db.log_action(
@@ -11133,7 +10484,9 @@ async def start_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, m
             return
         
         # Списываем ставку
-        db.increment_coins(user.id, -bet_amount)
+        if _casino_take_bet(user.id, bet_amount) is None:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
         
         # Создаём игру
         grid = create_mines_grid(mines_count)
@@ -11319,11 +10672,9 @@ async def finish_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # Обновляем статистику
     player = db.get_or_create_player(user_id, user.username or user.first_name)
     if win:
-        current_wins = int(getattr(player, 'casino_wins', 0) or 0)
-        db.update_player_stats(user_id, casino_wins=current_wins + 1)
+        _casino_record_result(user_id, True)
     elif result == 'exploded':
-        current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-        db.update_player_stats(user_id, casino_losses=current_losses + 1)
+        _casino_record_result(user_id, False)
     
     # Логируем
     db.log_action(
@@ -11476,7 +10827,9 @@ async def start_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, b
             return
         
         # Списываем ставку
-        db.increment_coins(user.id, -bet_amount)
+        if _casino_take_bet(user.id, bet_amount) is None:
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
         
         # Генерируем точку краша
         crash_point = generate_crash_point()
@@ -11644,11 +10997,9 @@ async def finish_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # Обновляем статистику
     player = db.get_or_create_player(user_id, user.username or user.first_name)
     if win:
-        current_wins = int(getattr(player, 'casino_wins', 0) or 0)
-        db.update_player_stats(user_id, casino_wins=current_wins + 1)
+        _casino_record_result(user_id, True)
     else:
-        current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-        db.update_player_stats(user_id, casino_losses=current_losses + 1)
+        _casino_record_result(user_id, False)
     
     # Логируем
     db.log_action(
@@ -11709,8 +11060,7 @@ async def finish_crash_game_internal(context: ContextTypes.DEFAULT_TYPE, user_id
     
     # Обновляем статистику
     player = db.get_or_create_player(user_id, username)
-    current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-    db.update_player_stats(user_id, casino_losses=current_losses + 1)
+    _casino_record_result(user_id, False)
     
     # Логируем
     db.log_action(
@@ -11816,7 +11166,7 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             return
 
         # Списываем ставку
-        after_debit = db.increment_coins(user.id, -int(amount))
+        after_debit = _casino_take_bet(user.id, int(amount))
         if after_debit is None:
             await query.answer("Ошибка при списании", show_alert=True)
             return
@@ -11830,14 +11180,10 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if win:
             coins_after = db.increment_coins(user.id, int(amount) * 2) or after_debit + int(amount) * 2
             result_line = f"🎉 Победа! Вы получаете +{amount} септимов."
-            # Обновляем статистику побед
-            current_wins = int(getattr(player, 'casino_wins', 0) or 0)
-            db.update_player_stats(user.id, casino_wins=current_wins + 1)
+            _casino_record_result(user.id, True)
         else:
             result_line = f"💥 Поражение! Списано {amount} септимов."
-            # Обновляем статистику поражений
-            current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-            db.update_player_stats(user.id, casino_losses=current_losses + 1)
+            _casino_record_result(user.id, False)
 
         # Перерисовываем экран с обновлённым балансом и результатом (новое меню)
         player = db.get_or_create_player(user.id, user.username or user.first_name)
@@ -11988,7 +11334,7 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         
         # Списываем ставку
-        after_debit = db.increment_coins(user.id, -bet_amount)
+        after_debit = _casino_take_bet(user.id, bet_amount)
         if after_debit is None:
             await msg.reply_text("Ошибка при списании")
             return ConversationHandler.END
@@ -12002,14 +11348,10 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
         if win:
             coins_after = db.increment_coins(user.id, bet_amount * 2) or after_debit + bet_amount * 2
             result_line = f"🎉 Победа! Вы получаете +{bet_amount} септимов."
-            # Обновляем статистику побед
-            current_wins = int(getattr(player, 'casino_wins', 0) or 0)
-            db.update_player_stats(user.id, casino_wins=current_wins + 1)
+            _casino_record_result(user.id, True)
         else:
             result_line = f"💥 Поражение! Списано {bet_amount} септимов."
-            # Обновляем статистику поражений
-            current_losses = int(getattr(player, 'casino_losses', 0) or 0)
-            db.update_player_stats(user.id, casino_losses=current_losses + 1)
+            _casino_record_result(user.id, False)
         
         # Показываем результат с новым главным меню
         player = db.get_or_create_player(user.id, user.username or user.first_name)
@@ -13505,7 +12847,7 @@ async def show_fertilizer_apply_pick_bed(update: Update, context: ContextTypes.D
         st = getattr(b, 'seed_type', None)
         name = html.escape(getattr(st, 'name', 'Растение')) if st else 'Растение'
         lines.append(f"• Грядка {idx}: {name} — растёт")
-        keyboard.append([InlineKeyboardButton(f"Удобрить {idx}", callback_data=f'fert_apply_do_{idx}_{fertilizer_id}')])
+        keyboard.append([InlineKeyboardButton(f"Удобрить {idx}", callback_data=f'fert_apply_mode_{idx}_{fertilizer_id}')])
     if not eligible:
         lines.append("\nНет растущих грядок для удобрения.")
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_fertilizers_inv')])
@@ -13537,6 +12879,106 @@ async def handle_fertilizer_apply(update: Update, context: ContextTypes.DEFAULT_
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         else:
             await query.answer('Удобрение применено! Бонусы суммируются.', show_alert=False)
+        await show_plantation_my_beds(update, context)
+
+def _calc_fertilizer_apply_capacity(bed, fertilizer, inventory_qty: int, max_fert: int) -> int:
+    """Сколько раз это удобрение можно применить к грядке прямо сейчас."""
+    try:
+        qty = max(0, int(inventory_qty or 0))
+        if not bed or not fertilizer or qty <= 0:
+            return 0
+        total_count = _count_bed_total_fertilizers(bed)
+        protection_used = _count_bed_resilience_fertilizers(bed)
+        main_used = max(0, total_count - protection_used)
+        category = get_fertilizer_category(fertilizer)
+        if category == 'resilience':
+            if protection_used >= 1:
+                return 0
+            total_limit_left = max(0, (int(max_fert) + 1) - int(total_count))
+            return min(qty, total_limit_left, 1)
+        main_slots_left = max(0, int(max_fert) - int(main_used))
+        return min(qty, main_slots_left)
+    except Exception:
+        return 0
+
+async def show_fertilizer_apply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int, fertilizer_id: int):
+    """Выбор: внести одно удобрение или заполнить грядку максимумом."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    max_fert = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
+    inv = db.get_fertilizer_inventory(user.id) or []
+    beds = db.get_player_beds(user.id) or []
+
+    fert_item = next((it for it in inv if int(getattr(getattr(it, 'fertilizer', None), 'id', 0) or 0) == int(fertilizer_id)), None)
+    fertilizer = getattr(fert_item, 'fertilizer', None) if fert_item else None
+    bed = next((b for b in beds if int(getattr(b, 'bed_index', 0) or 0) == int(bed_index)), None)
+
+    if not fertilizer or not bed:
+        await query.answer('Не удалось найти грядку или удобрение', show_alert=True)
+        await show_plantation_my_beds(update, context)
+        return
+
+    qty = int(getattr(fert_item, 'quantity', 0) or 0)
+    available_now = _calc_fertilizer_apply_capacity(bed, fertilizer, qty, max_fert)
+    fert_name = html.escape(str(getattr(fertilizer, 'name', 'Удобрение')))
+    category = get_fertilizer_category(fertilizer)
+
+    lines = [
+        f"<b>🧪 Удобрение для грядки {bed_index}</b>",
+        "",
+        f"Выбрано: <b>{fert_name}</b>",
+        f"В инвентаре: <b>{qty}</b>",
+        f"Можно применить сейчас: <b>{available_now}</b>",
+    ]
+    if category == 'resilience':
+        lines.append("Тип: 🛡️ защитное удобрение (отдельный слот 1/1)")
+    else:
+        lines.append("Тип: ⚡ обычное удобрение")
+
+    keyboard = []
+    if available_now > 0:
+        keyboard.append([InlineKeyboardButton("🧪 Внести 1", callback_data=f'fert_apply_do_{bed_index}_{fertilizer_id}')])
+        keyboard.append([InlineKeyboardButton(f"💥 Внести максимум ({available_now})", callback_data=f'fert_apply_max_{bed_index}_{fertilizer_id}')])
+    else:
+        lines.append("")
+        lines.append("⚠️ Сейчас это удобрение больше нельзя применить на эту грядку.")
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f'fert_pick_for_bed_{bed_index}')])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+async def handle_fertilizer_apply_max(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int, fertilizer_id: int):
+    query = update.callback_query
+    user = query.from_user
+    lock = _get_lock(f"user:{user.id}:fert_apply")
+    if lock.locked():
+        await query.answer("Обработка…", show_alert=False)
+        return
+    async with lock:
+        applied = 0
+        last_reason = None
+        max_fert = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
+        while True:
+            res = db.apply_fertilizer(user.id, int(bed_index), int(fertilizer_id))
+            if not res.get('ok'):
+                last_reason = res.get('reason')
+                break
+            applied += 1
+
+        if applied > 0:
+            await query.answer(f'Внесено удобрений: {applied}', show_alert=False)
+        else:
+            if last_reason == 'not_growing':
+                await query.answer('Грядка не в состоянии роста', show_alert=True)
+            elif last_reason == 'not_watered':
+                await query.answer('Сначала полейте растение!', show_alert=True)
+            elif last_reason == 'no_fertilizer_in_inventory':
+                await query.answer('Нет такого удобрения в инвентаре', show_alert=True)
+            elif last_reason == 'max_fertilizers_reached':
+                await query.answer(f'Достигнут лимит удобрений (макс. {max_fert} + 1 защитный слот)', show_alert=True)
+            elif last_reason == 'resilience_slot_occupied':
+                await query.answer('Защитный слот уже занят. На грядку доступен только 1 защитный эффект.', show_alert=True)
+            else:
+                await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
         await show_plantation_my_beds(update, context)
 
 async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEFAULT_TYPE, bed_index: int):
@@ -13584,7 +13026,7 @@ async def show_fertilizer_pick_for_bed(update: Update, context: ContextTypes.DEF
             continue
         any_items = True
         name = html.escape(getattr(fz, 'name', 'Удобрение'))
-        keyboard.append([InlineKeyboardButton(f"{name} ({qty})", callback_data=f'fert_apply_do_{bed_index}_{fz.id}')])
+        keyboard.append([InlineKeyboardButton(f"{name} ({qty})", callback_data=f'fert_apply_mode_{bed_index}_{fz.id}')])
     if not any_items:
         lines.append("\nУ вас нет удобрений.")
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_my_beds')])
@@ -17834,9 +17276,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('casino_choice_'):
         # casino_choice_{game_type}_{choice}
         try:
-            parts = data.replace('casino_choice_', '').split('_', 1)
-            game_type = parts[0]
-            choice = parts[1]
+            payload = data.replace('casino_choice_', '', 1)
+            game_type, choice = _parse_casino_game_choice(payload)
+            if not game_type or choice is None:
+                raise ValueError("bad casino_choice payload")
             # Показываем экран выбора ставки
             player = db.get_or_create_player(update.callback_query.from_user.id, 
                                             update.callback_query.from_user.username or update.callback_query.from_user.first_name)
@@ -17851,21 +17294,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             parts = data.replace('casino_bet_', '').rsplit('_', 1)
             amount = int(parts[1])
-            # Разделяем game_type и choice
-            game_and_choice = parts[0].rsplit('_', 1)
-            if len(game_and_choice) == 2:
-                game_type = game_and_choice[0]
-                choice = game_and_choice[1]
-                # Если choice='none', значит это слоты
-                if choice == 'none':
-                    choice = None
-            else:
-                # Для слотов нет choice
-                game_type = parts[0]
+            game_type, choice = _parse_casino_game_choice(parts[0])
+            if not game_type:
+                raise ValueError("bad casino_bet payload")
+            if choice == 'none':
                 choice = None
             await play_casino_game(update, context, game_type, choice, amount)
         except Exception as e:
             logger.error(f"Error in casino_bet: {e}")
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('casino_repeat|'):
+        try:
+            _, game_type, raw_choice, raw_amount = data.split('|', 3)
+            amount = int(raw_amount)
+            choice = None if raw_choice == '-' else raw_choice
+            await play_casino_game(update, context, game_type, choice, amount)
+        except Exception as e:
+            logger.error(f"Error in casino_repeat: {e}")
             await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('casino_play_'):
         # casino_play_{game_type}_{amount} - старый формат для слотов
@@ -17969,11 +17414,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_fertilizer_apply_pick_bed(update, context, fid)
         except Exception:
             await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('fert_apply_mode_'):
+        # fert_apply_mode_{bed}_{fert}
+        try:
+            _, _, _, bed, fid = data.split('_')
+            await show_fertilizer_apply_mode(update, context, int(bed), int(fid))
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('fert_apply_do_'):
         # fert_apply_do_{bed}_{fert}
         try:
             _, _, _, bed, fid = data.split('_')
             await handle_fertilizer_apply(update, context, int(bed), int(fid))
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
+    elif data.startswith('fert_apply_max_'):
+        # fert_apply_max_{bed}_{fert}
+        try:
+            _, _, _, bed, fid = data.split('_')
+            await handle_fertilizer_apply_max(update, context, int(bed), int(fid))
         except Exception:
             await update.callback_query.answer('Ошибка', show_alert=True)
     elif data.startswith('fert_pick_for_bed_'):

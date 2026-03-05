@@ -7877,6 +7877,35 @@ def update_player_stats(user_id: int, **kwargs):
         db.close()
 
 
+def add_casino_stats(user_id: int, wins_delta: int = 0, losses_delta: int = 0) -> bool:
+    """Атомарно обновляет статистику казино игрока."""
+    db = SessionLocal()
+    try:
+        player = db.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=user_id, username=None, casino_wins=0, casino_losses=0)
+            db.add(player)
+            db.commit()
+            db.refresh(player)
+
+        if int(wins_delta or 0):
+            player.casino_wins = int(player.casino_wins or 0) + int(wins_delta)
+        if int(losses_delta or 0):
+            player.casino_losses = int(player.casino_losses or 0) + int(losses_delta)
+
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"[DB] Error updating casino stats: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
 # --- Функции статистики для админ панели ---
 
 def get_total_users_count() -> int:
