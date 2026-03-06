@@ -35,6 +35,7 @@ from casino_logic import (
 )
 import casino_handlers
 import casino_gameplay
+from gift_system import GiftFeature
 from fullhelp import fullhelp_command
 from admin import admin_command
 from admin2 import (
@@ -225,11 +226,6 @@ SEED_CUSTOM_QTY = range(1)
 
 PENDING_ADDITIONS: dict[int, dict] = {}
 NEXT_PENDING_ID = 1
-
-GIFT_OFFERS: dict[int, dict] = {}
-NEXT_GIFT_ID = 1
-GIFT_SELECT_TOKENS: dict[str, dict] = {}
-GIFT_SELECTION_STATE: dict[int, dict] = {}  # {user_id: {recipient_info, inventory_items}}
 
 # --- Блокировки для предотвращения даблкликов/гонок ---
 _LOCKS: Dict[str, asyncio.Lock] = {}
@@ -16238,6 +16234,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
+    if await gift_feature.handle_callback(update, context):
+        return
+
     # Централизованная проверка прав для админских callback'ов по матрице.
     required_level = get_required_level_for_callback(data)
     if required_level is not None:
@@ -17612,78 +17611,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_group_notifications(update, context)
     elif data == 'group_toggle_delete':
         await toggle_group_auto_delete(update, context)
-    elif data.startswith('gift_page_'):
-        # Навигация по страницам выбора подарка
-        try:
-            page = int(data.split('_')[-1])
-            await send_gift_selection_menu(
-                context, 
-                query.from_user.id, 
-                page=page, 
-                message_id=query.message.message_id
-            )
-            await query.answer()
-        except Exception:
-            await query.answer("Ошибка навигации", show_alert=True)
-    elif data == 'gift_page_info':
-        # Информационная кнопка - ничего не делает
-        await query.answer("Текущая страница", show_alert=False)
-    elif data == 'gift_search':
-        # Начать поиск напитка
-        state = GIFT_SELECTION_STATE.get(query.from_user.id)
-        if state:
-            state['awaiting_search'] = True
-            state['search_message_id'] = query.message.message_id
-            await query.answer()
-            await query.edit_message_text(
-                "🔍 <b>Поиск напитка</b>\n\n"
-                "Введите название напитка (или его часть):",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Отменить поиск", callback_data="gift_cancel_search")]
-                ])
-            )
-        else:
-            await query.answer("Сессия истекла", show_alert=True)
-    elif data == 'gift_cancel_search':
-        # Отменить поиск и вернуться к списку
-        state = GIFT_SELECTION_STATE.get(query.from_user.id)
-        if state:
-            state['awaiting_search'] = False
-            await send_gift_selection_menu(
-                context, 
-                query.from_user.id, 
-                page=1, 
-                message_id=query.message.message_id
-            )
-            await query.answer("Поиск отменён")
-        else:
-            await query.answer("Сессия истекла", show_alert=True)
-    elif data == 'gift_cancel':
-        # Полностью отменить выбор подарка
-        user_id = query.from_user.id
-        if user_id in GIFT_SELECTION_STATE:
-            del GIFT_SELECTION_STATE[user_id]
-        await query.edit_message_text("❌ Выбор подарка отменён.")
-        await query.answer()
-    elif data.startswith('selectgift2_'):
-        # Новый формат: selectgift2_{token} -> payload в GIFT_SELECT_TOKENS
-        token = data.split('_', 1)[1]
-        payload = GIFT_SELECT_TOKENS.pop(token, None)
-        if not payload:
-            await query.answer("Просрочено или неверно", show_alert=True)
-        else:
-            await handle_select_gift(update, context, payload)
-    elif data.startswith('giftresp_'):
-        # giftresp_{id}_yes/no
-        try:
-            _prefix, gid, resp = data.split('_', 2)
-            gift_id = int(gid)
-            accepted = resp == 'yes'
-            await handle_gift_response(update, context, gift_id, accepted)
-        except Exception:
-            await query.answer("Ошибка", show_alert=True)
-
 async def group_register_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрирует группу при любом групповом сообщении/команде."""
     try:
@@ -20041,6 +19968,9 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not getattr(msg, 'text', None):
         return
 
+    if await gift_feature.handle_text_message(update, context):
+        return
+
     try:
         u = update.effective_user
         if u:
@@ -20147,37 +20077,6 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await msg.reply_text("Промокод активирован.")
         return
 
-    # Проверяем, ждём ли мы ввод для поиска подарка
-    user_id = update.effective_user.id
-    state = GIFT_SELECTION_STATE.get(user_id)
-    if state and state.get('awaiting_search'):
-        state['awaiting_search'] = False
-        search_query = incoming.strip()
-        
-        if not search_query:
-            await msg.reply_text("❌ Пустой запрос. Попробуйте снова.")
-            return
-        
-        # Обновляем меню с результатами поиска
-        message_id = state.get('search_message_id')
-        try:
-            await send_gift_selection_menu(
-                context, 
-                user_id, 
-                page=1, 
-                search_query=search_query,
-                message_id=message_id
-            )
-            # Удаляем сообщение пользователя с запросом
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-        except Exception as e:
-            logger.exception("[GIFT_SEARCH] Error: %s", e)
-            await msg.reply_text("Ошибка при поиске. Попробуйте снова.")
-        return
-    
     # Проверяем, ждём ли мы ввод для поиска по инвентарю
     if context.user_data.get('awaiting_favorites_search'):
         context.user_data.pop('awaiting_favorites_search', None)
@@ -20617,6 +20516,17 @@ def get_rarity_emoji(rarity: str) -> str:
     return COLOR_EMOJIS.get(rarity, '⭐')
 
 
+gift_feature = GiftFeature(
+    logger=logger,
+    abort_if_banned=abort_if_banned,
+    register_group_if_needed=register_group_if_needed,
+    reply_auto_delete_message=reply_auto_delete_message,
+    schedule_auto_delete_message=schedule_auto_delete_message,
+    get_rarity_emoji=get_rarity_emoji,
+    get_lock=_get_lock,
+)
+
+
 def _load_rarity_emoji_overrides_into_constants() -> None:
     try:
         rows = db.list_rarity_emoji_overrides()
@@ -20633,550 +20543,6 @@ def _load_rarity_emoji_overrides_into_constants() -> None:
                 pass
     except Exception:
         return
-
-
-async def send_gift_selection_menu(context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int = 1, search_query: str = None, message_id: int = None):
-    """Отправляет или обновляет меню выбора подарка с пагинацией."""
-    state = GIFT_SELECTION_STATE.get(user_id)
-    if not state:
-        return
-    
-    inventory_items = state['inventory_items']
-    recipient_display = state['recipient_display']
-    gifts_sent_today = state['gifts_sent_today']
-    
-    # Фильтруем по поиску, если есть
-    if search_query:
-        filtered_items = [
-            item for item in inventory_items 
-            if search_query.lower() in item.drink.name.lower()
-        ]
-    else:
-        filtered_items = inventory_items
-    
-    if not filtered_items:
-        text = (
-            f"🎁 <b>Выбор подарка</b>\n\n"
-            f"❌ Ничего не найдено по запросу: <i>{html.escape(search_query)}</i>\n\n"
-            f"Получатель: {html.escape(recipient_display)}\n"
-            f"Подарков сегодня: {gifts_sent_today}/20"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Новый поиск", callback_data="gift_search")],
-            [InlineKeyboardButton("◀️ Показать все", callback_data="gift_page_1")]
-        ])
-        
-        if message_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=user_id,
-                    message_id=message_id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode='HTML'
-                )
-            except Exception:
-                pass
-        return
-    
-    # Пагинация (6 напитков на страницу, по 2 в ряд)
-    items_per_page = 6
-    total_items = len(filtered_items)
-    total_pages = max(1, (total_items + items_per_page - 1) // items_per_page)
-    
-    if page > total_pages:
-        page = total_pages
-    if page < 1:
-        page = 1
-    
-    start_idx = (page - 1) * items_per_page
-    end_idx = start_idx + items_per_page
-    page_items = filtered_items[start_idx:end_idx]
-    
-    # Формируем текст
-    search_info = f"\n🔍 Поиск: <i>{html.escape(search_query)}</i>\n" if search_query else ""
-    text = (
-        f"🎁 <b>Выберите напиток для подарка</b>\n\n"
-        f"👤 Получатель: {html.escape(recipient_display)}\n"
-        f"📊 Подарков сегодня: {gifts_sent_today}/20"
-        f"{search_info}\n"
-        f"📄 Страница {page}/{total_pages} ({total_items} напитков)"
-    )
-    
-    # Формируем клавиатуру с кнопками напитков (по 2 в ряд)
-    keyboard_rows = []
-    for i in range(0, len(page_items), 2):
-        row = []
-        for item in page_items[i:i+2]:
-            rarity_emoji = get_rarity_emoji(item.rarity)
-            # Ограничиваем длину названия для кнопки
-            drink_name = item.drink.name[:15] + "..." if len(item.drink.name) > 15 else item.drink.name
-            button_text = f"{rarity_emoji} {drink_name} x{item.quantity}"
-            
-            token = secrets.token_urlsafe(8)
-            GIFT_SELECT_TOKENS[token] = {
-                'group_id': state['group_id'],
-                'recipient_username': state['recipient_username'],
-                'recipient_id': state['recipient_id'],
-                'recipient_display': recipient_display,
-                'item_id': item.id,
-            }
-            row.append(InlineKeyboardButton(button_text, callback_data=f"selectgift2_{token}"))
-        keyboard_rows.append(row)
-    
-    # Кнопка поиска
-    keyboard_rows.append([InlineKeyboardButton("🔍 Поиск по названию", callback_data="gift_search")])
-    
-    # Навигация
-    nav_row = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"gift_page_{page-1}"))
-    if total_pages > 1:
-        nav_row.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="gift_page_info"))
-    if page < total_pages:
-        nav_row.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"gift_page_{page+1}"))
-    
-    if nav_row:
-        keyboard_rows.append(nav_row)
-    
-    # Кнопка отмены
-    keyboard_rows.append([InlineKeyboardButton("❌ Отменить", callback_data="gift_cancel")])
-    
-    keyboard = InlineKeyboardMarkup(keyboard_rows)
-    
-    # Отправляем или обновляем сообщение
-    if message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=user_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode='HTML'
-            )
-        except Exception:
-            pass
-    else:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode='HTML'
-        )
-
-
-async def giftstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/giftstats — показывает статистику подарков пользователя."""
-    user_id = update.effective_user.id
-    
-    try:
-        stats = db.get_gift_stats(user_id)
-        gifts_sent_today = db.get_user_gifts_sent_today(user_id)
-        
-        # Проверяем блокировку
-        is_blocked, reason = db.is_user_gift_restricted(user_id)
-        
-        text = (
-            f"📊 <b>Статистика подарков</b>\n\n"
-            f"🎁 Отправлено всего: <b>{stats['sent']}</b>\n"
-            f"🎉 Получено всего: <b>{stats['received']}</b>\n"
-            f"📅 Отправлено сегодня: <b>{gifts_sent_today}/20</b>\n\n"
-        )
-        
-        if is_blocked:
-            text += f"🚫 <b>Статус:</b> Заблокирован\n<i>Причина: {html.escape(reason)}</i>"
-        else:
-            text += "✅ <b>Статус:</b> Активен"
-        
-        await update.message.reply_html(text)
-    except Exception as e:
-        logger.exception("[GIFTSTATS] Error: %s", e)
-        await update.message.reply_text("Ошибка при получении статистики.")
-
-
-async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/gift @username — инициирует дарение энергетика. Работает только в группах."""
-    if await abort_if_banned(update, context):
-        return
-    try:
-        logger.info(
-            "[GIFT] invoked: chat_id=%s type=%s user_id=%s args=%s",
-            getattr(update.effective_chat, 'id', None),
-            getattr(update.effective_chat, 'type', None),
-            getattr(update.effective_user, 'id', None),
-            context.args if hasattr(context, 'args') else None,
-        )
-    except Exception:
-        pass
-    await register_group_if_needed(update)
-    if update.message.chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Этой командой можно пользоваться только в группах.")
-        return
-
-    # Определяем получателя: приоритет — ответ на сообщение (reply), затем аргумент @username
-    recipient_id = None
-    recipient_username = None
-    recipient_display = None
-
-    reply = getattr(update.message, 'reply_to_message', None)
-    if reply and getattr(reply, 'from_user', None):
-        ruser = reply.from_user
-        # Нельзя дарить сообщениям без пользователя (на всякий случай)
-        if getattr(ruser, 'is_bot', False):
-            await reply_auto_delete_message(update.message, "Нельзя дарить ботам.", context=context)
-            return
-        recipient_id = ruser.id
-        recipient_username = ruser.username or None
-        # Отображаемое имя для подписи в группе (если нет username)
-        display = getattr(ruser, 'full_name', None) or " ".join([n for n in [ruser.first_name, ruser.last_name] if n])
-        recipient_display = f"@{recipient_username}" if recipient_username else (display or str(recipient_id))
-    else:
-        # Аргументы: пытаемся получить из context.args, а если пусто — распарсить из текста команды
-        args = context.args if hasattr(context, 'args') else []
-        if not args:
-            try:
-                raw = (getattr(update.message, 'text', None) or '').strip()
-                m = re.match(r"^/gift(?:@\w+)?\s+(\S+)", raw, flags=re.IGNORECASE)
-                if m:
-                    args = [m.group(1)]
-            except Exception:
-                pass
-        if not args:
-            await reply_auto_delete_message(
-                update.message, 
-                "Использование: /gift @username\nЛибо ответьте на сообщение пользователя в группе и отправьте /gift",
-                context=context
-            )
-            return
-        recipient_username = args[0].lstrip("@").strip()
-        recipient_display = f"@{recipient_username}"
-    giver_id = update.effective_user.id
-
-    # 🛡️ Защита от самодарения
-    if recipient_id and recipient_id == giver_id:
-        await reply_auto_delete_message(update.message, "❌ Вы не можете подарить напиток самому себе!", context=context)
-        return
-
-    # 🛡️ Проверка блокировки дарителя
-    is_blocked, reason = db.is_user_gift_restricted(giver_id)
-    if is_blocked:
-        await reply_auto_delete_message(
-            update.message,
-            f"🚫 Вы не можете дарить подарки.\nПричина: {reason}",
-            context=context
-        )
-        return
-
-    # 🛡️ Проверка блокировки получателя (если известен ID)
-    if recipient_id:
-        is_recipient_blocked, _ = db.is_user_gift_restricted(recipient_id)
-        if is_recipient_blocked:
-            await reply_auto_delete_message(
-                update.message,
-                f"🚫 Получатель не может принимать подарки.",
-                context=context
-            )
-            return
-
-    # 📊 Проверка дневного лимита (20 подарков в день)
-    gifts_sent_today = db.get_user_gifts_sent_today(giver_id)
-    if gifts_sent_today >= 20:
-        await reply_auto_delete_message(
-            update.message,
-            f"⏳ Вы достигли дневного лимита подарков ({gifts_sent_today}/20).\nПопробуйте завтра!",
-            context=context
-        )
-        return
-
-    # ⏱️ Проверка кулдауна (40 секунд)
-    last_gift_time = db.get_user_last_gift_time(giver_id)
-    current_time = int(time.time())
-    cooldown_seconds = 40
-    if last_gift_time and (current_time - last_gift_time) < cooldown_seconds:
-        remaining = cooldown_seconds - (current_time - last_gift_time)
-        await reply_auto_delete_message(
-            update.message,
-            f"⏳ Подождите {remaining} сек. перед следующим подарком.",
-            context=context
-        )
-        return
-
-    # Безопасно читаем инвентарь дарителя
-    try:
-        inventory_items = db.get_player_inventory_with_details(giver_id)
-    except Exception:
-        logger.exception("[GIFT] Failed to fetch inventory for giver %s", giver_id)
-        await reply_auto_delete_message(update.message, "Ошибка при чтении инвентаря. Попробуйте позже.", context=context)
-        return
-    if not inventory_items:
-        await reply_auto_delete_message(update.message, "Ваш инвентарь пуст — нечего дарить.", context=context)
-        return
-
-    # Сохраняем состояние выбора подарка
-    GIFT_SELECTION_STATE[giver_id] = {
-        'group_id': update.effective_chat.id,
-        'recipient_username': recipient_username or "",
-        'recipient_id': recipient_id,
-        'recipient_display': recipient_display,
-        'inventory_items': inventory_items,
-        'gifts_sent_today': gifts_sent_today
-    }
-
-    # Пытаемся написать дарителю в личку. Если бот не может — сообщаем в группе, что нужно нажать Start.
-    try:
-        # Отправляем красивое меню выбора подарка
-        await send_gift_selection_menu(context, giver_id, page=1)
-        # Сообщаем в группе, что список отправлен в личку
-        try:
-            sent_msg = await update.message.reply_text("Отправил список вам в личные сообщения.")
-            # Планируем автоудаление подтверждения
-            try:
-                await schedule_auto_delete_message(context, update.effective_chat.id, sent_msg.message_id)
-            except Exception:
-                pass
-        except Exception:
-            pass
-    except Forbidden:
-        await reply_auto_delete_message(
-            update.message,
-            "Не могу написать вам в личку. Откройте чат с ботом и нажмите Start, после этого повторите команду.",
-            context=context
-        )
-        return
-    except Exception as e:
-        logger.exception("[GIFT] Failed to send DM to giver %s: %s", giver_id, e)
-        await reply_auto_delete_message(update.message, "Не удалось отправить список в личные сообщения. Попробуйте позже.", context=context)
-        return
-    
-    
-
-
-async def handle_select_gift(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: dict):
-    query = update.callback_query
-    await query.answer()
-
-    giver_id = query.from_user.id
-
-    group_id = payload.get('group_id')
-    item_id = payload.get('item_id')
-    recipient_username = (payload.get('recipient_username') or '').strip()
-    recipient_id = payload.get('recipient_id')
-    recipient_display = payload.get('recipient_display') or (f"@{recipient_username}" if recipient_username else None)
-
-    # Проверяем что предмет у дарителя
-    item = db.get_inventory_item(item_id)
-    if not item or item.player_id != giver_id or item.quantity <= 0:
-        await query.answer("Этот напиток недоступен.", show_alert=True)
-        return
-
-    # 🛡️ Проверка на подозрительную активность (>10 подарков подряд одному человеку)
-    if recipient_id and db.check_consecutive_gifts(giver_id, recipient_id, limit=10):
-        # Блокируем обоих пользователей
-        db.add_gift_restriction(
-            giver_id, 
-            "Подозрительная активность: более 10 подарков подряд одному пользователю",
-            blocked_until=None  # Постоянная блокировка
-        )
-        db.add_gift_restriction(
-            recipient_id,
-            "Подозрительная активность: получение более 10 подарков подряд от одного пользователя",
-            blocked_until=None
-        )
-        logger.warning(
-            f"[GIFT_SECURITY] Blocked users {giver_id} and {recipient_id} for suspicious gift activity"
-        )
-        await query.edit_message_text(
-            "🚫 <b>Обнаружена подозрительная активность!</b>\n\n"
-            "Вы и получатель заблокированы за нарушение правил дарения.\n"
-            "Обратитесь к администратору для разблокировки.",
-            parse_mode='HTML'
-        )
-        # Очищаем состояние
-        if giver_id in GIFT_SELECTION_STATE:
-            del GIFT_SELECTION_STATE[giver_id]
-        return
-
-    global NEXT_GIFT_ID
-    gift_id = NEXT_GIFT_ID
-    NEXT_GIFT_ID += 1
-
-    GIFT_OFFERS[gift_id] = {
-        "giver_id": giver_id,
-        "giver_name": query.from_user.username or query.from_user.first_name,
-        "recipient_username": recipient_username,
-        "recipient_id": recipient_id,
-        "recipient_display": recipient_display,
-        "item_id": item_id,
-        "drink_id": item.drink.id,
-        "drink_name": item.drink.name,
-        "rarity": item.rarity,
-        "group_id": group_id
-    }
-
-    # Сообщение в группу с эмодзи редкости
-    recip_text = GIFT_OFFERS[gift_id].get('recipient_display') or (f"@{recipient_username}" if recipient_username else "получателю")
-    # Если нет @username, экранируем имя для HTML
-    recip_html = recip_text if recip_text.startswith('@') else html.escape(str(recip_text))
-    rarity_emoji = get_rarity_emoji(item.rarity)
-    caption = (
-        f"🎁 <b>Подарок!</b>\n\n"
-        f"<b>От:</b> @{GIFT_OFFERS[gift_id]['giver_name']}\n"
-        f"<b>Кому:</b> {recip_html}\n"
-        f"<b>Напиток:</b> {rarity_emoji} {html.escape(item.drink.name)}\n"
-        f"<b>Редкость:</b> {html.escape(item.rarity)}\n\n"
-        f"<i>Принять подарок?</i>"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Да", callback_data=f"giftresp_{gift_id}_yes"),
-         InlineKeyboardButton("❌ Нет", callback_data=f"giftresp_{gift_id}_no")]
-    ])
-
-    await context.bot.send_message(
-        chat_id=group_id,
-        text=caption,
-        reply_markup=keyboard,
-        parse_mode='HTML'
-    )
-
-    await query.edit_message_text("✅ Подарок предложен! Ожидаем ответ получателя.")
-    
-    # Очищаем состояние выбора подарка
-    if giver_id in GIFT_SELECTION_STATE:
-        del GIFT_SELECTION_STATE[giver_id]
-
-
-async def handle_gift_response(update: Update, context: ContextTypes.DEFAULT_TYPE, gift_id: int, accepted: bool):
-    query = update.callback_query
-    await query.answer()
-    # Анти-даблклик: защита от двойного принятия одного и того же подарка
-    lock = _get_lock(f"gift:{gift_id}")
-    if lock.locked():
-        await query.answer("Этот подарок уже обрабатывается…", show_alert=True)
-        return
-    async with lock:
-        offer = GIFT_OFFERS.get(gift_id)
-        if not offer:
-            await query.answer("Предложение не найдено.", show_alert=True)
-            return
-
-    # Допускаем только указанного получателя: сперва по id, иначе по username
-    rec_id = offer.get('recipient_id')
-    rec_un = (offer.get('recipient_username') or '').lower()
-    if rec_id:
-        if query.from_user.id != rec_id:
-            await query.answer("Это не вам предназначалось!", show_alert=True)
-            return
-    elif rec_un:
-        if not query.from_user.username or query.from_user.username.lower() != rec_un:
-            await query.answer("Это не вам предназначалось!", show_alert=True)
-            return
-
-    # Фикс: сначала фиксируем drink_id
-    drink_id = offer.get('drink_id')
-    if not drink_id:
-        inv_item = db.get_inventory_item(offer['item_id'])
-        drink_id = getattr(inv_item, 'drink_id', None) if inv_item else None
-    if not drink_id:
-        await query.edit_message_text("Не удалось определить напиток для передачи.")
-        del GIFT_OFFERS[gift_id]
-        return
-
-    recipient_id = query.from_user.id
-    
-    if not accepted:
-        # Отклонено - логируем в БД
-        db.log_gift(
-            giver_id=offer['giver_id'],
-            recipient_id=recipient_id,
-            drink_id=drink_id,
-            rarity=offer['rarity'],
-            status='declined'
-        )
-        rarity_emoji = get_rarity_emoji(offer['rarity'])
-        try:
-            await query.edit_message_text(
-                f"❌ <b>Подарок отклонён</b>\n\n"
-                f"{rarity_emoji} {html.escape(offer['drink_name'])} ({html.escape(offer['rarity'])})",
-                parse_mode='HTML'
-            )
-        except BadRequest:
-            pass
-        # Уведомление дарителю
-        try:
-            await context.bot.send_message(
-                chat_id=offer['giver_id'],
-                text=f"😔 Ваш подарок ({offer['drink_name']}) был отклонён."
-            )
-        except Exception:
-            pass
-        del GIFT_OFFERS[gift_id]
-        return
-
-    # Принятие: передаём предмет
-    success = db.decrement_inventory_item(offer['item_id'])
-    if not success:
-        await query.edit_message_text("Не удалось передать подарок (предмет исчез).")
-        del GIFT_OFFERS[gift_id]
-        return
-
-    # Добавляем получателю
-    db.add_drink_to_inventory(recipient_id, drink_id, offer['rarity'])
-    
-    # 📊 Логируем принятый подарок в БД
-    db.log_gift(
-        giver_id=offer['giver_id'],
-        recipient_id=recipient_id,
-        drink_id=drink_id,
-        rarity=offer['rarity'],
-        status='accepted'
-    )
-    
-    # log
-    logger.info(
-        f"[GIFT] {offer['giver_name']} -> {query.from_user.username or query.from_user.id}: {offer['drink_name']} ({offer['rarity']})"
-    )
-
-    rarity_emoji = get_rarity_emoji(offer['rarity'])
-    try:
-        await query.edit_message_text(
-            f"✅ <b>Подарок принят!</b>\n\n"
-            f"{rarity_emoji} {html.escape(offer['drink_name'])} ({html.escape(offer['rarity'])})",
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-
-    # Уведомления приватно с деталями
-    try:
-        await context.bot.send_message(
-            chat_id=offer['giver_id'],
-            text=(
-                f"🎉 <b>Ваш подарок принят!</b>\n\n"
-                f"Получатель: {html.escape(offer.get('recipient_display', 'пользователь'))}\n"
-                f"Напиток: {rarity_emoji} {html.escape(offer['drink_name'])}\n"
-                f"Редкость: {html.escape(offer['rarity'])}"
-            ),
-            parse_mode='HTML'
-        )
-    except Exception:
-        pass
-    
-    try:
-        await context.bot.send_message(
-            chat_id=recipient_id,
-            text=(
-                f"🎁 <b>Вы получили подарок!</b>\n\n"
-                f"От: @{offer['giver_name']}\n"
-                f"Напиток: {rarity_emoji} {html.escape(offer['drink_name'])}\n"
-                f"Редкость: {html.escape(offer['rarity'])}\n\n"
-                f"<i>Напиток добавлен в ваш инвентарь!</i>"
-            ),
-            parse_mode='HTML'
-        )
-    except Exception:
-        pass
-    
-    del GIFT_OFFERS[gift_id]
 
 
 def main():
@@ -21342,8 +20708,8 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, photo_message_handler), group=1)
     application.add_handler(MessageHandler(filters.AUDIO, audio_message_handler), group=1)
     # Регистрируем /gift раньше, чтобы исключить перехват другими обработчиками
-    application.add_handler(CommandHandler("gift", gift_command))
-    application.add_handler(CommandHandler("giftstats", giftstats_command))
+    application.add_handler(CommandHandler("gift", gift_feature.gift_command))
+    application.add_handler(CommandHandler("giftstats", gift_feature.giftstats_command))
     # Тихая регистрация групп по любым групповым сообщениям/командам
     application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler("check", check_command))
