@@ -245,6 +245,7 @@ async def play_casino_game(update, context, game_type: str, player_choice: str, 
                 success=False,
             )
 
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
         achievement_bonus = check_casino_achievements(user.id, player)
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         new_balance = int(getattr(player, "coins", 0) or 0)

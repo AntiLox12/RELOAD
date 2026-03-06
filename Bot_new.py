@@ -10295,7 +10295,8 @@ async def finish_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TY
         success=win
     )
     
-    # Проверяем достижения
+    # Проверяем достижения на актуальной статистике после записи результата
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
     achievement_bonus = check_casino_achievements(user_id, player)
     
     # Формируем итоговое сообщение
@@ -10686,7 +10687,8 @@ async def finish_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         success=win
     )
     
-    # Показываем поле с минами
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
+    achievement_bonus = check_casino_achievements(user_id, player)
     player = db.get_or_create_player(user_id, user.username or user.first_name)
     new_balance = int(getattr(player, 'coins', 0) or 0)
     
@@ -10721,6 +10723,9 @@ async def finish_mines_game(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         text += f"💸 Потеряно: <b>{bet}</b> септимов\n"
     
     text += f"💵 Баланс: <b>{new_balance}</b> септимов"
+    if achievement_bonus:
+        ach = achievement_bonus['achievement']
+        text += f"\n\n🏆 <b>Достижение!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']}"
     
     # Очищаем игру
     del MINES_GAMES[user_id]
@@ -11012,6 +11017,8 @@ async def finish_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
     
     player = db.get_or_create_player(user_id, user.username or user.first_name)
+    achievement_bonus = check_casino_achievements(user_id, player)
+    player = db.get_or_create_player(user_id, user.username or user.first_name)
     new_balance = int(getattr(player, 'coins', 0) or 0)
     
     text = (
@@ -11027,6 +11034,9 @@ async def finish_crash_game(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         text += f"📊 Краш был на: <b>x{crash_point:.2f}</b>\n"
     
     text += f"💵 Баланс: <b>{new_balance}</b> септимов"
+    if achievement_bonus:
+        ach = achievement_bonus['achievement']
+        text += f"\n\n🏆 <b>Достижение!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']}"
     
     # Очищаем игру
     del CRASH_GAMES[user_id]
@@ -11185,7 +11195,8 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             result_line = f"💥 Поражение! Списано {amount} септимов."
             _casino_record_result(user.id, False)
 
-        # Перерисовываем экран с обновлённым балансом и результатом (новое меню)
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        achievement_bonus = check_casino_achievements(user.id, player)
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
         casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
@@ -11199,6 +11210,9 @@ async def handle_casino_bet(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
             "🎮 <b>Выберите игру:</b>"
         )
+        if achievement_bonus:
+            ach = achievement_bonus['achievement']
+            text += f"\n\n🏆 <b>Достижение!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']}"
         keyboard = [
             [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
             [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
@@ -11353,7 +11367,8 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
             result_line = f"💥 Поражение! Списано {bet_amount} септимов."
             _casino_record_result(user.id, False)
         
-        # Показываем результат с новым главным меню
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        achievement_bonus = check_casino_achievements(user.id, player)
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         casino_wins = int(getattr(player, 'casino_wins', 0) or 0)
         casino_losses = int(getattr(player, 'casino_losses', 0) or 0)
@@ -11367,6 +11382,9 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
             f"📊 Статистика: {casino_wins}✅ / {casino_losses}❌ ({win_rate:.1f}%)\n\n"
             "🎮 <b>Выберите игру:</b>"
         )
+        if achievement_bonus:
+            ach = achievement_bonus['achievement']
+            text += f"\n\n🏆 <b>Достижение!</b>\n{ach['name']}: {ach['desc']}\n💰 Бонус: +{achievement_bonus['bonus']}"
         keyboard = [
             [InlineKeyboardButton("🪙 Монетка", callback_data='casino_game_coin_flip')],
             [InlineKeyboardButton("🎲 Кости", callback_data='casino_game_dice'), 
