@@ -120,6 +120,7 @@ from constants import (
     PLANTATION_NEG_EVENT_DURATION_SEC,
 )
 import silk_ui
+import ordinary_plantation
 import swagashop
 import swaga_admin
 from admin_permissions import (
@@ -16237,6 +16238,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await gift_feature.handle_callback(update, context):
         return
 
+    if ordinary_plantation.can_handle_callback(data):
+        await ordinary_plantation.handle_callback(update, context, data)
+        return
+
     # Централизованная проверка прав для админских callback'ов по матрице.
     required_level = get_required_level_for_callback(data)
     if required_level is not None:
@@ -20668,34 +20673,7 @@ def main():
     )
     application.add_handler(casino_custom_bet_handler)
     
-    # Conversation handler для кастомной покупки удобрений
-    fertilizer_custom_buy_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_fertilizer_custom_buy_wrapper, pattern='^fert_buy_custom_')],
-        states={
-            FERTILIZER_CUSTOM_QTY: [MessageHandler(filters.TEXT & (~filters.COMMAND), handle_fertilizer_custom_qty_input)],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_fertilizer_custom_buy, pattern='^fert_custom_cancel$|^plantation_fertilizers_shop$')],
-        allow_reentry=True
-    )
-    application.add_handler(fertilizer_custom_buy_handler)
-
-    seed_custom_buy_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_seed_custom_buy_wrapper, pattern='^seed_buy_custom_')],
-        states={
-            SEED_CUSTOM_QTY: [
-                MessageHandler(filters.TEXT & (~filters.COMMAND), handle_seed_custom_qty_input),
-                CallbackQueryHandler(seed_custom_retry, pattern='^seed_custom_retry$'),
-                CallbackQueryHandler(seed_custom_buy_max, pattern='^seed_custom_buy_max$'),
-                CallbackQueryHandler(cancel_seed_custom_buy, pattern='^seed_custom_cancel$'),
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_seed_custom_buy, pattern='^seed_custom_cancel$|^plantation_shop$')],
-        allow_reentry=True
-    )
-    application.add_handler(seed_custom_buy_handler)
-    
-    application.add_handler(CallbackQueryHandler(toggle_plantation_reminder, pattern='^toggle_plantation_rem$'))
-    application.add_handler(CallbackQueryHandler(snooze_reminder_handler, pattern='^snooze_remind_'))
+    ordinary_plantation.register_handlers(application)
     application.add_handler(CallbackQueryHandler(toggle_auto_search_silent, pattern='^toggle_silent_mode$'))
     
     application.add_handler(CallbackQueryHandler(handle_selyuk_farmer_upgrade_action, pattern='^selyuk_farmer_upgrade_action$'))
@@ -20901,20 +20879,7 @@ def main():
         silk_monitor_delay = 45  # начинаем через 45 секунд после старта
         application.job_queue.run_repeating(silk_harvest_reminder_job, interval=silk_monitor_interval, first=silk_monitor_delay)
 
-        # Мониторинг автосбора урожая фермерами (каждые 10 минут)
-        farmer_harvest_interval = 10 * 60  # 10 минут
-        farmer_harvest_delay = 60  # начинаем через 1 минуту после старта
-        application.job_queue.run_repeating(global_farmer_harvest_job, interval=farmer_harvest_interval, first=farmer_harvest_delay)
-
-        farmer_fertilize_interval = 5 * 60
-        farmer_fertilize_delay = 75
-        application.job_queue.run_repeating(global_farmer_fertilize_job, interval=farmer_fertilize_interval, first=farmer_fertilize_delay)
-        application.job_queue.run_repeating(global_negative_effects_job, interval=60, first=90)
-
-        # Сводки фермера (для тихого режима)
-        farmer_summary_interval = 5 * 60
-        farmer_summary_delay = 90
-        application.job_queue.run_repeating(farmer_summary_job, interval=farmer_summary_interval, first=farmer_summary_delay)
+        ordinary_plantation.schedule_jobs(application)
 
         # --- Восстановление задач автопоиска VIP после рестарта ---
         try:
@@ -20975,12 +20940,6 @@ def main():
             await restore_scheduled_auto_deletes(context.application)
         
         application.job_queue.run_once(restore_auto_delete_on_startup, when=3)
-
-        # --- Восстановление напоминаний о поливе ---
-        async def restore_plantation_reminders_on_startup(context: ContextTypes.DEFAULT_TYPE):
-            await restore_plantation_reminders(context.application)
-            
-        application.job_queue.run_once(restore_plantation_reminders_on_startup, when=5)
 
     print("Бот запущен...")
     application.run_polling()
