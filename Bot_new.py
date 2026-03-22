@@ -123,6 +123,14 @@ import silk_ui
 import ordinary_plantation
 import swagashop
 import swaga_admin
+from youtube_downloader import (
+    FfmpegNotFoundError,
+    UnsupportedYoutubeUrlError,
+    YoutubeAudioDownloadError,
+    cleanup_downloaded_audio,
+    download_youtube_audio_async,
+    extract_first_youtube_url,
+)
 from admin_permissions import (
     get_effective_admin_level,
     has_admin_level,
@@ -174,6 +182,14 @@ async def _send_photo_long(call, **kwargs):
 async def _send_media_group_long(call, **kwargs):
     kwargs.setdefault('read_timeout', 60.0)
     kwargs.setdefault('write_timeout', 60.0)
+    kwargs.setdefault('connect_timeout', 20.0)
+    kwargs.setdefault('pool_timeout', 20.0)
+    return await _tg_call_with_retry(call, retries=3, base_delay=1.5, **kwargs)
+
+
+async def _send_audio_long(call, **kwargs):
+    kwargs.setdefault('read_timeout', 120.0)
+    kwargs.setdefault('write_timeout', 120.0)
     kwargs.setdefault('connect_timeout', 20.0)
     kwargs.setdefault('pool_timeout', 20.0)
     return await _tg_call_with_retry(call, retries=3, base_delay=1.5, **kwargs)
@@ -16261,18 +16277,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await swagashop.show_swaga_chests_inv(update, context)
     elif data == 'swaga_tracks_inv':
         await swagashop.show_swaga_tracks_inv(update, context, page=1)
+    elif data == 'swaga_recent_tracks':
+        await swagashop.show_recent_swaga_tracks(update, context, page=1)
     elif data.startswith('swaga_exchange_'):
         rarity = data.split('swaga_exchange_')[1]
         await swagashop.handle_swaga_exchange(update, context, rarity)
     elif data.startswith('swaga_upgrade_'):
-        rarity = data.split('swaga_upgrade_')[1]
-        await swagashop.handle_swaga_upgrade(update, context, rarity)
+        payload = data.split('swaga_upgrade_')[1]
+        parts = payload.rsplit('_', 2)
+        if len(parts) == 3:
+            rarity, cost, reward_qty = parts
+            await swagashop.handle_swaga_upgrade(update, context, rarity, cost=int(cost), reward_qty=int(reward_qty))
+        else:
+            rarity = payload
+            await swagashop.handle_swaga_upgrade(update, context, rarity)
     elif data.startswith('swaga_open_'):
         rarity = data.split('swaga_open_')[1]
         await swagashop.handle_swaga_open_chest(update, context, rarity)
     elif data.startswith('swaga_tracks_page_'):
         page = int(data.split('swaga_tracks_page_')[1])
         await swagashop.show_swaga_tracks_inv(update, context, page=page)
+    elif data.startswith('swaga_recent_tracks_page_'):
+        page = int(data.split('swaga_recent_tracks_page_')[1])
+        await swagashop.show_recent_swaga_tracks(update, context, page=page)
     elif data.startswith('swaga_play_'):
         track_id = int(data.split('swaga_play_')[1])
         await swagashop.handle_swaga_play_track(update, context, track_id)
@@ -19841,11 +19868,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/leaderboard — leaderboard by drinks.\n"
             "/moneyleaderboard — leaderboard by coins.\n"
             "/find — quick find (works in groups too).\n"
+            "/yt <link> — download MP3 from YouTube / YouTube Music.\n"
             "/myreceipts — your TG Premium receipts.\n"
             "/myboosts — your auto-search boosts history.\n"
             "/help — this message.\n\n"
             "<b>Tips:</b>\n"
             "• You can just type: \"<b>Find energy</b>\" — I will understand.\n"
+            "• In DM you can also just send a YouTube link and I will download the track.\n"
             "• In groups you can gift drinks: /gift @username (bot will send the menu in DM)."
         )
     else:
@@ -19868,14 +19897,113 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/leaderboard — таблица лидеров по энергетикам.\n"
             "/moneyleaderboard — таблица лидеров по деньгам.\n"
             "/find — быстро найти энергетик (работает и в группах).\n"
+            "/yt <ссылка> — скачать MP3 из YouTube / YouTube Music.\n"
             "/myreceipts — ваши последние чеки TG Premium.\n"
             "/myboosts — ваша история автопоиск бустов.\n"
             "/help — это сообщение.\n\n"
             "<b>Подсказки:</b>\n"
             "• Можно просто написать в чат \"<b>Найти энергетик</b>\", \"<b>Найди энергетик</b>\" или \"<b>Получить энергетик</b>\" — я всё пойму.\n"
+            "• В личке можно просто отправить ссылку на YouTube, и я попробую скачать трек.\n"
             "• В группах можно дарить напитки друзьям: /gift @username (бот пришлёт выбор в личку)."
         )
     await update.message.reply_html(text, disable_web_page_preview=True)
+
+
+async def _handle_youtube_download_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    raw_input: str,
+    *,
+    from_prompt: bool = False,
+):
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
+        return
+    if getattr(chat, 'type', None) != 'private':
+        await msg.reply_text("Скачивание с YouTube доступно только в личных сообщениях бота.")
+        return
+
+    url = extract_first_youtube_url(raw_input or "")
+    if not url:
+        if from_prompt:
+            context.user_data['awaiting_youtube_url'] = True
+        await msg.reply_text("Пришли корректную ссылку на YouTube или YouTube Music.")
+        return
+
+    lock = _get_lock(f"user:{user.id}:youtube_download")
+    if lock.locked():
+        await msg.reply_text("Скачивание уже выполняется. Дождись завершения текущей загрузки.")
+        return
+
+    status_message = await msg.reply_text("Скачиваю трек и конвертирую в MP3, это может занять до минуты.")
+    result = None
+    async with lock:
+        try:
+            result = await download_youtube_audio_async(url)
+            title_html = html.escape(result.title)
+            uploader_html = html.escape(result.uploader)
+
+            if result.thumbnail_path and result.thumbnail_path.exists():
+                with open(result.thumbnail_path, 'rb') as photo:
+                    await _send_photo_long(
+                        context.bot.send_photo,
+                        chat_id=chat.id,
+                        photo=photo,
+                        caption=f"Обложка: <b>{title_html}</b>",
+                        parse_mode='HTML',
+                    )
+
+            thumb_handle = None
+            try:
+                if result.thumbnail_path and result.thumbnail_path.exists():
+                    thumb_handle = open(result.thumbnail_path, 'rb')
+                with open(result.audio_path, 'rb') as audio_file:
+                    await _send_audio_long(
+                        context.bot.send_audio,
+                        chat_id=chat.id,
+                        audio=audio_file,
+                        caption=f"🎵 <b>{title_html}</b>\n👤 {uploader_html}",
+                        parse_mode='HTML',
+                        title=result.title[:255],
+                        performer=result.uploader[:255] if result.uploader else None,
+                        thumbnail=thumb_handle,
+                    )
+            finally:
+                if thumb_handle:
+                    try:
+                        thumb_handle.close()
+                    except Exception:
+                        pass
+
+            await status_message.edit_text("Готово.")
+        except UnsupportedYoutubeUrlError:
+            await status_message.edit_text("Поддерживаются только ссылки на YouTube и YouTube Music.")
+        except FfmpegNotFoundError:
+            await status_message.edit_text("На сервере не найден ffmpeg. Установи ffmpeg, и MP3-конвертация заработает.")
+        except YoutubeAudioDownloadError as exc:
+            logger.warning("[YTDL] Download failed for user %s: %s", user.id, exc)
+            await status_message.edit_text("Не удалось скачать этот трек. Возможно, ссылка недоступна или YouTube временно режет доступ.")
+        except Exception as exc:
+            logger.exception("[YTDL] Unexpected error for user %s", user.id)
+            await status_message.edit_text("Произошла ошибка при скачивании трека. Попробуй позже.")
+        finally:
+            cleanup_downloaded_audio(result)
+
+
+async def youtube_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await abort_if_banned(update, context):
+        return
+    msg = update.effective_message
+    if not msg:
+        return
+    raw_input = " ".join(context.args or []).strip()
+    if not raw_input:
+        context.user_data['awaiting_youtube_url'] = True
+        await msg.reply_text("Пришли ссылку на YouTube или YouTube Music, и я скачаю MP3 с обложкой.")
+        return
+    await _handle_youtube_download_request(update, context, raw_input)
 
 
 async def promo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -20227,6 +20355,16 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     chat = update.effective_chat
+    if context.user_data.get('awaiting_youtube_url'):
+        context.user_data.pop('awaiting_youtube_url', None)
+        await _handle_youtube_download_request(update, context, incoming, from_prompt=True)
+        return
+
+    youtube_url = extract_first_youtube_url(incoming)
+    if chat and getattr(chat, 'type', None) == 'private' and youtube_url:
+        await _handle_youtube_download_request(update, context, youtube_url)
+        return
+
     if chat and getattr(chat, 'type', None) == 'private':
         norm_simple = "".join(ch for ch in incoming.lower() if ch.isalnum() or ch.isspace()).strip()
         if norm_simple == 'меню':
@@ -20690,6 +20828,7 @@ def main():
     application.add_handler(CommandHandler("giftstats", gift_feature.giftstats_command))
     # Тихая регистрация групп по любым групповым сообщениям/командам
     application.add_handler(CommandHandler("find", find_command))
+    application.add_handler(CommandHandler(["yt", "ytmp3", "ytmusic"], youtube_download_command))
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler("groupsettings", groupsettings_command))
 

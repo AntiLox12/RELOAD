@@ -1,5 +1,6 @@
 import os
 import random
+from datetime import datetime
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaAudio
 from telegram.ext import ContextTypes
 import database as db
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 SWAGA_CHEST_EXCHANGE_COST = 100
 SWAGA_UPGRADE_SUPER_RARE_TARGETS = {"Swaga", "Мистербист"}
+SWAGA_TRACKS_PER_PAGE = 10
 
 
 def _swaga_higher_rarity(rarity: str) -> str | None:
@@ -33,6 +35,23 @@ def _swaga_upgrade_cost(target_rarity: str) -> int:
     return 20 if str(target_rarity) in SWAGA_UPGRADE_SUPER_RARE_TARGETS else 10
 
 
+def _swaga_upgrade_options(target_rarity: str) -> list[tuple[int, int]]:
+    """Return allowed upgrade bundles as (cost, reward_qty)."""
+    base_cost = _swaga_upgrade_cost(target_rarity)
+    return [(base_cost, 1), (base_cost * 5, 5), (base_cost * 10, 10)]
+
+
+def _format_swaga_track_added_at(created_at: int | None) -> str:
+    """Форматирует время добавления трека без секунд."""
+    try:
+        ts = int(created_at or 0)
+        if ts <= 0:
+            return "Не указано"
+        return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "Не указано"
+
+
 async def show_swaga_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню магазина Сваги."""
     query = update.callback_query
@@ -47,13 +66,14 @@ async def show_swaga_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Добро пожаловать в Свага Шоп! Здесь ты можешь обменять накопленные "
         "Свага Карточки на Свага Сундуки, а также открыть их, чтобы получить уникальные треки!\n\n"
         "<i>Курс обмена: 100 карточек = 1 сундук той же редкости.</i>\n"
-        "<i>Апгрейд карточек: 10 карточек = 1 карточка на 1 редкость выше (в Swaga/Мистербист: 20).</i>"
+        "<i>Upgrade cards: 10 -> 1, 50 -> 5, 100 -> 10 (Swaga/MisterBeast: 20 -> 1, 100 -> 5, 200 -> 10).</i>"
     )
 
     keyboard = [
         [InlineKeyboardButton("🎴 Мои Свага Карточки", callback_data="swaga_cards_inv")],
         [InlineKeyboardButton("📦 Мои Свага Сундуки", callback_data="swaga_chests_inv")],
         [InlineKeyboardButton("💿 Мои Свага Треки", callback_data="swaga_tracks_inv")],
+        [InlineKeyboardButton("🆕 Недавно добавленные треки", callback_data="swaga_recent_tracks")],
         [InlineKeyboardButton("🔙 В главное меню", callback_data="menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -86,7 +106,7 @@ async def show_swaga_cards_inv(update: Update, context: ContextTypes.DEFAULT_TYP
     text = (
         "🎴 <b>Мои Свага Карточки</b>\n\n"
         "• Обмен на сундук: 100 карточек = 1 сундук той же редкости.\n"
-        "• Апгрейд: 10 карточек = 1 карточка на 1 редкость выше (в Swaga/Мистербист: 20).\n\n"
+        "* Upgrade: 10 -> 1, 50 -> 5, 100 -> 10 (Swaga/MisterBeast: 20 -> 1, 100 -> 5, 200 -> 10).\n\n"
     )
     has_cards = False
     keyboard = []
@@ -101,12 +121,12 @@ async def show_swaga_cards_inv(update: Update, context: ContextTypes.DEFAULT_TYP
             higher = _swaga_higher_rarity(rarity)
             if higher:
                 higher_emoji = SWAGA_COLOR_EMOJIS.get(higher, '⚫')
-                upgrade_cost = _swaga_upgrade_cost(higher)
-                if count >= upgrade_cost:
-                    keyboard.append([InlineKeyboardButton(
-                        f"⬆️ {upgrade_cost} {emoji} {rarity} → 1 {higher_emoji} {higher}",
-                        callback_data=f"swaga_upgrade_{rarity}"
-                    )])
+                for upgrade_cost, reward_qty in _swaga_upgrade_options(higher):
+                    if count >= upgrade_cost:
+                        keyboard.append([InlineKeyboardButton(
+                            f"UPGRADE {upgrade_cost} {emoji} {rarity} -> {reward_qty} {higher_emoji} {higher}",
+                            callback_data=f"swaga_upgrade_{rarity}_{upgrade_cost}_{reward_qty}"
+                        )])
 
             if count >= SWAGA_CHEST_EXCHANGE_COST:
                 keyboard.append([InlineKeyboardButton(
@@ -166,32 +186,51 @@ async def handle_swaga_exchange(update: Update, context: ContextTypes.DEFAULT_TY
         await show_swaga_cards_inv(update, context)
 
 
-async def handle_swaga_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE, rarity: str):
-    """Апгрейд карточек: rarity -> на 1 редкость выше."""
+async def handle_swaga_upgrade(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    rarity: str,
+    cost: int | None = None,
+    reward_qty: int | None = None,
+):
+    """Upgrade cards: rarity -> one tier higher."""
     query = update.callback_query
     user_id = query.from_user.id
 
     higher = _swaga_higher_rarity(rarity)
     if not higher:
-        await query.answer("Эту редкость нельзя улучшить.", show_alert=True)
+        await query.answer("This rarity cannot be upgraded.", show_alert=True)
         return
 
-    cost = _swaga_upgrade_cost(higher)
+    allowed_options = set(_swaga_upgrade_options(higher))
+    if cost is None or reward_qty is None:
+        cost, reward_qty = _swaga_upgrade_cost(higher), 1
+
+    try:
+        cost = int(cost)
+        reward_qty = int(reward_qty)
+    except (TypeError, ValueError):
+        await query.answer("Invalid upgrade format.", show_alert=True)
+        return
+
+    if (cost, reward_qty) not in allowed_options:
+        await query.answer("Upgrade option is not allowed.", show_alert=True)
+        return
 
     db_session = db.SessionLocal()
     success = False
     try:
         cur = db_session.query(db.SwagaCardInventory).filter_by(user_id=user_id, rarity=rarity).first()
         if not cur or int(cur.quantity or 0) < int(cost):
-            await query.answer("Недостаточно карточек для апгрейда!", show_alert=True)
+            await query.answer("Not enough cards for upgrade!", show_alert=True)
             return
 
         cur.quantity -= cost
         up = db_session.query(db.SwagaCardInventory).filter_by(user_id=user_id, rarity=higher).first()
         if up:
-            up.quantity += 1
+            up.quantity += reward_qty
         else:
-            db_session.add(db.SwagaCardInventory(user_id=user_id, rarity=higher, quantity=1))
+            db_session.add(db.SwagaCardInventory(user_id=user_id, rarity=higher, quantity=reward_qty))
 
         db_session.commit()
         success = True
@@ -201,14 +240,17 @@ async def handle_swaga_upgrade(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
         logger.error(f"Error in swaga upgrade: {e}")
-        await query.answer("Ошибка апгрейда!", show_alert=True)
+        await query.answer("Upgrade error!", show_alert=True)
     finally:
         db_session.close()
 
     if success:
-        e_from = SWAGA_COLOR_EMOJIS.get(rarity, '⚫')
-        e_to = SWAGA_COLOR_EMOJIS.get(higher, '⚫')
-        await query.answer(f"✅ Апгрейд: {cost} {e_from} {rarity} → 1 {e_to} {higher}", show_alert=True)
+        e_from = SWAGA_COLOR_EMOJIS.get(rarity, '?')
+        e_to = SWAGA_COLOR_EMOJIS.get(higher, '?')
+        await query.answer(
+            f"Upgrade: {cost} {e_from} {rarity} -> {reward_qty} {e_to} {higher}",
+            show_alert=True,
+        )
         await show_swaga_cards_inv(update, context)
 
 
@@ -411,7 +453,6 @@ async def show_swaga_tracks_inv(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    PER_PAGE = 10
 
     db_session = db.SessionLocal()
     tracks = []
@@ -446,12 +487,12 @@ async def show_swaga_tracks_inv(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(chat_id=user_id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         return
 
-    total_pages = max(1, (len(tracks) - 1) // PER_PAGE + 1)
+    total_pages = max(1, (len(tracks) - 1) // SWAGA_TRACKS_PER_PAGE + 1)
     if page < 1: page = 1
     if page > total_pages: page = total_pages
 
-    start_idx = (page - 1) * PER_PAGE
-    end_idx = start_idx + PER_PAGE
+    start_idx = (page - 1) * SWAGA_TRACKS_PER_PAGE
+    end_idx = start_idx + SWAGA_TRACKS_PER_PAGE
     page_tracks = tracks[start_idx:end_idx]
 
     text = f"💿 <b>Мои Свага Треки</b> (Стр {page}/{total_pages})\n\n"
@@ -469,6 +510,84 @@ async def show_swaga_tracks_inv(update: Update, context: ContextTypes.DEFAULT_TY
     if nav_row:
         keyboard.append(nav_row)
 
+    keyboard.append([InlineKeyboardButton("🔙 Назад в Свага Шоп", callback_data="swaga_shop")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode='HTML')
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_recent_swaga_tracks(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    """Список недавно добавленных свага-треков с пагинацией."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    db_session = db.SessionLocal()
+    tracks = []
+    try:
+        tracks = (
+            db_session.query(db.SwagaTrack)
+            .order_by(db.SwagaTrack.created_at.desc(), db.SwagaTrack.id.desc())
+            .all()
+        )
+    finally:
+        db_session.close()
+
+    if not tracks:
+        text = "🆕 <b>Недавно добавленные Свага Треки</b>\n\nВ базе пока нет добавленных треков."
+        keyboard = [[InlineKeyboardButton("🔙 Назад в Свага Шоп", callback_data="swaga_shop")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode='HTML')
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        return
+
+    total_pages = max(1, (len(tracks) - 1) // SWAGA_TRACKS_PER_PAGE + 1)
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+
+    start_idx = (page - 1) * SWAGA_TRACKS_PER_PAGE
+    end_idx = start_idx + SWAGA_TRACKS_PER_PAGE
+    page_tracks = tracks[start_idx:end_idx]
+
+    lines = [f"🆕 <b>Недавно добавленные Свага Треки</b> (Стр {page}/{total_pages})", ""]
+    for idx, trk in enumerate(page_tracks, start=start_idx + 1):
+        emoji = SWAGA_COLOR_EMOJIS.get(trk.rarity, '⚫')
+        added_at = _format_swaga_track_added_at(getattr(trk, 'created_at', 0))
+        lines.append(
+            f"{idx}. <b>{trk.name}</b>\n"
+            f"Редкость: {emoji} {trk.rarity}\n"
+            f"Добавлен: {added_at}"
+        )
+
+    lines.extend([
+        "",
+        "ℹ️ <i>Редкость трека указывает администратор при добавлении. Это его личная субъективная оценка, с которой игроки могут не соглашаться.</i>",
+    ])
+    text = "\n\n".join(lines)
+
+    keyboard = []
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"swaga_recent_tracks_page_{page-1}"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"swaga_recent_tracks_page_{page+1}"))
+    if nav_row:
+        keyboard.append(nav_row)
     keyboard.append([InlineKeyboardButton("🔙 Назад в Свага Шоп", callback_data="swaga_shop")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
