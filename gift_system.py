@@ -38,20 +38,177 @@ class GiftFeature:
         self.next_gift_id = 1
         self.selection_state: dict[int, dict[str, Any]] = {}
 
+    def _format_timestamp(self, timestamp: int | None) -> str:
+        if not timestamp:
+            return "—"
+        try:
+            return time.strftime("%d.%m.%Y %H:%M", time.localtime(int(timestamp)))
+        except Exception:
+            return "—"
+
+    def _build_user_display(self, user_id: int | None, username: str | None = None, display_name: str | None = None) -> str:
+        if username:
+            return f"@{username}"
+        if display_name:
+            return str(display_name)
+        if user_id:
+            return str(user_id)
+        return "пользователь"
+
+    def _resolve_username_recipient(self, username: str | None) -> tuple[int | None, str]:
+        uname = (username or "").lstrip("@").strip()
+        if not uname:
+            return (None, "")
+        player = db.get_player_by_username(uname)
+        if not player:
+            return (None, f"@{uname}")
+        return (
+            int(player.user_id),
+            self._build_user_display(
+                int(player.user_id),
+                getattr(player, "username", None),
+                getattr(player, "display_name", None),
+            ),
+        )
+
+    def _format_restriction_message(self, restriction: dict | None) -> str:
+        if not restriction:
+            return "Ограничение на подарки активно."
+        text = html.escape(restriction.get("reason") or "Нарушение правил дарения")
+        blocked_until = restriction.get("blocked_until")
+        if blocked_until:
+            text += f"\nДо: {self._format_timestamp(blocked_until)}"
+        return text
+
+    def _build_gift_flow_snapshot(self, giver_id: int, recipient_id: int | None) -> dict:
+        settings = db.get_gift_autoblock_settings()
+        gifts_sent_today = db.get_user_gifts_sent_today(giver_id)
+        remaining_daily = max(self.DAILY_LIMIT - gifts_sent_today, 0)
+        recipient_stats = None
+        recipient_warning = None
+        if settings["enabled"]:
+            if recipient_id:
+                recipient_stats = db.get_consecutive_gift_stats(
+                    giver_id,
+                    recipient_id,
+                    limit=settings["consecutive_limit"],
+                    planned_gifts=0,
+                )
+            else:
+                recipient_warning = (
+                    "Точный лимит подряд доступен, если получатель известен по ID. "
+                    "Используйте reply на сообщение пользователя или дождитесь, пока он появится в базе."
+                )
+        return {
+            "settings": settings,
+            "gifts_sent_today": gifts_sent_today,
+            "remaining_daily": remaining_daily,
+            "recipient_stats": recipient_stats,
+            "recipient_warning": recipient_warning,
+        }
+
+    def _refresh_selection_snapshot(self, state: dict[str, Any], giver_id: int) -> dict:
+        snapshot = self._build_gift_flow_snapshot(giver_id, state.get("recipient_id"))
+        state["gifts_sent_today"] = snapshot["gifts_sent_today"]
+        state["max_gifts"] = min(self.MAX_BUNDLE_SIZE, snapshot["remaining_daily"])
+        state["gift_snapshot"] = snapshot
+        return snapshot
+
+    def _project_recipient_stats(self, snapshot: dict, planned_gifts: int) -> dict | None:
+        stats = snapshot.get("recipient_stats")
+        if not stats:
+            return None
+        planned_gifts = max(0, int(planned_gifts or 0))
+        projected_streak = int(stats["current_streak"]) + planned_gifts
+        limit = int(stats["limit"])
+        return {
+            "current_streak": int(stats["current_streak"]),
+            "remaining_before_block": int(stats["remaining_before_block"]),
+            "projected_streak": projected_streak,
+            "would_trigger": projected_streak > limit,
+            "limit": limit,
+        }
+
+    def _render_gift_limit_block(self, snapshot: dict, planned_gifts: int = 0) -> str:
+        lines = [
+            f"📊 Сегодня отправлено: <b>{snapshot['gifts_sent_today']}/{self.DAILY_LIMIT}</b>",
+            f"🎯 Осталось на сегодня: <b>{snapshot['remaining_daily']}</b>",
+        ]
+        settings = snapshot["settings"]
+        if not settings["enabled"]:
+            lines.append("🛡️ Gift-защита: <b>выключена</b>")
+            return "\n".join(lines)
+
+        stats = snapshot.get("recipient_stats")
+        if stats:
+            projected = self._project_recipient_stats(snapshot, planned_gifts)
+            lines.append(
+                f"🧱 Серия этому получателю: <b>{stats['current_streak']}/{stats['limit']}</b>"
+            )
+            lines.append(
+                f"⚠️ Ещё можно подряд без блока: <b>{stats['remaining_before_block']}</b>"
+            )
+            if planned_gifts > 0 and projected:
+                lines.append(
+                    f"📦 С учётом корзины будет: <b>{projected['projected_streak']}/{projected['limit']}</b>"
+                )
+                if projected["would_trigger"]:
+                    lines.append("🚫 Эта корзина вызовет автоблокировку.")
+                elif projected["limit"] - projected["projected_streak"] <= 1:
+                    lines.append("⚠️ Лимит почти достигнут.")
+        elif snapshot.get("recipient_warning"):
+            lines.append(f"ℹ️ {snapshot['recipient_warning']}")
+        return "\n".join(lines)
+
+    def _build_autoblock_reasons(self, limit: int) -> tuple[str, str]:
+        return (
+            f"Подозрительная активность: более {limit} подарков подряд одному пользователю",
+            f"Подозрительная активность: получение более {limit} подарков подряд от одного пользователя",
+        )
+
+    def _apply_gift_autoblock(
+        self,
+        giver_id: int,
+        recipient_id: int | None,
+        *,
+        limit: int,
+        duration_sec: int,
+        blocked_by: int | None = None,
+    ) -> int:
+        blocked_until = int(time.time()) + int(duration_sec)
+        giver_reason, recipient_reason = self._build_autoblock_reasons(limit)
+        db.add_gift_restriction(giver_id, giver_reason, blocked_until=blocked_until, blocked_by=blocked_by)
+        if recipient_id:
+            db.add_gift_restriction(recipient_id, recipient_reason, blocked_until=blocked_until, blocked_by=blocked_by)
+        return blocked_until
+
+    def _autoblock_text(self, blocked_until: int) -> str:
+        until_text = self._format_timestamp(blocked_until)
+        return (
+            "🚫 <b>Обнаружена подозрительная активность!</b>\n\n"
+            "Даритель и получатель получили временную gift-блокировку.\n"
+            f"Срок окончания: <b>{until_text}</b>\n\n"
+            "Обратитесь к администратору, если это ошибка."
+        )
+
     async def giftstats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         try:
             stats = db.get_gift_stats(user_id)
             gifts_sent_today = db.get_user_gifts_sent_today(user_id)
-            is_blocked, reason = db.is_user_gift_restricted(user_id)
+            restriction = db.get_gift_restriction_info(user_id)
             text = (
                 "📊 <b>Статистика подарков</b>\n\n"
                 f"🎁 Отправлено всего: <b>{stats['sent']}</b>\n"
                 f"🎉 Получено всего: <b>{stats['received']}</b>\n"
                 f"📅 Отправлено сегодня: <b>{gifts_sent_today}/{self.DAILY_LIMIT}</b>\n\n"
             )
-            if is_blocked:
-                text += f"🚫 <b>Статус:</b> Заблокирован\n<i>Причина: {html.escape(reason)}</i>"
+            if restriction:
+                text += (
+                    "🚫 <b>Статус:</b> Заблокирован\n"
+                    f"<i>Причина: {html.escape(restriction['reason'])}</i>\n"
+                    f"<i>До: {self._format_timestamp(restriction.get('blocked_until'))}</i>"
+                )
             else:
                 text += "✅ <b>Статус:</b> Активен"
             await update.message.reply_html(text)
@@ -97,7 +254,7 @@ class GiftFeature:
                 )
                 return
             recipient_username = args[0].lstrip("@").strip()
-            recipient_display = f"@{recipient_username}"
+            recipient_id, recipient_display = self._resolve_username_recipient(recipient_username)
 
         giver_id = update.effective_user.id
         if recipient_id and recipient_id == giver_id:
@@ -108,21 +265,21 @@ class GiftFeature:
             )
             return
 
-        is_blocked, reason = db.is_user_gift_restricted(giver_id)
-        if is_blocked:
+        giver_restriction = db.get_gift_restriction_info(giver_id)
+        if giver_restriction:
             await self.reply_auto_delete_message(
                 update.message,
-                f"🚫 Вы не можете дарить подарки.\nПричина: {reason}",
+                f"🚫 Вы не можете дарить подарки.\n{self._format_restriction_message(giver_restriction)}",
                 context=context,
             )
             return
 
         if recipient_id:
-            is_recipient_blocked, _ = db.is_user_gift_restricted(recipient_id)
-            if is_recipient_blocked:
+            recipient_restriction = db.get_gift_restriction_info(recipient_id)
+            if recipient_restriction:
                 await self.reply_auto_delete_message(
                     update.message,
-                    "🚫 Получатель не может принимать подарки.",
+                    f"🚫 Получатель временно не может принимать подарки.\n{self._format_restriction_message(recipient_restriction)}",
                     context=context,
                 )
                 return
@@ -167,7 +324,7 @@ class GiftFeature:
             "group_id": update.effective_chat.id,
             "recipient_username": recipient_username or "",
             "recipient_id": recipient_id,
-            "recipient_display": recipient_display,
+            "recipient_display": recipient_display or f"@{recipient_username}",
             "inventory_items": inventory_items,
             "gifts_sent_today": gifts_sent_today,
             "max_gifts": min(self.MAX_BUNDLE_SIZE, remaining_daily),
@@ -176,6 +333,7 @@ class GiftFeature:
             "search_query": None,
             "awaiting_search": False,
             "search_message_id": None,
+            "gift_snapshot": self._build_gift_flow_snapshot(giver_id, recipient_id),
         }
 
         try:
@@ -311,6 +469,7 @@ class GiftFeature:
             return
 
         self._refresh_inventory(state, user_id)
+        snapshot = self._refresh_selection_snapshot(state, user_id)
         if search_query is not None:
             state["search_query"] = search_query
         search_query = state.get("search_query")
@@ -327,6 +486,7 @@ class GiftFeature:
         selected_total = self._selected_total(state)
         max_gifts = state["max_gifts"]
         summary = self._cart_summary(state)
+        limits_block = self._render_gift_limit_block(snapshot, planned_gifts=selected_total)
 
         if not filtered_items:
             text = (
@@ -334,7 +494,7 @@ class GiftFeature:
                 f"❌ Ничего не найдено по запросу: <i>{html.escape(search_query or '')}</i>\n\n"
                 f"👤 Получатель: {html.escape(state['recipient_display'])}\n"
                 f"🧺 В корзине: <b>{selected_total}/{max_gifts}</b>\n"
-                f"📊 Сегодня: {state['gifts_sent_today']}/{self.DAILY_LIMIT}\n\n"
+                f"{limits_block}\n\n"
                 f"{summary}"
             )
             keyboard = InlineKeyboardMarkup(
@@ -359,7 +519,7 @@ class GiftFeature:
             "🎁 <b>Подарки пачкой</b>\n\n"
             f"👤 Получатель: {html.escape(state['recipient_display'])}\n"
             f"🧺 В корзине: <b>{selected_total}/{max_gifts}</b>{search_info}\n"
-            f"📊 Сегодня: {state['gifts_sent_today']}/{self.DAILY_LIMIT}\n"
+            f"{limits_block}\n"
             f"📄 Страница {page}/{total_pages} ({total_items} поз.)\n\n"
             f"{summary}"
         )
@@ -433,6 +593,12 @@ class GiftFeature:
                     return
 
             recipient_id = query.from_user.id
+            offer["recipient_id"] = recipient_id
+            offer["recipient_display"] = self._build_user_display(
+                recipient_id,
+                getattr(query.from_user, "username", None),
+                getattr(query.from_user, "full_name", None) or getattr(query.from_user, "first_name", None),
+            )
             if not accepted:
                 self._log_bundle(offer, recipient_id, "declined")
                 try:
@@ -453,6 +619,58 @@ class GiftFeature:
                     pass
                 self.gift_offers.pop(gift_id, None)
                 return
+
+            giver_restriction = db.get_gift_restriction_info(offer["giver_id"])
+            if giver_restriction:
+                self.gift_offers.pop(gift_id, None)
+                await query.edit_message_text(
+                    f"🚫 Даритель сейчас не может отправлять подарки.\n\n{self._format_restriction_message(giver_restriction)}",
+                    parse_mode="HTML",
+                )
+                return
+
+            recipient_restriction = db.get_gift_restriction_info(recipient_id)
+            if recipient_restriction:
+                self.gift_offers.pop(gift_id, None)
+                await query.edit_message_text(
+                    f"🚫 Вы сейчас не можете принимать подарки.\n\n{self._format_restriction_message(recipient_restriction)}",
+                    parse_mode="HTML",
+                )
+                return
+
+            settings = db.get_gift_autoblock_settings()
+            if settings["enabled"]:
+                streak_stats = db.get_consecutive_gift_stats(
+                    offer["giver_id"],
+                    recipient_id,
+                    limit=settings["consecutive_limit"],
+                    planned_gifts=offer["total_quantity"],
+                )
+                if streak_stats["would_trigger"]:
+                    blocked_until = self._apply_gift_autoblock(
+                        offer["giver_id"],
+                        recipient_id,
+                        limit=settings["consecutive_limit"],
+                        duration_sec=settings["duration_sec"],
+                    )
+                    try:
+                        await context.bot.send_message(
+                            chat_id=offer["giver_id"],
+                            text=(
+                                "🚫 <b>Подарок не был передан.</b>\n\n"
+                                "Сработала защита от подозрительной серии подарков.\n"
+                                f"Срок gift-блокировки: <b>до {self._format_timestamp(blocked_until)}</b>"
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                    self.gift_offers.pop(gift_id, None)
+                    await query.edit_message_text(
+                        self._autoblock_text(blocked_until),
+                        parse_mode="HTML",
+                    )
+                    return
 
             giver_lock = self.get_lock(f"gift-transfer:{offer['giver_id']}")
             async with giver_lock:
@@ -619,6 +837,7 @@ class GiftFeature:
             await query.answer("Сессия истекла", show_alert=True)
             return
         self._refresh_inventory(state, query.from_user.id)
+        snapshot = self._refresh_selection_snapshot(state, query.from_user.id)
         item = self._find_item(state, item_id)
         if not item or int(item.quantity or 0) <= 0:
             state["cart"].pop(item_id, None)
@@ -629,6 +848,7 @@ class GiftFeature:
         remaining_slots = state["max_gifts"] - self._selected_total(state)
         available_to_add = max(0, min(int(item.quantity) - selected, remaining_slots))
         rarity_emoji = self.get_rarity_emoji(item.rarity)
+        limits_block = self._render_gift_limit_block(snapshot, planned_gifts=self._selected_total(state))
         text = (
             "🎁 <b>Настройка подарка</b>\n\n"
             f"{rarity_emoji} <b>{html.escape(item.drink.name)}</b>\n"
@@ -636,6 +856,7 @@ class GiftFeature:
             f"В инвентаре: <b>{item.quantity}</b>\n"
             f"В корзине: <b>{selected}</b>\n"
             f"Можно добавить ещё: <b>{available_to_add}</b>\n\n"
+            f"{limits_block}\n\n"
             f"{self._cart_summary(state)}"
         )
 
@@ -730,14 +951,24 @@ class GiftFeature:
             await query.answer("Сессия истекла", show_alert=True)
             return
         self._refresh_inventory(state, query.from_user.id)
+        snapshot = self._refresh_selection_snapshot(state, query.from_user.id)
 
         total_selected = self._selected_total(state)
         if total_selected <= 0:
             await query.answer("Корзина пуста.", show_alert=True)
             return
 
-        current_sent = db.get_user_gifts_sent_today(query.from_user.id)
-        remaining_daily = self.DAILY_LIMIT - current_sent
+        giver_restriction = db.get_gift_restriction_info(query.from_user.id)
+        if giver_restriction:
+            self.selection_state.pop(query.from_user.id, None)
+            await query.edit_message_text(
+                f"🚫 Дарение недоступно.\n\n{self._format_restriction_message(giver_restriction)}",
+                parse_mode="HTML",
+            )
+            return
+
+        current_sent = snapshot["gifts_sent_today"]
+        remaining_daily = snapshot["remaining_daily"]
         if total_selected > remaining_daily:
             state["gifts_sent_today"] = current_sent
             state["max_gifts"] = min(self.MAX_BUNDLE_SIZE, max(0, remaining_daily))
@@ -759,25 +990,37 @@ class GiftFeature:
             return
 
         recipient_id = state.get("recipient_id")
-        if recipient_id and db.check_consecutive_gifts(query.from_user.id, recipient_id, limit=10):
-            db.add_gift_restriction(
+        if recipient_id:
+            recipient_restriction = db.get_gift_restriction_info(recipient_id)
+            if recipient_restriction:
+                self.selection_state.pop(query.from_user.id, None)
+                await query.edit_message_text(
+                    f"🚫 Получатель не может принять подарок.\n\n{self._format_restriction_message(recipient_restriction)}",
+                    parse_mode="HTML",
+                )
+                return
+
+        settings = snapshot["settings"]
+        if recipient_id and settings["enabled"]:
+            streak_stats = db.get_consecutive_gift_stats(
                 query.from_user.id,
-                "Подозрительная активность: более 10 подарков подряд одному пользователю",
-                blocked_until=None,
-            )
-            db.add_gift_restriction(
                 recipient_id,
-                "Подозрительная активность: получение более 10 подарков подряд от одного пользователя",
-                blocked_until=None,
+                limit=settings["consecutive_limit"],
+                planned_gifts=total_selected,
             )
-            self.selection_state.pop(query.from_user.id, None)
-            await query.edit_message_text(
-                "🚫 <b>Обнаружена подозрительная активность!</b>\n\n"
-                "Вы и получатель заблокированы за нарушение правил дарения.\n"
-                "Обратитесь к администратору для разблокировки.",
-                parse_mode="HTML",
-            )
-            return
+            if streak_stats["would_trigger"]:
+                blocked_until = self._apply_gift_autoblock(
+                    query.from_user.id,
+                    recipient_id,
+                    limit=settings["consecutive_limit"],
+                    duration_sec=settings["duration_sec"],
+                )
+                self.selection_state.pop(query.from_user.id, None)
+                await query.edit_message_text(
+                    self._autoblock_text(blocked_until),
+                    parse_mode="HTML",
+                )
+                return
 
         inventory_map = {item.id: item for item in state["inventory_items"]}
         bundle_items = []

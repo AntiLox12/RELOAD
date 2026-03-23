@@ -86,6 +86,8 @@ ADMIN_TEXT_ACTION_LEVELS: dict[str, int] = {
     "mod_ban": 2,
     "mod_unban": 2,
     "mod_check": 2,
+    "mod_gift_block": 2,
+    "mod_gift_unblock": 2,
     "warn_add": 2,
     "warn_list": 2,
     "warn_clear": 2,

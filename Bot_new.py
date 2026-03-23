@@ -892,6 +892,77 @@ async def show_admin_settings_autosearch(update: Update, context: ContextTypes.D
         pass
 
 
+async def show_admin_settings_gift_protection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except BadRequest:
+        pass
+    user = query.from_user
+    if not has_creator_panel_access(user.id, user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+
+    settings = db.get_gift_autoblock_settings()
+    duration_sec = int(settings['duration_sec'])
+    duration_days = round(duration_sec / 86400, 2)
+    status_text = "включена" if settings['enabled'] else "выключена"
+    toggle_text = "Выключить защиту" if settings['enabled'] else "Включить защиту"
+
+    text = (
+        "🎁 <b>Gift-защита</b>\n\n"
+        f"Статус: <b>{status_text}</b>\n"
+        f"Лимит подряд одному получателю: <b>{int(settings['consecutive_limit'])}</b>\n"
+        f"Длительность блокировки: <b>{duration_sec}</b> сек. ({duration_days} дн., {_format_duration_compact(duration_sec)})\n\n"
+        "Настройки применяются к автоматической anti-abuse блокировке в системе подарков."
+    )
+    kb = [
+        [InlineKeyboardButton(f"🛡️ {toggle_text}", callback_data='admin_settings_gift_toggle')],
+        [InlineKeyboardButton("🔢 Изменить лимит подряд", callback_data='admin_settings_set_gift_limit')],
+        [InlineKeyboardButton("⏳ Изменить длительность", callback_data='admin_settings_set_gift_duration')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
+    ]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_settings_set_gift_limit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_gift_protection')]]
+    try:
+        await query.message.edit_text(
+            "Введите новый лимит подряд одному получателю (целое число ≥ 1):",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_gift_limit'
+
+
+async def admin_settings_set_gift_duration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_gift_protection')]]
+    try:
+        await query.message.edit_text(
+            "Введите длительность gift-блокировки: <code>14d</code>, <code>12h</code> или <code>3600</code>.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML',
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'settings_set_gift_duration'
+
+
 async def show_admin_settings_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает настройки удачи в казино."""
     query = update.callback_query
@@ -1336,6 +1407,104 @@ async def admin_warn_clear_start(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['awaiting_admin_action'] = 'warn_clear'
 
 
+async def admin_mod_gift_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_admin_level(user.id, user.username, 2):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    items = db.list_active_gift_restrictions(limit=50)
+    text = (
+        "🎁 <b>Gift-блокировки</b>\n\n"
+        f"Активных блокировок: <b>{len(items)}</b>\n\n"
+        "Здесь можно просматривать, выдавать и снимать ограничения только на систему подарков."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Активные gift-блокировки", callback_data='admin_mod_gift_list')],
+        [InlineKeyboardButton("➕ Выдать / переустановить", callback_data='admin_mod_gift_block')],
+        [InlineKeyboardButton("✅ Снять gift-блокировку", callback_data='admin_mod_gift_unblock')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')],
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_mod_gift_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_admin_level(user.id, user.username, 2):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    items = db.list_active_gift_restrictions(limit=50)
+    if not items:
+        text = "🎁 Активные gift-блокировки: нет"
+    else:
+        lines = ["🎁 <b>Активные gift-блокировки</b>"]
+        for it in items:
+            label = _format_player_label(it['user_id'], it.get('username'), it.get('display_name'))
+            until_str = safe_format_timestamp(it.get('blocked_until')) or '—'
+            source = "авто" if it.get('source') == 'auto' else f"admin:{it.get('blocked_by')}"
+            reason = html.escape(it.get('reason') or '—')
+            lines.append(
+                f"• {html.escape(label)} — до: <b>{until_str}</b>\n"
+                f"  Причина: {reason}\n"
+                f"  Источник: {source}"
+            )
+        text = "\n".join(lines[:51])
+    kb = [[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]
+    try:
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def admin_mod_gift_block_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_admin_level(user.id, user.username, 2):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_gift_menu')]]
+    try:
+        await query.message.edit_text(
+            "➕ Gift-блокировка\n\n"
+            "Отправьте: <code>@username</code> или <code>user_id</code>, опционально длительность и причину.\n"
+            "Примеры:\n"
+            "<code>@user 14d подозрительная серия</code>\n"
+            "<code>123456789 3600 тест</code>\n"
+            "<code>@user</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'mod_gift_block'
+
+
+async def admin_mod_gift_unblock_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not has_admin_level(user.id, user.username, 2):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_gift_menu')]]
+    try:
+        await query.message.edit_text(
+            "✅ Снять gift-блокировку\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='HTML'
+        )
+    except BadRequest:
+        pass
+    context.user_data['awaiting_admin_action'] = 'mod_gift_unblock'
+
+
 def _parse_duration_to_seconds(s: str | None) -> int | None:
     if not s:
         return None
@@ -1351,6 +1520,33 @@ def _parse_duration_to_seconds(s: str | None) -> int | None:
     unit = m.group(2)
     mult = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}.get(unit, 1)
     return num * mult
+
+
+def _format_duration_compact(seconds: int | None) -> str:
+    if not seconds:
+        return "—"
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}д")
+    if hours:
+        parts.append(f"{hours}ч")
+    if minutes:
+        parts.append(f"{minutes}м")
+    if secs or not parts:
+        parts.append(f"{secs}с")
+    return " ".join(parts[:3])
+
+
+def _format_player_label(user_id: int, username: str | None = None, display_name: str | None = None) -> str:
+    if username:
+        return f"@{username}"
+    if display_name:
+        return str(display_name)
+    return f"ID:{user_id}"
 
 
 def _resolve_user_identifier(text: str) -> int | None:
@@ -1803,6 +1999,38 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
             except Exception:
                 await update.message.reply_html("❌ Введите число (≥ 0), например 2", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_gift_limit':
+            kb = [[InlineKeyboardButton("🎁 Gift-защита", callback_data='admin_settings_gift_protection')]]
+            try:
+                new_val = int(text_input.strip())
+                if new_val < 1:
+                    raise ValueError
+                ok = db.set_setting_int('gift_autoblock_consecutive_limit', new_val)
+                if ok:
+                    await update.message.reply_html(
+                        f"✅ Лимит gift-защиты обновлён: <b>{new_val}</b>",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите целое число (≥ 1)", reply_markup=InlineKeyboardMarkup(kb))
+        elif action == 'settings_set_gift_duration':
+            kb = [[InlineKeyboardButton("🎁 Gift-защита", callback_data='admin_settings_gift_protection')]]
+            try:
+                duration_sec = _parse_duration_to_seconds(text_input.strip())
+                if not duration_sec:
+                    raise ValueError
+                ok = db.set_setting_int('gift_autoblock_duration_sec', int(duration_sec))
+                if ok:
+                    await update.message.reply_html(
+                        f"✅ Длительность gift-блокировки обновлена: <b>{duration_sec}</b> сек. ({_format_duration_compact(duration_sec)})",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                else:
+                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
+            except Exception:
+                await update.message.reply_html("❌ Введите длительность в формате 14d, 12h или 3600", reply_markup=InlineKeyboardMarkup(kb))
         elif action == 'settings_set_fertilizer_max':
             kb = [[InlineKeyboardButton("💰 Лимиты", callback_data='admin_settings_limits')]]
             try:
@@ -1972,10 +2200,15 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 player = db.get_player(uid)
                 banned = db.is_user_banned(uid)
+                gift_restriction = db.get_gift_restriction_info(uid)
                 warns = db.get_warnings(uid, limit=50)
                 vip = db.is_vip(uid)
                 vip_plus = db.is_vip_plus(uid)
                 username = getattr(player, 'username', None) if player else None
+                gift_status = "✅ Активен"
+                if gift_restriction:
+                    until = safe_format_timestamp(gift_restriction.get('blocked_until')) or '—'
+                    gift_status = f"🚫 Gift-блок до {until}"
                 text_lines = [
                     "🔍 <b>Проверка игрока</b>",
                     f"ID: <b>{uid}</b>",
@@ -1983,10 +2216,102 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"Баланс: <b>{getattr(player, 'coins', 0) if player else 0}</b>",
                     f"VIP: {'активен' if vip else '—'} | VIP+: {'активен' if vip_plus else '—'}",
                     f"Статус: {'🚫 Забанен' if banned else '✅ Активен'}",
+                    f"Gift-статус: {gift_status}",
                     f"Предупреждений: <b>{len(warns)}</b>",
                 ]
+                if gift_restriction:
+                    text_lines.append(f"Gift-причина: {html.escape(gift_restriction.get('reason') or '—')}")
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]])
                 await update.message.reply_html("\n".join(text_lines), reply_markup=kb)
+        elif action == 'mod_gift_block':
+            parts = text_input.split(maxsplit=2)
+            if not parts:
+                await update.message.reply_html(
+                    "❌ Укажите пользователя. Пример: <code>@user 14d подозрительная серия</code>",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
+                )
+            else:
+                ident = parts[0]
+                duration_sec = None
+                reason = None
+                if len(parts) >= 2:
+                    parsed_duration = _parse_duration_to_seconds(parts[1])
+                    if parsed_duration:
+                        duration_sec = parsed_duration
+                        if len(parts) == 3:
+                            reason = parts[2]
+                    else:
+                        reason = " ".join(parts[1:])
+                if duration_sec is None:
+                    duration_sec = db.get_gift_autoblock_settings()['duration_sec']
+                uid = _resolve_user_identifier(ident)
+                if not uid:
+                    await update.message.reply_html(
+                        "❌ Пользователь не найден.\n\n"
+                        "Подсказка:\n"
+                        "• Попросите пользователя написать боту /start\n"
+                        "• Либо введите его числовой ID",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]])
+                    )
+                else:
+                    block_reason = reason or "Ручная gift-блокировка администратором"
+                    blocked_until = int(time.time()) + int(duration_sec)
+                    ok = db.add_gift_restriction(
+                        uid,
+                        block_reason,
+                        blocked_until=blocked_until,
+                        blocked_by=update.effective_user.id,
+                    )
+                    if ok:
+                        try:
+                            db.insert_moderation_log(
+                                actor_id=update.effective_user.id,
+                                action='gift_block',
+                                target_id=uid,
+                                details=block_reason,
+                            )
+                        except Exception:
+                            pass
+                        await update.message.reply_html(
+                            "✅ Gift-блокировка выдана.\n"
+                            f"Пользователь: <b>{uid}</b>\n"
+                            f"До: <b>{safe_format_timestamp(blocked_until) or '—'}</b>\n"
+                            f"Длительность: <b>{_format_duration_compact(duration_sec)}</b>\n"
+                            f"Причина: {html.escape(block_reason)}",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
+                        )
+                    else:
+                        await update.message.reply_html(
+                            "❌ Не удалось выдать gift-блокировку",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
+                        )
+        elif action == 'mod_gift_unblock':
+            ident = text_input.strip()
+            uid = _resolve_user_identifier(ident)
+            if not uid:
+                await update.message.reply_html(
+                    "❌ Пользователь не найден.\n\n"
+                    "Подсказка:\n"
+                    "• Попросите пользователя написать боту /start\n"
+                    "• Либо введите его числовой ID",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]])
+                )
+            else:
+                ok = db.remove_gift_restriction(uid)
+                if ok:
+                    try:
+                        db.insert_moderation_log(
+                            actor_id=update.effective_user.id,
+                            action='gift_unblock',
+                            target_id=uid,
+                            details=None,
+                        )
+                    except Exception:
+                        pass
+                await update.message.reply_html(
+                    "✅ Gift-блокировка снята" if ok else "❌ Не удалось снять gift-блокировку",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
+                )
         elif action == 'warn_add':
             parts = text_input.split(maxsplit=1)
             if not parts:
@@ -5284,6 +5609,7 @@ async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT
     keyboard = [
         [InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')],
         [InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')],
+        [InlineKeyboardButton("🎁 Gift-защита", callback_data='admin_settings_gift_protection')],
         [InlineKeyboardButton("💰 Лимиты", callback_data='admin_settings_limits')],
         [InlineKeyboardButton("🎰 Настройки казино", callback_data='admin_settings_casino')],
         [InlineKeyboardButton("🏪 Настройки магазина", callback_data='admin_settings_shop')],
@@ -5299,6 +5625,7 @@ async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT
         "Управление параметрами работы бота:\n\n"
         "⏱️ <b>Кулдауны</b> - время ожидания между действиями\n"
         "🤖 <b>Автопоиск</b> - лимиты и коэффициенты VIP/VIP+\n"
+        "🎁 <b>Gift-защита</b> - автоблокировки и анти-абуз подарков\n"
         "💰 <b>Лимиты</b> - ограничения на операции\n"
         "🎰 <b>Казино</b> - настройки игр и шансов\n"
         "🏪 <b>Магазин</b> - цены и ассортимент\n"
@@ -5463,6 +5790,7 @@ async def show_admin_moderation_menu(update: Update, context: ContextTypes.DEFAU
     keyboard = [
         [InlineKeyboardButton("🚫 Забанить пользователя", callback_data='admin_mod_ban')],
         [InlineKeyboardButton("✅ Разбанить пользователя", callback_data='admin_mod_unban')],
+        [InlineKeyboardButton("🎁 Gift-блокировки", callback_data='admin_mod_gift_menu')],
         [InlineKeyboardButton("⚠️ Предупреждения", callback_data='admin_mod_warnings')],
         [InlineKeyboardButton("📋 Список банов", callback_data='admin_mod_banlist')],
         [InlineKeyboardButton("🔍 Проверить игрока", callback_data='admin_mod_check')],
@@ -5476,6 +5804,7 @@ async def show_admin_moderation_menu(update: Update, context: ContextTypes.DEFAU
         f"Заблокировано пользователей: <b>{banned_users}</b>\n\n"
         "<b>Доступные действия:</b>\n"
         "• Блокировка/разблокировка игроков\n"
+        "• Gift-блокировки подарков\n"
         "• Система предупреждений\n"
         "• Проверка активности\n"
         "• История нарушений\n\n"
@@ -16455,6 +16784,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_settings_set_auto_vip_mult_start(update, context)
     elif data == 'admin_settings_set_auto_vip_plus_mult':
         await admin_settings_set_auto_vip_plus_mult_start(update, context)
+    elif data == 'admin_settings_gift_protection':
+        await show_admin_settings_gift_protection(update, context)
+    elif data == 'admin_settings_set_gift_limit':
+        await admin_settings_set_gift_limit_start(update, context)
+    elif data == 'admin_settings_set_gift_duration':
+        await admin_settings_set_gift_duration_start(update, context)
+    elif data == 'admin_settings_gift_toggle':
+        if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+            await query.answer("⛔ Доступ запрещён!", show_alert=True)
+            return
+        current = db.get_setting_bool('gift_autoblock_enabled', True)
+        ok = db.set_setting_bool('gift_autoblock_enabled', not current)
+        await query.answer("✅ Настройка обновлена" if ok else "❌ Ошибка", show_alert=True)
+        await show_admin_settings_gift_protection(update, context)
     elif data == 'admin_settings_casino':
         await show_admin_settings_casino(update, context)
     elif data == 'admin_settings_set_casino_win_prob':
@@ -16481,6 +16824,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_mod_ban_start(update, context)
     elif data == 'admin_mod_unban':
         await admin_mod_unban_start(update, context)
+    elif data == 'admin_mod_gift_menu':
+        await admin_mod_gift_menu(update, context)
+    elif data == 'admin_mod_gift_list':
+        await admin_mod_gift_list_show(update, context)
+    elif data == 'admin_mod_gift_block':
+        await admin_mod_gift_block_start(update, context)
+    elif data == 'admin_mod_gift_unblock':
+        await admin_mod_gift_unblock_start(update, context)
     elif data == 'admin_mod_banlist':
         await admin_mod_banlist_show(update, context)
     elif data == 'admin_mod_check':

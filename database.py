@@ -33,6 +33,12 @@ Base = declarative_base()
 
 logger = logging.getLogger(__name__)
 PLANTATION_PROTECTION_SLOT_MAX = 1
+GIFT_AUTOBLOCK_ENABLED_KEY = "gift_autoblock_enabled"
+GIFT_AUTOBLOCK_LIMIT_KEY = "gift_autoblock_consecutive_limit"
+GIFT_AUTOBLOCK_DURATION_KEY = "gift_autoblock_duration_sec"
+GIFT_AUTOBLOCK_DEFAULT_ENABLED = True
+GIFT_AUTOBLOCK_DEFAULT_LIMIT = 10
+GIFT_AUTOBLOCK_DEFAULT_DURATION_SEC = 14 * 24 * 60 * 60
 
 # --- Описание таблиц в базе данных ---
 
@@ -747,7 +753,7 @@ class GiftRestriction(Base):
     user_id = Column(BigInteger, unique=True, index=True)  # ID заблокированного пользователя
     reason = Column(String)  # Причина блокировки
     blocked_at = Column(Integer, default=lambda: int(time.time()), index=True)
-    blocked_until = Column(Integer, nullable=True, index=True)  # NULL = навсегда, иначе timestamp
+    blocked_until = Column(Integer, nullable=True, index=True)  # Timestamp окончания; legacy NULL мигрируется в timed-ban
     blocked_by = Column(BigInteger, nullable=True)  # ID админа или системы (None = автоматическая)
     
     __table_args__ = (
@@ -1632,6 +1638,80 @@ def get_setting_bool(key: str, default_value: bool) -> bool:
 
 def set_setting_bool(key: str, value: bool) -> bool:
     return set_setting_str(key, "1" if value else "0")
+
+
+def _ensure_gift_autoblock_defaults() -> None:
+    defaults = (
+        (GIFT_AUTOBLOCK_ENABLED_KEY, "1" if GIFT_AUTOBLOCK_DEFAULT_ENABLED else "0"),
+        (GIFT_AUTOBLOCK_LIMIT_KEY, str(GIFT_AUTOBLOCK_DEFAULT_LIMIT)),
+        (GIFT_AUTOBLOCK_DURATION_KEY, str(GIFT_AUTOBLOCK_DEFAULT_DURATION_SEC)),
+    )
+    db = SessionLocal()
+    try:
+        for key, value in defaults:
+            row = db.query(BotSetting).filter(BotSetting.key == key).first()
+            if not row:
+                db.add(BotSetting(key=key, value=value))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def get_gift_autoblock_settings() -> dict:
+    enabled = get_setting_bool(GIFT_AUTOBLOCK_ENABLED_KEY, GIFT_AUTOBLOCK_DEFAULT_ENABLED)
+    limit = max(1, int(get_setting_int(GIFT_AUTOBLOCK_LIMIT_KEY, GIFT_AUTOBLOCK_DEFAULT_LIMIT)))
+    duration_sec = max(1, int(get_setting_int(GIFT_AUTOBLOCK_DURATION_KEY, GIFT_AUTOBLOCK_DEFAULT_DURATION_SEC)))
+    return {
+        "enabled": bool(enabled),
+        "consecutive_limit": limit,
+        "duration_sec": duration_sec,
+    }
+
+
+def _cleanup_expired_gift_restrictions_session(db, now_ts: int | None = None) -> int:
+    now_ts = int(now_ts or time.time())
+    try:
+        rows = db.query(GiftRestriction).filter(
+            GiftRestriction.blocked_until.isnot(None),
+            GiftRestriction.blocked_until <= now_ts,
+        ).all()
+        count = len(rows)
+        for row in rows:
+            db.delete(row)
+        if count:
+            db.commit()
+        return count
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def _migrate_legacy_gift_restrictions() -> None:
+    settings = get_gift_autoblock_settings()
+    blocked_until = int(time.time()) + int(settings["duration_sec"])
+    db = SessionLocal()
+    try:
+        legacy_rows = db.query(GiftRestriction).filter(GiftRestriction.blocked_until.is_(None)).all()
+        for row in legacy_rows:
+            row.blocked_until = blocked_until
+        if legacy_rows:
+            db.commit()
+        _cleanup_expired_gift_restrictions_session(db)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
 
 # --- Магазин: офферы и покупки ---
 
@@ -6173,6 +6253,16 @@ def ensure_schema():
 
 
     try:
+        _ensure_gift_autoblock_defaults()
+    except Exception:
+        pass
+
+    try:
+        _migrate_legacy_gift_restrictions()
+    except Exception:
+        pass
+
+    try:
         ensure_fertilizer_effect_types()
     except Exception:
         pass
@@ -7743,44 +7833,87 @@ def get_user_last_gift_time(user_id: int) -> int:
         db.close()
 
 
-def check_consecutive_gifts(giver_id: int, recipient_id: int, limit: int = 10) -> bool:
-    """
-    Проверяет, дарил ли giver_id последние N раз подряд recipient_id.
-    Возвращает True если превышен лимит (нужна блокировка).
-    """
+def get_consecutive_gift_stats(giver_id: int, recipient_id: int, limit: int, planned_gifts: int = 1) -> dict:
+    """Возвращает текущую подряд идущую серию подарков и прогноз до срабатывания защиты."""
+    limit = max(1, int(limit or 1))
+    planned_gifts = max(0, int(planned_gifts or 0))
+    if not giver_id or not recipient_id:
+        return {
+            "current_streak": 0,
+            "remaining_before_block": limit,
+            "projected_streak": planned_gifts,
+            "would_trigger": planned_gifts > limit,
+            "limit": limit,
+        }
+
     db = SessionLocal()
     try:
-        # Берем последние 'limit' подарков от дарителя
-        recent_gifts = db.query(GiftHistory).filter(
+        fetch_limit = max(limit + max(planned_gifts, 1), 1)
+        recent_gifts = db.query(GiftHistory.recipient_id).filter(
             GiftHistory.giver_id == giver_id
-        ).order_by(GiftHistory.created_at.desc()).limit(limit).all()
-        
-        if len(recent_gifts) < limit:
-            return False  # Недостаточно подарков для проверки
-        
-        # Проверяем, все ли они были одному получателю
-        return all(g.recipient_id == recipient_id for g in recent_gifts)
+        ).order_by(GiftHistory.created_at.desc(), GiftHistory.id.desc()).limit(fetch_limit).all()
+
+        current_streak = 0
+        for gift in recent_gifts:
+            if int(gift.recipient_id or 0) != int(recipient_id):
+                break
+            current_streak += 1
+
+        projected_streak = current_streak + planned_gifts
+        return {
+            "current_streak": current_streak,
+            "remaining_before_block": max(limit - current_streak, 0),
+            "projected_streak": projected_streak,
+            "would_trigger": projected_streak > limit,
+            "limit": limit,
+        }
     finally:
         db.close()
 
 
+def check_consecutive_gifts(giver_id: int, recipient_id: int, limit: int = 10) -> bool:
+    """Совместимый wrapper: True, если текущая подряд серия уже достигла лимита."""
+    stats = get_consecutive_gift_stats(giver_id, recipient_id, limit=limit, planned_gifts=0)
+    return int(stats["current_streak"]) >= int(stats["limit"])
+
+
+def _gift_restriction_to_dict(restriction: GiftRestriction, player: Player | None = None) -> dict:
+    username = getattr(player, "username", None) if player else None
+    display_name = getattr(player, "display_name", None) if player else None
+    blocked_until = int(restriction.blocked_until) if restriction.blocked_until is not None else None
+    return {
+        "user_id": int(restriction.user_id),
+        "username": username,
+        "display_name": display_name,
+        "reason": restriction.reason or "Нарушение правил дарения",
+        "blocked_at": int(restriction.blocked_at or 0),
+        "blocked_until": blocked_until,
+        "blocked_by": int(restriction.blocked_by) if restriction.blocked_by is not None else None,
+        "source": "admin" if restriction.blocked_by else "auto",
+    }
+
+
 def add_gift_restriction(user_id: int, reason: str, blocked_until: int = None, blocked_by: int = None):
-    """Добавляет блокировку на дарение подарков."""
+    """Добавляет или обновляет gift-блокировку. По умолчанию срок берётся из BotSetting."""
+    now_ts = int(time.time())
+    if blocked_until is None:
+        blocked_until = now_ts + int(get_gift_autoblock_settings()["duration_sec"])
+    else:
+        blocked_until = int(blocked_until)
+
     db = SessionLocal()
     try:
-        # Проверяем, нет ли уже блокировки
         existing = db.query(GiftRestriction).filter(GiftRestriction.user_id == user_id).first()
         if existing:
-            # Обновляем существующую
             existing.reason = reason
-            existing.blocked_at = int(time.time())
+            existing.blocked_at = now_ts
             existing.blocked_until = blocked_until
             existing.blocked_by = blocked_by
         else:
-            # Создаем новую
             restriction = GiftRestriction(
                 user_id=user_id,
                 reason=reason,
+                blocked_at=now_ts,
                 blocked_until=blocked_until,
                 blocked_by=blocked_by
             )
@@ -7795,35 +7928,40 @@ def add_gift_restriction(user_id: int, reason: str, blocked_until: int = None, b
         db.close()
 
 
-def is_user_gift_restricted(user_id: int) -> tuple[bool, str]:
-    """
-    Проверяет, заблокирован ли пользователь для дарения.
-    Возвращает (True/False, причина).
-    """
+def get_gift_restriction_info(user_id: int) -> dict | None:
     db = SessionLocal()
     try:
         restriction = db.query(GiftRestriction).filter(GiftRestriction.user_id == user_id).first()
         if not restriction:
-            return (False, "")
-        
-        # Проверяем, не истекла ли блокировка
-        if restriction.blocked_until is not None:
-            if int(time.time()) > restriction.blocked_until:
-                # Блокировка истекла, удаляем её
-                db.delete(restriction)
-                db.commit()
-                return (False, "")
-        
-        return (True, restriction.reason or "Нарушение правил дарения")
+            return None
+        now_ts = int(time.time())
+        if restriction.blocked_until is not None and restriction.blocked_until <= now_ts:
+            db.delete(restriction)
+            db.commit()
+            return None
+        player = db.query(Player).filter(Player.user_id == user_id).first()
+        return _gift_restriction_to_dict(restriction, player)
     except Exception as e:
-        print(f"[GIFT_DB] Error checking restriction: {e}")
-        return (False, "")
+        print(f"[GIFT_DB] Error loading restriction info: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
     finally:
         db.close()
 
 
+def is_user_gift_restricted(user_id: int) -> tuple[bool, str]:
+    """Проверяет, заблокирован ли пользователь для дарения."""
+    info = get_gift_restriction_info(user_id)
+    if not info:
+        return (False, "")
+    return (True, info["reason"])
+
+
 def remove_gift_restriction(user_id: int):
-    """Снимает блокировку с пользователя."""
+    """Снимает gift-блокировку с пользователя."""
     db = SessionLocal()
     try:
         db.query(GiftRestriction).filter(GiftRestriction.user_id == user_id).delete()
@@ -7833,6 +7971,30 @@ def remove_gift_restriction(user_id: int):
         print(f"[GIFT_DB] Error removing restriction: {e}")
         db.rollback()
         return False
+    finally:
+        db.close()
+
+
+def cleanup_expired_gift_restrictions() -> int:
+    db = SessionLocal()
+    try:
+        return _cleanup_expired_gift_restrictions_session(db)
+    finally:
+        db.close()
+
+
+def list_active_gift_restrictions(limit: int = 50) -> list[dict]:
+    db = SessionLocal()
+    try:
+        _cleanup_expired_gift_restrictions_session(db)
+        rows = db.query(GiftRestriction, Player).outerjoin(
+            Player, Player.user_id == GiftRestriction.user_id
+        ).order_by(
+            GiftRestriction.blocked_until.asc(),
+            GiftRestriction.blocked_at.desc(),
+            GiftRestriction.user_id.asc(),
+        ).limit(limit).all()
+        return [_gift_restriction_to_dict(restriction, player) for restriction, player in rows]
     finally:
         db.close()
 
