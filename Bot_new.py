@@ -76,6 +76,11 @@ from constants import (
     DAILY_BONUS_COOLDOWN,
     ENERGY_IMAGES_DIR,
     DAILY_BONUS_REWARDS,
+    DAILY_BONUS_RULES,
+    DAILY_BONUS_TIER_ORDER,
+    DAILY_BONUS_TIER_LABELS,
+    DAILY_BONUS_REWARD_CATALOG,
+    DAILY_BONUS_ROULETTE_TABLE,
     RARITIES,
     COLOR_EMOJIS,
     RARITY_ORDER,
@@ -575,6 +580,98 @@ def _daily_bonus_weights_with_rating(rewards: dict, rating_value: int, max_bonus
         out = {'coins': 1.0}
     return out
 
+
+def _daily_bonus_reward_label(reward_id: str, lang: str = 'ru', resolved_reward_id: str | None = None) -> str:
+    actual_reward_id = str(resolved_reward_id or reward_id or '')
+    spec = DAILY_BONUS_REWARD_CATALOG.get(actual_reward_id) or DAILY_BONUS_REWARD_CATALOG.get(str(reward_id or '')) or {}
+    key = 'label_en' if lang == 'en' else 'label_ru'
+    return str(spec.get(key) or actual_reward_id or reward_id or 'Reward')
+
+
+def _daily_bonus_tier_label(tier: str, lang: str = 'ru') -> str:
+    labels = DAILY_BONUS_TIER_LABELS.get(str(tier), {}) or {}
+    return str(labels.get('en' if lang == 'en' else 'ru') or tier)
+
+
+def _daily_bonus_format_duration(seconds_value: int) -> str:
+    total = max(0, int(seconds_value or 0))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _daily_bonus_format_window(seconds_value: int, lang: str = 'ru') -> str:
+    total = max(0, int(seconds_value or 0))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    if lang == 'en':
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+    if hours > 0:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин"
+
+
+def _daily_bonus_reward_detail_lines(reward_data: dict | None, lang: str = 'ru') -> list[str]:
+    if not reward_data:
+        return []
+
+    lines: list[str] = []
+    if reward_data.get('fallback'):
+        if lang == 'en':
+            lines.append("ℹ️ Original drink reward fallback was used because no eligible drink was found.")
+        else:
+            lines.append("ℹ️ Вместо напитка выдан запасной приз, потому что подходящий напиток не найден.")
+
+    drink = reward_data.get('drink') or {}
+    if drink:
+        drink_name = html.escape(str(drink.get('name') or ''))
+        description = html.escape(str(drink.get('description') or ''))
+        if drink_name:
+            lines.append(f"🥤 <b>{drink_name}</b>")
+        if description:
+            lines.append(f"<i>{description}</i>")
+
+    if reward_data.get('coins_after') is not None:
+        if lang == 'en':
+            lines.append(f"💰 Balance: <b>{int(reward_data['coins_after'])}</b> 🪙")
+        else:
+            lines.append(f"💰 Баланс: <b>{int(reward_data['coins_after'])}</b> 🪙")
+    if reward_data.get('fragments_after') is not None:
+        if lang == 'en':
+            lines.append(f"🧩 Total fragments: <b>{int(reward_data['fragments_after'])}</b>")
+        else:
+            lines.append(f"🧩 Всего фрагментов: <b>{int(reward_data['fragments_after'])}</b>")
+    if reward_data.get('luck_after') is not None:
+        if lang == 'en':
+            lines.append(f"🎲 Luck charges: <b>{int(reward_data['luck_after'])}</b>")
+        else:
+            lines.append(f"🎲 Зарядов купона: <b>{int(reward_data['luck_after'])}</b>")
+    if reward_data.get('vip_until') is not None:
+        vip_until = safe_format_timestamp(int(reward_data['vip_until']))
+        if vip_until:
+            if lang == 'en':
+                lines.append(f"👑 Active until: <b>{vip_until}</b>")
+            else:
+                lines.append(f"👑 Активен до: <b>{vip_until}</b>")
+    if reward_data.get('vip_plus_until') is not None:
+        vip_plus_until = safe_format_timestamp(int(reward_data['vip_plus_until']))
+        if vip_plus_until:
+            if lang == 'en':
+                lines.append(f"💎 Active until: <b>{vip_plus_until}</b>")
+            else:
+                lines.append(f"💎 Активен до: <b>{vip_plus_until}</b>")
+    if reward_data.get('boost_until') is not None:
+        boost_until = safe_format_timestamp(int(reward_data['boost_until']))
+        boost_count = int(reward_data.get('boost_count_after', reward_data.get('boost_count', 0)) or 0)
+        if boost_until:
+            if lang == 'en':
+                lines.append(f"🚀 Boost stash: <b>{boost_count}</b> until <b>{boost_until}</b>")
+            else:
+                lines.append(f"🚀 Бустов в запасе: <b>{boost_count}</b> до <b>{boost_until}</b>")
+    return lines
+
 # --- Функции-обработчики для кнопок ---
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,21 +700,14 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         search_status = f"{base_search} ✅"
 
-    # Проверка кулдауна ежедневного бонуса (VIP+ — x4 скорость, VIP — x2 скорость)
-    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
-    if vip_plus_active:
-        bonus_cd = base_bonus_cd / 4
-    elif vip_active:
-        bonus_cd = base_bonus_cd / 2
-    else:
-        bonus_cd = base_bonus_cd
-    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
-    bonus_time_left = max(0, bonus_cd - (time.time() - last_bonus_claim_val))
+    bonus_status_data = db.get_daily_bonus_status(
+        user.id,
+        username=getattr(user, 'username', None),
+        display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+    )
     base_bonus = t(lang, 'daily_bonus')
-    if bonus_time_left > 0:
-        hours, remainder = divmod(int(bonus_time_left), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        bonus_status = f"{base_bonus} (⏳ {hours:02d}:{minutes:02d}:{seconds:02d})"
+    if bonus_status_data.get('ok') and not bonus_status_data.get('available'):
+        bonus_status = f"{base_bonus} (⏳ {_daily_bonus_format_duration(int(bonus_status_data.get('time_left', 0) or 0))})"
     else:
         bonus_status = f"{base_bonus} ✅"
 
@@ -2558,7 +2648,7 @@ async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE,
         res = db.find_player_by_identifier(text_input)
         if res.get('ok') and res.get('player'):
             player = res['player']
-            db.update_player(player.user_id, last_bonus_claim=0)
+            db.set_daily_bonus_manual_ready(player.user_id)
             username = getattr(player, 'username', None)
             shown = f"@{username}" if username else str(player.user_id)
             response = f"✅ Ежедневный бонус сброшен для {shown}!"
@@ -2650,6 +2740,13 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             
             last_bonus = safe_format_timestamp(player.last_bonus_claim) if player.last_bonus_claim else "Никогда"
             last_search = safe_format_timestamp(player.last_search) if player.last_search else "Никогда"
+            bonus_status = db.get_daily_bonus_status(player.user_id, username=getattr(player, 'username', None), display_name=getattr(player, 'display_name', None))
+            bonus_extra = ""
+            if bonus_status.get('ok'):
+                bonus_extra = (
+                    f"\n<b>Серия бонуса:</b> {int(bonus_status.get('streak', 0) or 0)} "
+                    f"(milestone {int(bonus_status.get('next_milestone_target', 0) or 0)})"
+                )
             
             response = (
                 f"📊 <b>Статистика пользователя @{username}</b>\n\n" if username else f"📊 <b>Статистика пользователя {player.user_id}</b>\n\n"
@@ -2660,6 +2757,7 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"<b>Последний поиск:</b> {last_search}\n"
                 f"<b>Последний бонус:</b> {last_bonus}\n"
                 f"<b>Язык:</b> {player.language}"
+                f"{bonus_extra}"
             )
         else:
             response = f"❌ Пользователь {text_input} не найден!"
@@ -3656,6 +3754,13 @@ async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         last_bonus = safe_format_timestamp(player.last_bonus_claim) if player.last_bonus_claim else "Никогда"
         last_search = safe_format_timestamp(player.last_search) if player.last_search else "Никогда"
+        bonus_status = db.get_daily_bonus_status(player_id, username=getattr(player, 'username', None), display_name=getattr(player, 'display_name', None))
+        bonus_extra = ""
+        if bonus_status.get('ok'):
+            bonus_extra = (
+                f"\n<b>Серия бонуса:</b> {int(bonus_status.get('streak', 0) or 0)}"
+                f" (milestone {int(bonus_status.get('next_milestone_target', 0) or 0)})"
+            )
         
         # Проверяем, является ли игрок админом
         admin_level = db.get_admin_level(player_id)
@@ -3676,6 +3781,7 @@ async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"<b>Последний бонус:</b> {last_bonus}\n"
             f"<b>Язык:</b> {player.language}\n"
             f"<b>Автопоиск:</b> {'✅' if player.auto_search_enabled else '❌'}"
+            f"{bonus_extra}"
         )
         
         keyboard = [
@@ -3988,7 +4094,7 @@ async def admin_player_reset_bonus_execute(update: Update, context: ContextTypes
             await query.answer("❌ Игрок не найден", show_alert=True)
             return
         
-        db.update_player(player_id, last_bonus_claim=0)
+        db.set_daily_bonus_manual_ready(player_id)
         username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
         
         await query.answer(f"✅ Бонус сброшен для {username_display}!", show_alert=False)
@@ -7341,30 +7447,33 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
 
-async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, selected_reward: str) -> None:
+async def show_roulette_animation(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    selected_reward: str,
+    lang: str = 'ru',
+) -> None:
     """
     Показывает анимацию текстовой рулетки с движущейся стрелочкой.
     Длительность: 3 секунды.
     """
     # Список наград для отображения
-    rewards_display = [
-        ('coins', '💰 400 септимов'),
-        ('absolute_drink', '🟣 Энергетик Absolute'),
-        ('vip_3d', '👑 VIP на 3 дня'),
-        ('vip_plus_7d', '💎 VIP+ на 7 дней'),
-        ('vip_plus_30d', '🎊 VIP+ на 30 дней'),
-        ('selyuk_fragment', '🧩 Фрагмент Селюка'),
-    ]
+    rewards_display = []
+    for tier in DAILY_BONUS_TIER_ORDER:
+        for entry in DAILY_BONUS_ROULETTE_TABLE.get(tier, []):
+            reward_id = str(entry.get('reward_id') or '')
+            if not reward_id:
+                continue
+            rewards_display.append((reward_id, _daily_bonus_reward_label(reward_id, lang)))
+    if not rewards_display:
+        rewards_display = [('coins_400', _daily_bonus_reward_label('coins_400', lang))]
     
     # Находим индекс выбранной награды
     selected_index = next((i for i, (key, _) in enumerate(rewards_display) if key == selected_reward), 0)
     
     # Отправляем начальное сообщение
-    roulette_message = await context.bot.send_message(
-        chat_id=chat_id,
-        text="🎰 <b>Крутим рулетку...</b>",
-        parse_mode='HTML'
-    )
+    title = "🎰 <b>Крутим рулетку...</b>" if lang != 'en' else "🎰 <b>Spinning the roulette...</b>"
+    roulette_message = await context.bot.send_message(chat_id=chat_id, text=title, parse_mode='HTML')
     
     # Анимация: прокручиваем рулетку 3 секунды
     duration = 3.0  # секунд
@@ -7391,7 +7500,7 @@ async def show_roulette_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: i
         # Обновляем сообщение только если позиция изменилась
         if current_pos != prev_pos:
             # Формируем текст рулетки
-            roulette_text = "🎰 <b>Крутим рулетку...</b>\n\n"
+            roulette_text = title + "\n\n"
             for i, (_, display_name) in enumerate(rewards_display):
                 if i == current_pos:
                     roulette_text += f"➡️ <b>{display_name}</b>\n"
@@ -7430,78 +7539,117 @@ async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer()
 
     user = query.from_user
-    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    player = db.get_or_create_player(
+        user.id,
+        username=getattr(user, 'username', None),
+        display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+    )
     lang = getattr(player, 'language', 'ru') or 'ru'
-    rating_value = int(getattr(player, 'rating', 0) or 0)
-
-    vip_plus_active = db.is_vip_plus(user.id)
-    vip_active = db.is_vip(user.id)
-    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
-    if vip_plus_active:
-        eff_bonus_cd = base_bonus_cd / 4
-    elif vip_active:
-        eff_bonus_cd = base_bonus_cd / 2
-    else:
-        eff_bonus_cd = base_bonus_cd
-
-    now = time.time()
-    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
-    time_left = max(0, eff_bonus_cd - (now - last_bonus_claim_val))
-    hours, remainder = divmod(int(time_left), 3600)
-    minutes, seconds = divmod(remainder, 60)
-
-    reward_labels = {
-        'coins': '💰 400 септимов' if lang != 'en' else '💰 400 coins',
-        'absolute_drink': '🟣 Энергетик Absolute' if lang != 'en' else '🟣 Absolute energy drink',
-        'vip_3d': '👑 VIP на 3 дня' if lang != 'en' else '👑 VIP for 3 days',
-        'vip_plus_7d': '💎 VIP+ на 7 дней' if lang != 'en' else '💎 VIP+ for 7 days',
-        'vip_plus_30d': '🎊 VIP+ на 30 дней' if lang != 'en' else '🎊 VIP+ for 30 days',
-        'selyuk_fragment': '🧩 Фрагмент Селюка' if lang != 'en' else '🧩 Selyuk fragment',
-    }
-
-    adjusted = _daily_bonus_weights_with_rating(DAILY_BONUS_REWARDS, rating_value, 0.05)
-    total_weight = sum(float(w or 0) for w in adjusted.values())
-    if total_weight <= 0:
-        total_weight = 1.0
-
-    lines = []
-    for key, info in DAILY_BONUS_REWARDS.items():
+    status = db.get_daily_bonus_status(
+        user.id,
+        username=getattr(user, 'username', None),
+        display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+    )
+    if not status.get('ok'):
+        error_text = "❌ Не удалось загрузить информацию о бонусе." if lang != 'en' else "❌ Failed to load daily bonus info."
+        keyboard = [[InlineKeyboardButton("🔙 В меню" if lang != 'en' else "🔙 Menu", callback_data='menu')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         try:
-            w = float(adjusted.get(key, 0) or 0)
-        except Exception:
-            w = 0.0
-        pct = (w / total_weight) * 100.0
-        lines.append(f"- {reward_labels.get(key, key)} — <b>{pct:.2f}%</b>")
+            await query.message.edit_text(text=error_text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=error_text, reply_markup=reply_markup, parse_mode='HTML')
+        return
+
+    cycle_reward_label = _daily_bonus_reward_label(status.get('next_cycle_reward_id', ''), lang)
+    milestone_reward_label = _daily_bonus_reward_label(status.get('next_milestone_reward_id', ''), lang)
+
+    tier_lines = []
+    for tier in DAILY_BONUS_TIER_ORDER:
+        reward_names = ", ".join(_daily_bonus_reward_label(reward_id, lang) for reward_id in status.get('tier_reward_groups', {}).get(tier, []))
+        tier_lines.append(
+            f"• <b>{_daily_bonus_tier_label(tier, lang)}</b> — <b>{float(status.get('tier_odds', {}).get(tier, 0.0) or 0.0):.2f}%</b>: {reward_names}"
+        )
 
     if lang != 'en':
         title = "🎁 <b>Ежедневный бонус</b>"
-        timer_line = f"⏳ До следующего: <b>{hours:02d}:{minutes:02d}:{seconds:02d}</b>" if time_left > 0 else "✅ <b>Бонус доступен прямо сейчас!</b>"
-        vip_line = "⚡ VIP ускоряет в 2 раза, VIP+ — в 4 раза."
-        bonus_line = f"⭐ Бонус рейтинга к редким наградам: <b>до +5%</b> (сейчас: <b>+{_rating_bonus_percent(rating_value, 0.05) * 100:.2f}%</b>)."
-        rewards_title = "🎰 <b>Награды и шансы:</b>"
+        availability_line = (
+            "✅ <b>Бонус доступен прямо сейчас!</b>"
+            if status.get('available')
+            else f"⏳ До следующего: <b>{_daily_bonus_format_duration(int(status.get('time_left', 0) or 0))}</b>"
+        )
+        streak_line = f"🔥 Серия: <b>{int(status.get('streak', 0) or 0)}</b> | Рекорд: <b>{int(status.get('best_streak', 0) or 0)}</b>"
+        cycle_line = (
+            f"🗓 Следующий день цикла: <b>{int(status.get('next_cycle_day', 1) or 1)}/{int(status.get('cycle_length', 7) or 7)}</b>"
+            f" — {cycle_reward_label}"
+        )
+        milestone_line = (
+            f"🏆 Следующая награда серии: <b>{int(status.get('next_milestone_target', 0) or 0)}</b>"
+            f" (осталось <b>{int(status.get('next_milestone_remaining', 0) or 0)}</b>) — {milestone_reward_label}"
+        )
+        pity_line = (
+            f"🛡 Гарант редкого: <b>{'готов' if int(status.get('rare_pity_remaining', 0) or 0) <= 0 else 'через ' + str(int(status.get('rare_pity_remaining', 0) or 0))}</b>"
+            f" | Гарант эпика: <b>{'готов' if int(status.get('epic_pity_remaining', 0) or 0) <= 0 else 'через ' + str(int(status.get('epic_pity_remaining', 0) or 0))}</b>"
+        )
+        vip_line = (
+            f"⚡ VIP: КД x0.5, VIP+: КД x0.25. Мягкое окно серии: <b>{_daily_bonus_format_window(int(status.get('grace_window', 0) or 0), lang)}</b>."
+        )
+        bonus_line = (
+            f"⭐ Бонус рейтинга к редким шансам: <b>до +5%</b> (сейчас: <b>+{float(status.get('rating_bonus_fraction', 0.0) or 0.0) * 100:.2f}%</b>)."
+        )
+        expired_line = "⚠️ Окно серии уже истекло: следующий клейм начнёт новую серию." if status.get('streak_expired') and not status.get('manual_ready') else ""
+        rewards_title = "🎰 <b>Рулетка по тирам:</b>"
         claim_label = "🎁 Забрать бонус"
+        back_label = "🔙 В меню"
     else:
         title = "🎁 <b>Daily Bonus</b>"
-        timer_line = f"⏳ Next in: <b>{hours:02d}:{minutes:02d}:{seconds:02d}</b>" if time_left > 0 else "✅ <b>Bonus is available now!</b>"
-        vip_line = "⚡ VIP is 2x faster, VIP+ is 4x faster."
-        bonus_line = f"⭐ Rating bonus to rare rewards: <b>up to +5%</b> (now: <b>+{_rating_bonus_percent(rating_value, 0.05) * 100:.2f}%</b>)."
-        rewards_title = "🎰 <b>Rewards & odds:</b>"
+        availability_line = (
+            "✅ <b>Bonus is available now!</b>"
+            if status.get('available')
+            else f"⏳ Next in: <b>{_daily_bonus_format_duration(int(status.get('time_left', 0) or 0))}</b>"
+        )
+        streak_line = f"🔥 Streak: <b>{int(status.get('streak', 0) or 0)}</b> | Best: <b>{int(status.get('best_streak', 0) or 0)}</b>"
+        cycle_line = (
+            f"🗓 Next cycle day: <b>{int(status.get('next_cycle_day', 1) or 1)}/{int(status.get('cycle_length', 7) or 7)}</b>"
+            f" — {cycle_reward_label}"
+        )
+        milestone_line = (
+            f"🏆 Next milestone: <b>{int(status.get('next_milestone_target', 0) or 0)}</b>"
+            f" (<b>{int(status.get('next_milestone_remaining', 0) or 0)}</b> left) — {milestone_reward_label}"
+        )
+        pity_line = (
+            f"🛡 Rare pity: <b>{'ready' if int(status.get('rare_pity_remaining', 0) or 0) <= 0 else 'in ' + str(int(status.get('rare_pity_remaining', 0) or 0))}</b>"
+            f" | Epic pity: <b>{'ready' if int(status.get('epic_pity_remaining', 0) or 0) <= 0 else 'in ' + str(int(status.get('epic_pity_remaining', 0) or 0))}</b>"
+        )
+        vip_line = (
+            f"⚡ VIP: x0.5 cooldown, VIP+: x0.25 cooldown. Streak grace window: <b>{_daily_bonus_format_window(int(status.get('grace_window', 0) or 0), lang)}</b>."
+        )
+        bonus_line = (
+            f"⭐ Rating bonus to rare odds: <b>up to +5%</b> (now: <b>+{float(status.get('rating_bonus_fraction', 0.0) or 0.0) * 100:.2f}%</b>)."
+        )
+        expired_line = "⚠️ Your streak grace window has expired: the next claim will restart the streak." if status.get('streak_expired') and not status.get('manual_ready') else ""
+        rewards_title = "🎰 <b>Roulette tiers:</b>"
         claim_label = "🎁 Claim bonus"
+        back_label = "🔙 Menu"
 
-    text = "\n".join([
+    text_parts = [
         title,
         "",
-        timer_line,
+        availability_line,
+        streak_line,
+        cycle_line,
+        milestone_line,
+        pity_line,
         vip_line,
         bonus_line,
-        "",
-        rewards_title,
-        *lines,
-    ])
+    ]
+    if expired_line:
+        text_parts.extend(["", expired_line])
+    text_parts.extend(["", rewards_title, *tier_lines])
+    text = "\n".join(text_parts)
 
     keyboard = [
         [InlineKeyboardButton(claim_label, callback_data='claim_bonus')],
-        [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        [InlineKeyboardButton(back_label, callback_data='menu')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -7514,8 +7662,6 @@ async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TY
 async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Логика получения ежедневного бонуса."""
     query = update.callback_query
-    await query.answer()
-
     user = query.from_user
     
     # Анти-даблклик: один бонус за раз
@@ -7524,50 +7670,53 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Запрос бонуса уже обрабатывается…", show_alert=True)
         return
     async with lock:
-        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        player = db.get_or_create_player(
+            user.id,
+            username=getattr(user, 'username', None),
+            display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+        )
         lang = getattr(player, 'language', 'ru') or 'ru'
-        rating_value = int(getattr(player, 'rating', 0) or 0)
+        current_time = int(time.time())
+        result = db.claim_daily_bonus_atomic(
+            user.id,
+            username=getattr(user, 'username', None),
+            display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+            now_ts=current_time,
+        )
 
-        # Проверка кулдауна
-        current_time = time.time()
-        vip_plus_active = db.is_vip_plus(user.id)
-        vip_active = db.is_vip(user.id)
-        base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
-        if vip_plus_active:
-            eff_bonus_cd = base_bonus_cd / 4
-        elif vip_active:
-            eff_bonus_cd = base_bonus_cd / 2
-        else:
-            eff_bonus_cd = base_bonus_cd
-        if current_time - player.last_bonus_claim < eff_bonus_cd:
-            time_left = int(eff_bonus_cd - (current_time - player.last_bonus_claim))
-            hours, remainder = divmod(time_left, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            try:
-                await query.answer(f"Ещё рано! До бонуса: {hours:02d}:{minutes:02d}:{seconds:02d}")
-            except Exception:
-                pass
-            await show_daily_bonus_info(update, context, already_answered=True)
+        if not result.get('ok'):
+            if result.get('reason') == 'cooldown':
+                cooldown_text = (
+                    f"Ещё рано! До бонуса: {_daily_bonus_format_duration(int(result.get('time_left', 0) or 0))}"
+                    if lang != 'en'
+                    else f"Too early! Next bonus in: {_daily_bonus_format_duration(int(result.get('time_left', 0) or 0))}"
+                )
+                logger.info(
+                    "[DAILY BONUS] cooldown reject user=%s ready_at=%s time_left=%s",
+                    user.id,
+                    result.get('ready_at'),
+                    result.get('time_left'),
+                )
+                try:
+                    await query.answer(cooldown_text, show_alert=False)
+                except Exception:
+                    pass
+                await show_daily_bonus_info(update, context, already_answered=True)
+                return
+
+            await query.answer()
+            error_text = "❌ Не удалось выдать бонус. Попробуй ещё раз позже." if lang != 'en' else "❌ Failed to claim the bonus. Please try again later."
+            await context.bot.send_message(chat_id=query.message.chat_id, text=error_text)
             return
 
+        await query.answer()
+
         chat_id = query.message.chat_id
-
-        # Выбираем награду по весам из рулетки
-        reward_types = list(DAILY_BONUS_REWARDS.keys())
-        adjusted = _daily_bonus_weights_with_rating(DAILY_BONUS_REWARDS, rating_value, 0.05)
-        reward_weights = [float(adjusted.get(r, 0) or 0) for r in reward_types]
-        selected_reward = random.choices(reward_types, weights=reward_weights, k=1)[0]
-        reward_info = DAILY_BONUS_REWARDS[selected_reward]
-
-        found_drink = None
-        if selected_reward == 'absolute_drink':
-            all_drinks = db.get_all_drinks()
-            non_special_drinks = [d for d in all_drinks if not d.is_special]
-            if non_special_drinks:
-                found_drink = random.choice(non_special_drinks)
-            else:
-                selected_reward = 'coins'
-                reward_info = DAILY_BONUS_REWARDS[selected_reward]
+        roulette_reward = result.get('roulette_reward') or {}
+        cycle_reward = result.get('cycle_reward') or {}
+        milestone_reward = result.get('milestone_reward') or {}
+        selected_tier = str(result.get('selected_tier') or 'common')
+        resolved_reward_id = str(roulette_reward.get('resolved_reward_id') or roulette_reward.get('reward_id') or 'coins_400')
 
         try:
             await query.message.edit_reply_markup(reply_markup=None)
@@ -7575,146 +7724,107 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         # Показываем текстовую анимацию рулетки
-        await show_roulette_animation(context, chat_id, selected_reward)
+        await show_roulette_animation(context, chat_id, resolved_reward_id, lang)
 
-        # Обрабатываем награду в зависимости от типа
-        caption = ""
-        reward_log = ""
-        new_rating = db.increment_rating(user.id, 1)
-
-        if selected_reward == 'coins':
-            # Награда 1: 400 септимов
-            coins_amount = reward_info['amount']
-            new_coins = db.increment_coins(user.id, coins_amount)
-            if new_coins is None:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Не удалось выдать бонус. Попробуй ещё раз позже.",
-                )
-                return
-            db.update_player(user.id, last_bonus_claim=current_time)
-
-            caption = (
-                f"🎉 <b>Поздравляем!</b>\n\n"
-                f"💰 Вы выиграли <b>{coins_amount} септимов</b>!\n\n"
-                f"Текущий баланс: <b>{new_coins}</b> 🪙"
+        if lang != 'en':
+            title_map = {
+                'common': "🎉 <b>Ежедневный бонус получен!</b>",
+                'rare': "✨ <b>Отличная добыча!</b>",
+                'epic': "🌟 <b>Эпическая награда!</b>",
+                'jackpot': "🎊 <b>ДЖЕКПОТ!</b>",
+            }
+            roulette_line = f"🎰 Рулетка: <b>{_daily_bonus_reward_label(roulette_reward.get('reward_id', ''), lang, resolved_reward_id)}</b>"
+            cycle_line = (
+                f"🎁 День цикла {int((result.get('status_after') or {}).get('next_cycle_day', 1) or 1) - 1 or int(DAILY_BONUS_RULES.get('cycle_length', 7) or 7)}/"
+                f"{int((result.get('status_after') or {}).get('cycle_length', 7) or 7)}: <b>{_daily_bonus_reward_label(cycle_reward.get('reward_id', ''), lang, cycle_reward.get('resolved_reward_id'))}</b>"
+            ) if cycle_reward else ""
+            milestone_line = (
+                f"🏆 Награда серии {int(result.get('streak_after', 0) or 0)}: <b>{_daily_bonus_reward_label(milestone_reward.get('reward_id', ''), lang, milestone_reward.get('resolved_reward_id'))}</b>"
+            ) if milestone_reward else ""
+            streak_line = f"🔥 Текущая серия: <b>{int(result.get('streak_after', 0) or 0)}</b> | Рекорд: <b>{int(result.get('best_streak_after', 0) or 0)}</b>"
+            pity_line = (
+                f"🛡 Счётчик гаранта после клейма: редкий <b>{int(result.get('rare_pity_after', 0) or 0)}</b>, эпик <b>{int(result.get('epic_pity_after', 0) or 0)}</b>"
             )
-            if new_rating is not None:
-                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-            reward_log = f"+{coins_amount} coins -> {new_coins}"
-
-        elif selected_reward == 'absolute_drink':
-            # Награда 2: Случайный энергетик Absolute (не Special)
-            rarity = 'Absolute'
-            rarity_emoji = COLOR_EMOJIS.get(rarity, '🟣')
-            try:
-                db.add_drink_to_inventory(user_id=user.id, drink_id=found_drink.id, rarity=rarity)
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="❌ Не удалось выдать бонус. Попробуй ещё раз позже.",
-                )
-                return
-            db.update_player(user.id, last_bonus_claim=current_time)
-
-            caption = (
-                f"🎉 <b>Невероятная удача!</b>\n\n"
-                f"Вы получили эксклюзивный энергетик редкости <b>{rarity_emoji} {rarity}</b>!\n\n"
-                f"<b>Название:</b> {found_drink.name}\n"
-                f"<b>Редкость:</b> {rarity_emoji} {rarity}\n\n"
-                f"<i>{found_drink.description}</i>"
+            rating_line = f"⭐ Ваш рейтинг: <b>{int(result.get('rating_after', 0) or 0)}</b>"
+            manual_line = "🛠 Кулдаун был открыт вручную, серия сохранена." if result.get('manual_ready_used') else ""
+        else:
+            title_map = {
+                'common': "🎉 <b>Daily bonus claimed!</b>",
+                'rare': "✨ <b>Great pull!</b>",
+                'epic': "🌟 <b>Epic reward!</b>",
+                'jackpot': "🎊 <b>JACKPOT!</b>",
+            }
+            roulette_line = f"🎰 Roulette: <b>{_daily_bonus_reward_label(roulette_reward.get('reward_id', ''), lang, resolved_reward_id)}</b>"
+            cycle_line = (
+                f"🎁 Cycle day {int((result.get('status_after') or {}).get('next_cycle_day', 1) or 1) - 1 or int(DAILY_BONUS_RULES.get('cycle_length', 7) or 7)}/"
+                f"{int((result.get('status_after') or {}).get('cycle_length', 7) or 7)}: <b>{_daily_bonus_reward_label(cycle_reward.get('reward_id', ''), lang, cycle_reward.get('resolved_reward_id'))}</b>"
+            ) if cycle_reward else ""
+            milestone_line = (
+                f"🏆 Milestone {int(result.get('streak_after', 0) or 0)}: <b>{_daily_bonus_reward_label(milestone_reward.get('reward_id', ''), lang, milestone_reward.get('resolved_reward_id'))}</b>"
+            ) if milestone_reward else ""
+            streak_line = f"🔥 Current streak: <b>{int(result.get('streak_after', 0) or 0)}</b> | Best: <b>{int(result.get('best_streak_after', 0) or 0)}</b>"
+            pity_line = (
+                f"🛡 Pity after claim: rare <b>{int(result.get('rare_pity_after', 0) or 0)}</b>, epic <b>{int(result.get('epic_pity_after', 0) or 0)}</b>"
             )
-            if new_rating is not None:
-                caption += f"\n\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-            reward_log = f"{found_drink.name} | rarity={rarity}"
+            rating_line = f"⭐ Your rating: <b>{int(result.get('rating_after', 0) or 0)}</b>"
+            manual_line = "🛠 Cooldown was manually unlocked and the streak was preserved." if result.get('manual_ready_used') else ""
 
-        elif selected_reward == 'vip_3d':
-            # Награда 3: VIP на 3 дня или VIP+ на 1 день если уже есть VIP+
-            vip_plus_ts = db.get_vip_plus_until(user.id)
-            current_time_check = time.time()
+        cycle_day_done = int((result.get('status_after') or {}).get('next_cycle_day', 1) or 1) - 1
+        cycle_length = int((result.get('status_after') or {}).get('cycle_length', 7) or 7)
+        if cycle_day_done <= 0:
+            cycle_day_done = cycle_length
+        cycle_line = (
+            f"{'🎁 День цикла' if lang != 'en' else '🎁 Cycle day'} {cycle_day_done}/{cycle_length}: "
+            f"<b>{_daily_bonus_reward_label(cycle_reward.get('reward_id', ''), lang, cycle_reward.get('resolved_reward_id'))}</b>"
+        ) if cycle_reward else ""
 
-            if vip_plus_ts and current_time_check < vip_plus_ts:
-                new_vip_plus_ts = db.extend_vip_plus(user.id, 1 * 24 * 60 * 60)
-                db.update_player(user.id, last_bonus_claim=current_time)
+        caption_lines = [title_map.get(selected_tier, title_map['common']), "", roulette_line]
+        caption_lines.extend(_daily_bonus_reward_detail_lines(roulette_reward, lang))
+        if cycle_line:
+            caption_lines.extend(["", cycle_line])
+            caption_lines.extend(_daily_bonus_reward_detail_lines(cycle_reward, lang))
+        if milestone_line:
+            caption_lines.extend(["", milestone_line])
+            caption_lines.extend(_daily_bonus_reward_detail_lines(milestone_reward, lang))
+        caption_lines.extend(["", streak_line, pity_line, rating_line])
+        if manual_line:
+            caption_lines.append(manual_line)
+        caption = "\n".join(line for line in caption_lines if line is not None)
 
-                caption = (
-                    f"🎉 <b>Элитная награда!</b>\n\n"
-                    f"{VIP_PLUS_EMOJI} Вы получили <b>+1 день VIP+</b>!\n\n"
-                    f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
-                )
-                if new_rating is not None:
-                    caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-                reward_log = "+1 day VIP+"
-            else:
-                new_vip_ts = db.extend_vip(user.id, 3 * 24 * 60 * 60)
-                db.update_player(user.id, last_bonus_claim=current_time)
-
-                caption = (
-                    f"🎉 <b>Отличная награда!</b>\n\n"
-                    f"{VIP_EMOJI} Вы получили <b>VIP на 3 дня</b>!\n\n"
-                    f"VIP активен до: {safe_format_timestamp(new_vip_ts)}"
-                )
-                if new_rating is not None:
-                    caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-                reward_log = "VIP 3 days"
-
-        elif selected_reward == 'vip_plus_7d':
-            # Награда 4: VIP+ на 7 дней
-            new_vip_plus_ts = db.extend_vip_plus(user.id, 7 * 24 * 60 * 60)
-            db.update_player(user.id, last_bonus_claim=current_time)
-
-            caption = (
-                f"🎉 <b>Фантастическая награда!</b>\n\n"
-                f"{VIP_PLUS_EMOJI} Вы получили <b>VIP+ на 7 дней</b>!\n\n"
-                f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
-            )
-            if new_rating is not None:
-                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-            reward_log = "VIP+ 7 days"
-
-        elif selected_reward == 'vip_plus_30d':
-            # Награда 5: VIP+ на 30 дней (джекпот!)
-            new_vip_plus_ts = db.extend_vip_plus(user.id, 30 * 24 * 60 * 60)
-            db.update_player(user.id, last_bonus_claim=current_time)
-
-            caption = (
-                f"🎊 <b>ДЖЕКПОТ!!!</b> 🎊\n\n"
-                f"{VIP_PLUS_EMOJI} Вы сорвали куш — <b>VIP+ на 30 дней</b>!\n\n"
-                f"VIP+ активен до: {safe_format_timestamp(new_vip_plus_ts)}"
-            )
-            if new_rating is not None:
-                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-            reward_log = "VIP+ 30 days (JACKPOT!)"
-
-        elif selected_reward == 'selyuk_fragment':
-            # Награда 6: Фрагмент Селюка
-            amount = reward_info.get('amount', 1)
-            new_fragments = db.increment_selyuk_fragments(user.id, amount)
-            db.update_player(user.id, last_bonus_claim=current_time)
-
-            caption = (
-                f"🎉 <b>Редкая находка!</b>\n\n"
-                f"🧩 Вы нашли <b>Фрагмент Селюка</b> ({amount} шт.)!\n\n"
-                f"Всего фрагментов: <b>{new_fragments}</b>"
-            )
-            if new_rating is not None:
-                caption += f"\n⭐ Ваш рейтинг: <b>{new_rating}</b>"
-            reward_log = f"Selyuk Fragment +{amount} -> {new_fragments}"
-
-        # Логируем результат
-        logger.info(
-            f"[DAILY BONUS ROULETTE] User {user.username or user.id} ({user.id}) | "
-            f"reward={selected_reward} | {reward_log}"
+        log_details = (
+            f"tier={selected_tier};"
+            f"roulette={roulette_reward.get('resolved_reward_id') or roulette_reward.get('reward_id')};"
+            f"cycle={cycle_reward.get('resolved_reward_id') or cycle_reward.get('reward_id') or '-'};"
+            f"milestone={milestone_reward.get('resolved_reward_id') or milestone_reward.get('reward_id') or '-'};"
+            f"streak_after={int(result.get('streak_after', 0) or 0)};"
+            f"rare_pity={int(result.get('rare_pity_after', 0) or 0)};"
+            f"epic_pity={int(result.get('epic_pity_after', 0) or 0)};"
+            f"vip_mode={'vip_plus' if (result.get('status_after') or {}).get('vip_plus_active') else ('vip' if (result.get('status_after') or {}).get('vip_active') else 'regular')};"
+            f"manual_ready={1 if result.get('manual_ready_used') else 0}"
         )
+        logger.info("[DAILY BONUS] user=%s username=%s %s", user.id, user.username or '-', log_details)
+        try:
+            db.log_action(
+                int(user.id),
+                getattr(user, 'username', None),
+                'daily_bonus_claim',
+                log_details,
+                success=True,
+            )
+        except Exception:
+            logger.warning("Не удалось записать action_log для daily bonus user=%s", user.id)
 
         # Отправляем финальное сообщение с наградой
         back_label = "🔙 В меню" if lang == 'ru' else "🔙 Menu"
         keyboard = [[InlineKeyboardButton(back_label, callback_data='menu')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        drink_payload = roulette_reward.get('drink') or {}
+        image_path = drink_payload.get('image_path')
+
         # Если выпал энергетик - отправляем с фото, иначе - просто текст
-        if found_drink and getattr(found_drink, 'image_path', None):
-            image_full_path = os.path.join(ENERGY_IMAGES_DIR, found_drink.image_path)
+        if image_path:
+            image_full_path = os.path.join(ENERGY_IMAGES_DIR, str(image_path))
             if os.path.exists(image_full_path):
                 try:
                     with open(image_full_path, 'rb') as photo:
@@ -8093,15 +8203,12 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_search_val = float(getattr(player, 'last_search', 0) or 0)
     search_time_left = max(0, search_cd - (time.time() - last_search_val))
 
-    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
-    if vip_plus_active:
-        bonus_cd = base_bonus_cd / 4
-    elif vip_active:
-        bonus_cd = base_bonus_cd / 2
-    else:
-        bonus_cd = base_bonus_cd
-    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
-    bonus_time_left = max(0, bonus_cd - (time.time() - last_bonus_claim_val))
+    bonus_status = db.get_daily_bonus_status(
+        user_id,
+        username=getattr(user, 'username', None),
+        display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+    )
+    bonus_time_left = int(bonus_status.get('time_left', 0) or 0) if bonus_status.get('ok') and not bonus_status.get('available') else 0
     
     # === ЗАГОЛОВОК И ПРОФИЛЬ ===
     stats_text = f"<b>📊 Статистика игрока</b>\n"
@@ -8161,6 +8268,11 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats_text += f"• Последний бонус: {last_bonus_str}\n"
     else:
         stats_text += f"• Последний бонус: Еще не было\n"
+    if bonus_status.get('ok'):
+        stats_text += (
+            f"• Daily bonus: серия <b>{int(bonus_status.get('streak', 0) or 0)}</b>, "
+            f"следующий milestone <b>{int(bonus_status.get('next_milestone_target', 0) or 0)}</b>\n"
+        )
     
     # Автопоиск (только для VIP)
     if vip_active or vip_plus_active:
@@ -8314,15 +8426,12 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_search_val = float(getattr(player, 'last_search', 0) or 0)
     search_time_left = max(0, search_cd - (time.time() - last_search_val))
 
-    base_bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
-    if vip_plus_active:
-        bonus_cd = base_bonus_cd / 4
-    elif vip_active:
-        bonus_cd = base_bonus_cd / 2
-    else:
-        bonus_cd = base_bonus_cd
-    last_bonus_claim_val = float(getattr(player, 'last_bonus_claim', 0) or 0)
-    bonus_time_left = max(0, bonus_cd - (time.time() - last_bonus_claim_val))
+    bonus_status = db.get_daily_bonus_status(
+        user_id,
+        username=getattr(user, 'username', None),
+        display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
+    )
+    bonus_time_left = int(bonus_status.get('time_left', 0) or 0) if bonus_status.get('ok') and not bonus_status.get('available') else 0
 
     if vip_plus_active:
         vip_until_str = safe_format_timestamp(vip_plus_ts, '%d.%m.%Y %H:%M')
@@ -8341,11 +8450,14 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timing_lines.append("🔎 <b>Поиск:</b> ✅")
 
         if bonus_time_left > 0:
-            hours, remainder = divmod(int(bonus_time_left), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            timing_lines.append(f"🎁 <b>Бонус:</b> ⏳ {hours:02d}:{minutes:02d}:{seconds:02d}")
+            timing_lines.append(f"🎁 <b>Бонус:</b> ⏳ {_daily_bonus_format_duration(bonus_time_left)}")
         else:
             timing_lines.append("🎁 <b>Бонус:</b> ✅")
+        if bonus_status.get('ok'):
+            timing_lines.append(
+                f"🔥 <b>Серия бонуса:</b> {int(bonus_status.get('streak', 0) or 0)} "
+                f"(до milestone {int(bonus_status.get('next_milestone_target', 0) or 0)})"
+            )
     else:
         if search_time_left > 0:
             timing_lines.append(f"🔎 <b>Search:</b> ⏳ {int(search_time_left // 60)}:{int(search_time_left % 60):02d}")
@@ -8353,11 +8465,14 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             timing_lines.append("🔎 <b>Search:</b> ✅")
 
         if bonus_time_left > 0:
-            hours, remainder = divmod(int(bonus_time_left), 3600)
-            minutes, seconds = divmod(remainder, 60)
-            timing_lines.append(f"🎁 <b>Bonus:</b> ⏳ {hours:02d}:{minutes:02d}:{seconds:02d}")
+            timing_lines.append(f"🎁 <b>Bonus:</b> ⏳ {_daily_bonus_format_duration(bonus_time_left)}")
         else:
             timing_lines.append("🎁 <b>Bonus:</b> ✅")
+        if bonus_status.get('ok'):
+            timing_lines.append(
+                f"🔥 <b>Bonus streak:</b> {int(bonus_status.get('streak', 0) or 0)} "
+                f"(milestone at {int(bonus_status.get('next_milestone_target', 0) or 0)})"
+            )
 
     timing_block = "\n" + "\n".join(timing_lines) if timing_lines else ""
 
@@ -14371,7 +14486,7 @@ async def handle_rostov_elite_buy(update: Update, context: ContextTypes.DEFAULT_
             db.update_player(user.id, last_search=0)
             await query.answer("✅ Кулдаун поиска сброшен!", show_alert=True)
         elif item_key == 'bonus_skip':
-            db.update_player(user.id, last_bonus_claim=0)
+            db.set_daily_bonus_manual_ready(user.id)
             await query.answer("✅ Кулдаун бонуса сброшен!", show_alert=True)
         elif item_key == 'auto_boost_10_24h':
             try:
@@ -20205,7 +20320,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "I am a bot for collecting energy drinks. Here is what you can do:\n\n"
             "<b>Main menu:</b>\n"
             f"• 🔎 <b>Find energy</b> — once per {search_minutes} min you can try your luck and find a random drink.\n"
-            f"• 🎁 <b>Daily bonus</b> — once per {bonus_hours} h.\n"
+            f"• 🎁 <b>Daily bonus</b> — roulette, streaks and milestones once per {bonus_hours} h.\n"
             "• 📦 <b>Inventory</b> — all your found drinks (with pages).\n"
             "• 🏙️ <b>Cities</b> — choose a city (HighTown: Shop, Receiver, Plantation).\n"
             "• 👤 <b>My profile</b> — your stats, boosts and promo codes.\n"
@@ -20234,7 +20349,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Я бот для коллекционирования энергетиков. Вот что доступно:\n\n"
             "<b>Главное меню:</b>\n"
             f"• 🔎 <b>Найти энергетик</b> — раз в {search_minutes} мин. можно испытать удачу и найти случайный энергетик.\n"
-            f"• 🎁 <b>Ежедневный бонус</b> — раз в {bonus_hours} ч.\n"
+            f"• 🎁 <b>Ежедневный бонус</b> — рулетка, серии и milestone-награды раз в {bonus_hours} ч.\n"
             "• 📦 <b>Инвентарь</b> — все ваши найденные напитки (есть пагинация).\n"
             "• 🏙️ <b>Города</b> — выбор города (ХайТаун: Магазин, Приёмник, Плантация).\n"
             "• 👤 <b>Мой профиль</b> — ваш профиль, статистика, бусты и промокоды.\n"

@@ -17,6 +17,14 @@ from constants import (
     RECEIVER_COMMISSION,
     SHOP_PRICES,
     ADMIN_USERNAMES,
+    DAILY_BONUS_COOLDOWN,
+    DAILY_BONUS_RULES,
+    DAILY_BONUS_TIER_ORDER,
+    DAILY_BONUS_TIER_LABELS,
+    DAILY_BONUS_REWARD_CATALOG,
+    DAILY_BONUS_ROULETTE_TABLE,
+    DAILY_BONUS_CYCLE_REWARDS,
+    DAILY_BONUS_MILESTONES,
     PLANTATION_FERTILIZER_MAX_PER_BED,
     PLANTATION_NEG_EVENT_INTERVAL_SEC,
     PLANTATION_NEG_EVENT_CHANCE,
@@ -51,6 +59,12 @@ class Player(Base):
     rating = Column(Integer, default=0)
     last_search = Column(Integer, default=0)
     last_bonus_claim = Column(Integer, default=0)
+    daily_bonus_streak = Column(Integer, default=0)
+    daily_bonus_best_streak = Column(Integer, default=0)
+    daily_bonus_cycle_index = Column(Integer, default=0)
+    daily_bonus_rare_pity = Column(Integer, default=0)
+    daily_bonus_epic_pity = Column(Integer, default=0)
+    daily_bonus_manual_ready = Column(Integer, default=0)
     last_add = Column(Integer, default=0)
     language = Column(String, default='ru')
     remind = Column(Boolean, default=False)
@@ -6072,6 +6086,18 @@ def ensure_schema():
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN rating INTEGER DEFAULT 0")
         if 'last_bonus_claim' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN last_bonus_claim INTEGER DEFAULT 0")
+        if 'daily_bonus_streak' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN daily_bonus_streak INTEGER DEFAULT 0")
+        if 'daily_bonus_best_streak' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN daily_bonus_best_streak INTEGER DEFAULT 0")
+        if 'daily_bonus_cycle_index' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN daily_bonus_cycle_index INTEGER DEFAULT 0")
+        if 'daily_bonus_rare_pity' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN daily_bonus_rare_pity INTEGER DEFAULT 0")
+        if 'daily_bonus_epic_pity' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN daily_bonus_epic_pity INTEGER DEFAULT 0")
+        if 'daily_bonus_manual_ready' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN daily_bonus_manual_ready INTEGER DEFAULT 0")
         if 'last_add' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN last_add INTEGER DEFAULT 0")
         if 'vip_until' not in cols:
@@ -6665,6 +6691,594 @@ def extend_vip_plus(user_id: int, duration_seconds: int) -> int:
     finally:
         db.close()
 
+def _daily_bonus_normalize_identity(username=None, display_name=None) -> tuple[str | None, str | None]:
+    new_uname = None
+    new_display = None
+    try:
+        if username:
+            uname = str(username).lstrip('@')
+            if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
+                new_uname = uname
+        if display_name:
+            new_display = str(display_name).strip()
+        if (not new_display) and username and (new_uname is None):
+            new_display = str(username).strip()
+    except Exception:
+        new_uname = None
+        new_display = None
+    return new_uname, new_display
+
+
+def _daily_bonus_get_or_create_player_row(dbs, user_id: int, username=None, display_name=None, for_update: bool = False) -> Player:
+    query = dbs.query(Player).filter(Player.user_id == int(user_id))
+    if for_update:
+        query = query.with_for_update(read=False)
+    player = query.first()
+
+    new_uname, new_display = _daily_bonus_normalize_identity(username=username, display_name=display_name)
+
+    if not player:
+        player = Player(user_id=int(user_id), username=new_uname, display_name=new_display)
+        dbs.add(player)
+        dbs.flush()
+        return player
+
+    if new_uname and new_uname != getattr(player, 'username', None):
+        player.username = new_uname
+    if new_display and new_display != getattr(player, 'display_name', None):
+        player.display_name = new_display
+    return player
+
+
+def _daily_bonus_rating_bonus_fraction(rating_value: int) -> float:
+    try:
+        rating = int(rating_value or 0)
+    except Exception:
+        rating = 0
+    rating = max(0, min(1000, rating))
+    max_bonus = float(DAILY_BONUS_RULES.get('rating_bonus_cap', 0.05) or 0.05)
+    return max(0.0, max_bonus) * (rating / 1000.0)
+
+
+def _daily_bonus_get_vip_flags(player: Player, now_ts: int) -> tuple[bool, bool]:
+    vip_until = int(getattr(player, 'vip_until', 0) or 0)
+    vip_plus_until = int(getattr(player, 'vip_plus_until', 0) or 0)
+    vip_plus_active = bool(vip_plus_until and int(now_ts) < vip_plus_until)
+    vip_active = bool(vip_plus_active or (vip_until and int(now_ts) < vip_until))
+    return vip_active, vip_plus_active
+
+
+def _daily_bonus_effective_cooldown(player: Player, now_ts: int) -> dict:
+    base_bonus_cd = int(get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN))
+    vip_active, vip_plus_active = _daily_bonus_get_vip_flags(player, now_ts)
+    if vip_plus_active:
+        effective = float(base_bonus_cd) / 4.0
+    elif vip_active:
+        effective = float(base_bonus_cd) / 2.0
+    else:
+        effective = float(base_bonus_cd)
+    return {
+        "base_cooldown": int(base_bonus_cd),
+        "effective_cooldown": float(effective),
+        "vip_active": bool(vip_active),
+        "vip_plus_active": bool(vip_plus_active),
+    }
+
+
+def _daily_bonus_grace_seconds(effective_cooldown: float, vip_active: bool, vip_plus_active: bool) -> int:
+    grace = float(effective_cooldown) * float(DAILY_BONUS_RULES.get('streak_grace_multiplier', 0.5) or 0.5)
+    if vip_plus_active:
+        grace *= float(DAILY_BONUS_RULES.get('vip_plus_grace_multiplier', 1.5) or 1.5)
+    elif vip_active:
+        grace *= float(DAILY_BONUS_RULES.get('vip_grace_multiplier', 1.25) or 1.25)
+    grace_min = int(DAILY_BONUS_RULES.get('grace_min_sec', 5400) or 5400)
+    grace_max = int(DAILY_BONUS_RULES.get('grace_max_sec', 43200) or 43200)
+    grace = int(round(grace))
+    return max(grace_min, min(grace_max, grace))
+
+
+def _daily_bonus_weighted_choice(options: list[dict], default_id: str | None = None) -> str | None:
+    ids: list[str] = []
+    weights: list[float] = []
+    for entry in options or []:
+        reward_id = str(entry.get('reward_id') or '')
+        if not reward_id:
+            continue
+        try:
+            weight = float(entry.get('weight', 0) or 0)
+        except Exception:
+            weight = 0.0
+        if weight <= 0:
+            continue
+        ids.append(reward_id)
+        weights.append(weight)
+    if ids:
+        return random.choices(ids, weights=weights, k=1)[0]
+    return default_id
+
+
+def _daily_bonus_tier_weights(rating_value: int, rare_pity: int, epic_pity: int) -> dict[str, float]:
+    base_weights = {
+        str(tier): float((DAILY_BONUS_RULES.get('tier_weights', {}) or {}).get(tier, 0) or 0.0)
+        for tier in DAILY_BONUS_TIER_ORDER
+    }
+    bonus = _daily_bonus_rating_bonus_fraction(rating_value)
+    multipliers = DAILY_BONUS_RULES.get('tier_rating_multipliers', {}) or {}
+
+    base_weights['common'] = max(0.0, base_weights.get('common', 0.0) * max(0.05, 1.0 - bonus))
+    base_weights['rare'] = max(0.0, base_weights.get('rare', 0.0) * (1.0 + bonus * float(multipliers.get('rare', 1.0) or 1.0)))
+    base_weights['epic'] = max(0.0, base_weights.get('epic', 0.0) * (1.0 + bonus * float(multipliers.get('epic', 1.35) or 1.35)))
+    base_weights['jackpot'] = max(0.0, base_weights.get('jackpot', 0.0) * (1.0 + bonus * float(multipliers.get('jackpot', 1.7) or 1.7)))
+
+    rare_threshold = int(DAILY_BONUS_RULES.get('pity_rare_after_common', 4) or 4)
+    epic_threshold = int(DAILY_BONUS_RULES.get('pity_epic_after_non_epic', 11) or 11)
+    if int(epic_pity or 0) >= epic_threshold:
+        base_weights['common'] = 0.0
+        base_weights['rare'] = 0.0
+    elif int(rare_pity or 0) >= rare_threshold:
+        base_weights['common'] = 0.0
+
+    if sum(v for v in base_weights.values() if v > 0) <= 0:
+        base_weights = {'common': 1.0, 'rare': 0.0, 'epic': 0.0, 'jackpot': 0.0}
+    return base_weights
+
+
+def _daily_bonus_percentages(weight_map: dict[str, float]) -> dict[str, float]:
+    total = sum(float(v or 0.0) for v in (weight_map or {}).values() if float(v or 0.0) > 0)
+    if total <= 0:
+        total = 1.0
+    return {
+        str(tier): (float(weight_map.get(tier, 0.0) or 0.0) / total) * 100.0
+        for tier in DAILY_BONUS_TIER_ORDER
+    }
+
+
+def _daily_bonus_next_cycle_reward(cycle_index: int) -> dict:
+    cycle_length = int(DAILY_BONUS_RULES.get('cycle_length', len(DAILY_BONUS_CYCLE_REWARDS)) or len(DAILY_BONUS_CYCLE_REWARDS))
+    next_day = (int(cycle_index or 0) % max(1, cycle_length)) + 1
+    for entry in DAILY_BONUS_CYCLE_REWARDS:
+        if int(entry.get('day', 0) or 0) == next_day:
+            return {
+                "day": int(next_day),
+                "reward_id": str(entry.get('reward_id') or ''),
+            }
+    fallback = DAILY_BONUS_CYCLE_REWARDS[0] if DAILY_BONUS_CYCLE_REWARDS else {"day": 1, "reward_id": ""}
+    return {
+        "day": int(fallback.get('day', 1) or 1),
+        "reward_id": str(fallback.get('reward_id') or ''),
+    }
+
+
+def _daily_bonus_next_milestone(streak_value: int) -> dict:
+    streak = max(0, int(streak_value or 0))
+    candidates: list[tuple[int, str]] = []
+
+    for entry in DAILY_BONUS_MILESTONES:
+        reward_id = str(entry.get('reward_id') or '')
+        exact_streak = entry.get('streak')
+        every = entry.get('every')
+        if exact_streak is not None:
+            target = int(exact_streak or 0)
+            if streak < target:
+                candidates.append((target, reward_id))
+            continue
+        if every is None:
+            continue
+        every_val = max(1, int(every or 1))
+        start = int(entry.get('start', every_val) or every_val)
+        if streak < start:
+            target = start
+        else:
+            target = ((streak // every_val) + 1) * every_val
+        candidates.append((target, reward_id))
+
+    if not candidates:
+        return {"target": 0, "reward_id": "", "remaining": 0}
+
+    target, reward_id = min(candidates, key=lambda item: item[0])
+    return {
+        "target": int(target),
+        "reward_id": str(reward_id),
+        "remaining": max(0, int(target) - streak),
+    }
+
+
+def _daily_bonus_triggered_milestone(streak_value: int) -> dict | None:
+    streak = max(0, int(streak_value or 0))
+    for entry in DAILY_BONUS_MILESTONES:
+        exact_streak = entry.get('streak')
+        if exact_streak is not None and int(exact_streak or 0) == streak:
+            return dict(entry)
+    for entry in DAILY_BONUS_MILESTONES:
+        every = entry.get('every')
+        if every is None:
+            continue
+        every_val = max(1, int(every or 1))
+        start = int(entry.get('start', every_val) or every_val)
+        if streak >= start and streak % every_val == 0:
+            return dict(entry)
+    return None
+
+
+def _daily_bonus_build_status(player: Player, now_ts: int) -> dict:
+    cooldown_ctx = _daily_bonus_effective_cooldown(player, now_ts)
+    effective_cooldown = float(cooldown_ctx["effective_cooldown"])
+    grace_window = _daily_bonus_grace_seconds(
+        effective_cooldown,
+        cooldown_ctx["vip_active"],
+        cooldown_ctx["vip_plus_active"],
+    )
+
+    last_bonus_claim = int(getattr(player, 'last_bonus_claim', 0) or 0)
+    manual_ready = bool(int(getattr(player, 'daily_bonus_manual_ready', 0) or 0))
+    stored_streak = max(0, int(getattr(player, 'daily_bonus_streak', 0) or 0))
+
+    if last_bonus_claim > 0:
+        ready_at = int(last_bonus_claim + effective_cooldown)
+        streak_expires_at = int(ready_at + grace_window)
+    else:
+        ready_at = int(now_ts)
+        streak_expires_at = int(now_ts + grace_window)
+
+    available = bool(manual_ready or last_bonus_claim <= 0 or int(now_ts) >= ready_at)
+    time_left = 0 if available else max(0, int(ready_at - int(now_ts)))
+
+    if manual_ready:
+        display_streak = stored_streak
+        streak_expired = False
+    elif stored_streak > 0 and last_bonus_claim > 0 and int(now_ts) > streak_expires_at:
+        display_streak = 0
+        streak_expired = True
+    else:
+        display_streak = stored_streak
+        streak_expired = False
+
+    next_cycle = _daily_bonus_next_cycle_reward(int(getattr(player, 'daily_bonus_cycle_index', 0) or 0))
+    next_milestone = _daily_bonus_next_milestone(display_streak)
+    rating_value = int(getattr(player, 'rating', 0) or 0)
+    rare_pity = max(0, int(getattr(player, 'daily_bonus_rare_pity', 0) or 0))
+    epic_pity = max(0, int(getattr(player, 'daily_bonus_epic_pity', 0) or 0))
+    tier_weights = _daily_bonus_tier_weights(rating_value, rare_pity, epic_pity)
+
+    return {
+        "available": bool(available),
+        "time_left": int(time_left),
+        "ready_at": int(ready_at),
+        "streak_expires_at": int(streak_expires_at),
+        "streak": int(display_streak),
+        "stored_streak": int(stored_streak),
+        "streak_expired": bool(streak_expired),
+        "best_streak": max(0, int(getattr(player, 'daily_bonus_best_streak', 0) or 0)),
+        "next_cycle_day": int(next_cycle["day"]),
+        "next_cycle_reward_id": str(next_cycle["reward_id"]),
+        "next_milestone_target": int(next_milestone["target"]),
+        "next_milestone_reward_id": str(next_milestone["reward_id"]),
+        "next_milestone_remaining": int(next_milestone["remaining"]),
+        "rare_pity": int(rare_pity),
+        "epic_pity": int(epic_pity),
+        "rare_pity_remaining": max(0, int(DAILY_BONUS_RULES.get('pity_rare_after_common', 4) or 4) - int(rare_pity)),
+        "epic_pity_remaining": max(0, int(DAILY_BONUS_RULES.get('pity_epic_after_non_epic', 11) or 11) - int(epic_pity)),
+        "base_cooldown": int(cooldown_ctx["base_cooldown"]),
+        "effective_cooldown": float(effective_cooldown),
+        "grace_window": int(grace_window),
+        "vip_active": bool(cooldown_ctx["vip_active"]),
+        "vip_plus_active": bool(cooldown_ctx["vip_plus_active"]),
+        "manual_ready": bool(manual_ready),
+        "rating_bonus_fraction": float(_daily_bonus_rating_bonus_fraction(rating_value)),
+        "rating_value": int(rating_value),
+        "tier_odds": _daily_bonus_percentages(tier_weights),
+        "tier_reward_groups": {
+            str(tier): [str(entry.get('reward_id') or '') for entry in DAILY_BONUS_ROULETTE_TABLE.get(tier, [])]
+            for tier in DAILY_BONUS_TIER_ORDER
+        },
+        "last_bonus_claim": int(last_bonus_claim),
+        "cycle_length": int(DAILY_BONUS_RULES.get('cycle_length', len(DAILY_BONUS_CYCLE_REWARDS)) or len(DAILY_BONUS_CYCLE_REWARDS)),
+    }
+
+
+def _daily_bonus_apply_reward(dbs, player: Player, reward_id: str, now_ts: int, source: str) -> dict:
+    spec = dict(DAILY_BONUS_REWARD_CATALOG.get(str(reward_id), {}) or {})
+    if not spec:
+        raise ValueError(f"Unknown daily bonus reward: {reward_id}")
+
+    result = {
+        "source": str(source),
+        "reward_id": str(reward_id),
+        "resolved_reward_id": str(reward_id),
+        "kind": str(spec.get('kind') or ''),
+        "tier": spec.get('tier'),
+        "fallback": False,
+    }
+
+    kind = str(spec.get('kind') or '')
+
+    if kind == 'coins':
+        amount = max(0, int(spec.get('amount', 0) or 0))
+        player.coins = int(getattr(player, 'coins', 0) or 0) + amount
+        result.update({
+            "amount": int(amount),
+            "coins_after": int(player.coins),
+        })
+        return result
+
+    if kind == 'selyuk_fragment':
+        amount = max(0, int(spec.get('amount', 0) or 0))
+        player.selyuk_fragments = int(getattr(player, 'selyuk_fragments', 0) or 0) + amount
+        result.update({
+            "amount": int(amount),
+            "fragments_after": int(player.selyuk_fragments),
+        })
+        return result
+
+    if kind == 'luck_coupon':
+        amount = max(0, int(spec.get('amount', 0) or 0))
+        player.luck_coupon_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0) + amount
+        result.update({
+            "amount": int(amount),
+            "luck_after": int(player.luck_coupon_charges),
+        })
+        return result
+
+    if kind == 'auto_search_boost':
+        boost_count = max(0, int(spec.get('boost_count', 0) or 0))
+        days = max(1, int(spec.get('days', 1) or 1))
+        current_boost_until = int(getattr(player, 'auto_search_boost_until', 0) or 0)
+        current_boost_count = int(getattr(player, 'auto_search_boost_count', 0) or 0)
+        if current_boost_until > int(now_ts):
+            start_time = current_boost_until
+            new_boost_count = current_boost_count + boost_count
+        else:
+            start_time = int(now_ts)
+            new_boost_count = boost_count
+        new_boost_until = int(start_time + (days * 24 * 60 * 60))
+        player.auto_search_boost_count = int(new_boost_count)
+        player.auto_search_boost_until = int(new_boost_until)
+        result.update({
+            "boost_count": int(boost_count),
+            "boost_days": int(days),
+            "boost_count_after": int(player.auto_search_boost_count),
+            "boost_until": int(player.auto_search_boost_until),
+        })
+        return result
+
+    if kind == 'vip':
+        seconds = max(0, int(spec.get('seconds', 0) or 0))
+        current_until = int(getattr(player, 'vip_until', 0) or 0)
+        start_ts = current_until if current_until > int(now_ts) else int(now_ts)
+        player.vip_until = int(start_ts + seconds)
+        result.update({
+            "seconds": int(seconds),
+            "vip_until": int(player.vip_until),
+        })
+        return result
+
+    if kind == 'vip_plus':
+        seconds = max(0, int(spec.get('seconds', 0) or 0))
+        current_until = int(getattr(player, 'vip_plus_until', 0) or 0)
+        start_ts = current_until if current_until > int(now_ts) else int(now_ts)
+        player.vip_plus_until = int(start_ts + seconds)
+        result.update({
+            "seconds": int(seconds),
+            "vip_plus_until": int(player.vip_plus_until),
+        })
+        return result
+
+    if kind == 'vip_combo':
+        vip_plus_until = int(getattr(player, 'vip_plus_until', 0) or 0)
+        resolved_reward_id = 'vip_plus_1d' if vip_plus_until > int(now_ts) else 'vip_3d'
+        applied = _daily_bonus_apply_reward(dbs, player, resolved_reward_id, now_ts, source)
+        applied["reward_id"] = str(reward_id)
+        applied["resolved_reward_id"] = str(resolved_reward_id)
+        return applied
+
+    if kind == 'absolute_drink':
+        drinks = dbs.query(EnergyDrink).filter(EnergyDrink.is_special == False).all() or []
+        if not drinks:
+            logger.warning("[DAILY BONUS] No non-special drinks for reward=%s, fallback to coins_700", reward_id)
+            fallback = _daily_bonus_apply_reward(dbs, player, 'coins_700', now_ts, source)
+            fallback["reward_id"] = str(reward_id)
+            fallback["resolved_reward_id"] = 'coins_700'
+            fallback["fallback"] = True
+            fallback["fallback_from"] = str(reward_id)
+            return fallback
+
+        found_drink = random.choice(drinks)
+        item = (
+            dbs.query(InventoryItem)
+            .filter(
+                InventoryItem.player_id == int(player.user_id),
+                InventoryItem.drink_id == int(found_drink.id),
+                InventoryItem.rarity == 'Absolute',
+            )
+            .first()
+        )
+        if item:
+            item.quantity = int(getattr(item, 'quantity', 0) or 0) + 1
+        else:
+            dbs.add(
+                InventoryItem(
+                    player_id=int(player.user_id),
+                    drink_id=int(found_drink.id),
+                    rarity='Absolute',
+                    quantity=1,
+                )
+            )
+        result.update({
+            "drink": {
+                "id": int(found_drink.id),
+                "name": str(getattr(found_drink, 'name', '') or ''),
+                "description": str(getattr(found_drink, 'description', '') or ''),
+                "image_path": getattr(found_drink, 'image_path', None),
+                "rarity": 'Absolute',
+            }
+        })
+        return result
+
+    raise ValueError(f"Unsupported daily bonus reward kind: {kind}")
+
+
+def get_daily_bonus_status(user_id, username=None, display_name=None, now_ts=None) -> dict:
+    dbs = SessionLocal()
+    try:
+        now_val = int(now_ts or time.time())
+        player = _daily_bonus_get_or_create_player_row(
+            dbs,
+            int(user_id),
+            username=username,
+            display_name=display_name,
+            for_update=False,
+        )
+        dbs.commit()
+        status = _daily_bonus_build_status(player, now_val)
+        status["ok"] = True
+        status["user_id"] = int(player.user_id)
+        return status
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        logger.exception("[DAILY BONUS] get_daily_bonus_status failed for user_id=%s", user_id)
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def claim_daily_bonus_atomic(user_id, username=None, display_name=None, now_ts=None) -> dict:
+    dbs = SessionLocal()
+    try:
+        now_val = int(now_ts or time.time())
+        player = _daily_bonus_get_or_create_player_row(
+            dbs,
+            int(user_id),
+            username=username,
+            display_name=display_name,
+            for_update=True,
+        )
+
+        status_before = _daily_bonus_build_status(player, now_val)
+        if not status_before.get("available"):
+            return {
+                "ok": False,
+                "reason": "cooldown",
+                **status_before,
+            }
+
+        manual_ready_used = bool(status_before.get("manual_ready"))
+        effective_cooldown = float(status_before.get("effective_cooldown", DAILY_BONUS_COOLDOWN))
+        grace_window = int(status_before.get("grace_window", 0))
+        last_bonus_claim = int(getattr(player, 'last_bonus_claim', 0) or 0)
+        stored_streak = max(0, int(getattr(player, 'daily_bonus_streak', 0) or 0))
+
+        if manual_ready_used:
+            new_streak = stored_streak + 1 if stored_streak > 0 else 1
+        elif last_bonus_claim <= 0 or stored_streak <= 0:
+            new_streak = 1
+        else:
+            ready_at = int(last_bonus_claim + effective_cooldown)
+            if now_val <= int(ready_at + grace_window):
+                new_streak = stored_streak + 1
+            else:
+                new_streak = 1
+
+        tier_weights = _daily_bonus_tier_weights(
+            int(getattr(player, 'rating', 0) or 0),
+            int(getattr(player, 'daily_bonus_rare_pity', 0) or 0),
+            int(getattr(player, 'daily_bonus_epic_pity', 0) or 0),
+        )
+        tier_options = [
+            {"reward_id": tier, "weight": float(tier_weights.get(tier, 0.0) or 0.0)}
+            for tier in DAILY_BONUS_TIER_ORDER
+        ]
+        selected_tier = _daily_bonus_weighted_choice(tier_options, default_id='common') or 'common'
+        roulette_reward_id = _daily_bonus_weighted_choice(
+            DAILY_BONUS_ROULETTE_TABLE.get(selected_tier, []),
+            default_id='coins_400',
+        ) or 'coins_400'
+
+        next_cycle = _daily_bonus_next_cycle_reward(int(getattr(player, 'daily_bonus_cycle_index', 0) or 0))
+        cycle_reward_id = str(next_cycle.get("reward_id") or '')
+        milestone_entry = _daily_bonus_triggered_milestone(new_streak)
+        milestone_reward_id = str((milestone_entry or {}).get('reward_id') or '')
+
+        roulette_reward = _daily_bonus_apply_reward(dbs, player, roulette_reward_id, now_val, source='roulette')
+        cycle_reward = _daily_bonus_apply_reward(dbs, player, cycle_reward_id, now_val, source='cycle') if cycle_reward_id else None
+        milestone_reward = _daily_bonus_apply_reward(dbs, player, milestone_reward_id, now_val, source='milestone') if milestone_reward_id else None
+
+        if selected_tier == 'common':
+            player.daily_bonus_rare_pity = int(getattr(player, 'daily_bonus_rare_pity', 0) or 0) + 1
+            player.daily_bonus_epic_pity = int(getattr(player, 'daily_bonus_epic_pity', 0) or 0) + 1
+        elif selected_tier == 'rare':
+            player.daily_bonus_rare_pity = 0
+            player.daily_bonus_epic_pity = int(getattr(player, 'daily_bonus_epic_pity', 0) or 0) + 1
+        else:
+            player.daily_bonus_rare_pity = 0
+            player.daily_bonus_epic_pity = 0
+
+        player.last_bonus_claim = int(now_val)
+        player.daily_bonus_manual_ready = 0
+        player.daily_bonus_streak = int(new_streak)
+        player.daily_bonus_best_streak = max(
+            int(getattr(player, 'daily_bonus_best_streak', 0) or 0),
+            int(new_streak),
+        )
+        player.daily_bonus_cycle_index = int(next_cycle.get("day", 1) or 1) % max(
+            1,
+            int(DAILY_BONUS_RULES.get('cycle_length', len(DAILY_BONUS_CYCLE_REWARDS)) or len(DAILY_BONUS_CYCLE_REWARDS)),
+        )
+
+        rating_before = int(getattr(player, 'rating', 0) or 0)
+        player.rating = min(1000, rating_before + 1)
+
+        dbs.commit()
+
+        status_after = _daily_bonus_build_status(player, now_val)
+        return {
+            "ok": True,
+            "user_id": int(player.user_id),
+            "manual_ready_used": bool(manual_ready_used),
+            "selected_tier": str(selected_tier),
+            "roulette_reward": roulette_reward,
+            "cycle_reward": cycle_reward,
+            "milestone_reward": milestone_reward,
+            "streak_before": int(stored_streak),
+            "streak_after": int(player.daily_bonus_streak),
+            "best_streak_after": int(player.daily_bonus_best_streak),
+            "rating_before": int(rating_before),
+            "rating_after": int(player.rating),
+            "rare_pity_after": int(player.daily_bonus_rare_pity),
+            "epic_pity_after": int(player.daily_bonus_epic_pity),
+            "status_after": status_after,
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        logger.exception("[DAILY BONUS] claim_daily_bonus_atomic failed for user_id=%s", user_id)
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def set_daily_bonus_manual_ready(user_id: int) -> bool:
+    dbs = SessionLocal()
+    try:
+        player = _daily_bonus_get_or_create_player_row(dbs, int(user_id), for_update=True)
+        player.daily_bonus_manual_ready = 1
+        dbs.commit()
+        return True
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        logger.exception("[DAILY BONUS] set_daily_bonus_manual_ready failed for user_id=%s", user_id)
+        return False
+    finally:
+        dbs.close()
+
+
 def set_admin_level(user_id: int, level: int) -> bool:
     """Устанавливает уровень админа (1..3). Возвращает True, если успешно."""
     if level not in (1, 2, 3):
@@ -6684,7 +7298,7 @@ def reset_all_daily_bonus() -> int:
     """Сбрасывает ежедневный бонус для всех пользователей. Возвращает количество обновленных записей."""
     db = SessionLocal()
     try:
-        count = db.query(Player).update({Player.last_bonus_claim: 0})
+        count = db.query(Player).update({Player.daily_bonus_manual_ready: 1})
         db.commit()
         return count
     except Exception:

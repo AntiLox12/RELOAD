@@ -65,29 +65,205 @@ SWAGA_CHEST_DROP_CHANCES = {
     'Мистербист': {'Обычная': 0, 'Редкая': 0, 'Ебабельная': 0, 'Нереальноахуенная': 0, 'Swaga': 30, 'Мистербист': 70},
 }
 
-# --- Рулетка ежедневного бонуса ---
-DAILY_BONUS_REWARDS = {
-    'coins': {
-        'weight': 75,
-        'amount': 400,
+# --- Daily bonus ---
+DAILY_BONUS_RULES = {
+    'cycle_length': 7,
+    'streak_grace_multiplier': 0.5,
+    'grace_min_sec': 5400,
+    'grace_max_sec': 43200,
+    'vip_grace_multiplier': 1.25,
+    'vip_plus_grace_multiplier': 1.5,
+    'rating_bonus_cap': 0.05,
+    'pity_rare_after_common': 4,
+    'pity_epic_after_non_epic': 11,
+    'tier_weights': {
+        'common': 84.5,
+        'rare': 13.5,
+        'epic': 1.9,
+        'jackpot': 0.1,
     },
-    'absolute_drink': {
-        'weight': 20,
-    },
-    'vip_3d': {
-        'weight': 10,
-    },
-    'vip_plus_7d': {
-        'weight': 0.1,
-    },
-    'vip_plus_30d': {
-        'weight': 0.01,
-    },
-    'selyuk_fragment': {
-        'weight': 5,
-        'amount': 1,
+    'tier_rating_multipliers': {
+        'rare': 1.0,
+        'epic': 1.35,
+        'jackpot': 1.7,
     },
 }
+
+DAILY_BONUS_TIER_ORDER = ['common', 'rare', 'epic', 'jackpot']
+
+DAILY_BONUS_TIER_LABELS = {
+    'common': {'ru': 'Обычные', 'en': 'Common'},
+    'rare': {'ru': 'Редкие', 'en': 'Rare'},
+    'epic': {'ru': 'Эпические', 'en': 'Epic'},
+    'jackpot': {'ru': 'Джекпот', 'en': 'Jackpot'},
+}
+
+DAILY_BONUS_REWARD_CATALOG = {
+    'coins_75': {
+        'kind': 'coins',
+        'amount': 75,
+        'label_ru': '💰 75 септимов',
+        'label_en': '💰 75 coins',
+    },
+    'coins_100': {
+        'kind': 'coins',
+        'amount': 100,
+        'label_ru': '💰 100 септимов',
+        'label_en': '💰 100 coins',
+    },
+    'coins_125': {
+        'kind': 'coins',
+        'amount': 125,
+        'label_ru': '💰 125 септимов',
+        'label_en': '💰 125 coins',
+    },
+    'coins_200': {
+        'kind': 'coins',
+        'amount': 200,
+        'label_ru': '💰 200 септимов',
+        'label_en': '💰 200 coins',
+    },
+    'coins_250': {
+        'kind': 'coins',
+        'amount': 250,
+        'tier': 'common',
+        'label_ru': '💰 250 септимов',
+        'label_en': '💰 250 coins',
+    },
+    'coins_400': {
+        'kind': 'coins',
+        'amount': 400,
+        'tier': 'common',
+        'label_ru': '💰 400 септимов',
+        'label_en': '💰 400 coins',
+    },
+    'coins_700': {
+        'kind': 'coins',
+        'amount': 700,
+        'tier': 'rare',
+        'label_ru': '💰 700 септимов',
+        'label_en': '💰 700 coins',
+    },
+    'selyuk_fragment_1': {
+        'kind': 'selyuk_fragment',
+        'amount': 1,
+        'tier': 'common',
+        'label_ru': '🧩 Фрагмент Селюка x1',
+        'label_en': '🧩 Selyuk fragment x1',
+    },
+    'selyuk_fragment_2': {
+        'kind': 'selyuk_fragment',
+        'amount': 2,
+        'tier': 'rare',
+        'label_ru': '🧩 Фрагменты Селюка x2',
+        'label_en': '🧩 Selyuk fragments x2',
+    },
+    'luck_coupon_1': {
+        'kind': 'luck_coupon',
+        'amount': 1,
+        'tier': 'common',
+        'label_ru': '🎲 Купон удачи x1',
+        'label_en': '🎲 Luck coupon x1',
+    },
+    'auto_search_boost_2_24h': {
+        'kind': 'auto_search_boost',
+        'boost_count': 2,
+        'days': 1,
+        'label_ru': '🚀 Автопоиск +2 на 24ч',
+        'label_en': '🚀 Auto-search +2 for 24h',
+    },
+    'auto_search_boost_5_24h': {
+        'kind': 'auto_search_boost',
+        'boost_count': 5,
+        'days': 1,
+        'tier': 'rare',
+        'label_ru': '🚀 Автопоиск +5 на 24ч',
+        'label_en': '🚀 Auto-search +5 for 24h',
+    },
+    'absolute_drink': {
+        'kind': 'absolute_drink',
+        'tier': 'rare',
+        'label_ru': '🟣 Энергетик Absolute',
+        'label_en': '🟣 Absolute energy drink',
+    },
+    'vip_3d': {
+        'kind': 'vip',
+        'seconds': 3 * 24 * 60 * 60,
+        'tier': 'epic',
+        'label_ru': '👑 VIP на 3 дня',
+        'label_en': '👑 VIP for 3 days',
+    },
+    'vip_combo_14': {
+        'kind': 'vip_combo',
+        'vip_seconds': 3 * 24 * 60 * 60,
+        'vip_plus_seconds_if_active': 1 * 24 * 60 * 60,
+        'label_ru': '👑 VIP на 3 дня или 💎 VIP+ +1 день',
+        'label_en': '👑 VIP for 3 days or 💎 VIP+ +1 day',
+    },
+    'vip_plus_1d': {
+        'kind': 'vip_plus',
+        'seconds': 1 * 24 * 60 * 60,
+        'tier': 'epic',
+        'label_ru': '💎 VIP+ на 1 день',
+        'label_en': '💎 VIP+ for 1 day',
+    },
+    'vip_plus_7d': {
+        'kind': 'vip_plus',
+        'seconds': 7 * 24 * 60 * 60,
+        'tier': 'jackpot',
+        'label_ru': '💎 VIP+ на 7 дней',
+        'label_en': '💎 VIP+ for 7 days',
+    },
+    'vip_plus_30d': {
+        'kind': 'vip_plus',
+        'seconds': 30 * 24 * 60 * 60,
+        'tier': 'jackpot',
+        'label_ru': '🎊 VIP+ на 30 дней',
+        'label_en': '🎊 VIP+ for 30 days',
+    },
+}
+
+DAILY_BONUS_ROULETTE_TABLE = {
+    'common': [
+        {'reward_id': 'coins_250', 'weight': 42},
+        {'reward_id': 'coins_400', 'weight': 30},
+        {'reward_id': 'selyuk_fragment_1', 'weight': 15},
+        {'reward_id': 'luck_coupon_1', 'weight': 13},
+    ],
+    'rare': [
+        {'reward_id': 'coins_700', 'weight': 28},
+        {'reward_id': 'selyuk_fragment_2', 'weight': 22},
+        {'reward_id': 'auto_search_boost_5_24h', 'weight': 25},
+        {'reward_id': 'absolute_drink', 'weight': 25},
+    ],
+    'epic': [
+        {'reward_id': 'vip_3d', 'weight': 85},
+        {'reward_id': 'vip_plus_1d', 'weight': 15},
+    ],
+    'jackpot': [
+        {'reward_id': 'vip_plus_7d', 'weight': 91},
+        {'reward_id': 'vip_plus_30d', 'weight': 9},
+    ],
+}
+
+DAILY_BONUS_CYCLE_REWARDS = [
+    {'day': 1, 'reward_id': 'coins_75'},
+    {'day': 2, 'reward_id': 'coins_100'},
+    {'day': 3, 'reward_id': 'luck_coupon_1'},
+    {'day': 4, 'reward_id': 'coins_125'},
+    {'day': 5, 'reward_id': 'selyuk_fragment_1'},
+    {'day': 6, 'reward_id': 'auto_search_boost_2_24h'},
+    {'day': 7, 'reward_id': 'coins_200'},
+]
+
+DAILY_BONUS_MILESTONES = [
+    {'streak': 7, 'reward_id': 'selyuk_fragment_1'},
+    {'streak': 14, 'reward_id': 'vip_combo_14'},
+    {'every': 30, 'start': 30, 'reward_id': 'vip_plus_1d'},
+]
+
+# Legacy alias for older imports.
+DAILY_BONUS_REWARDS = DAILY_BONUS_REWARD_CATALOG
 
 # --- Казино ---
 CASINO_WIN_PROB = 0.35  # Вероятность выигрыша в казино (меньше — чаще проигрыши)
