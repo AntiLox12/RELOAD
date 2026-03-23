@@ -537,6 +537,10 @@ async def show_recent_swaga_tracks(update: Update, context: ContextTypes.DEFAULT
             .order_by(db.SwagaTrack.created_at.desc(), db.SwagaTrack.id.desc())
             .all()
         )
+        owned_track_ids = {
+            int(track_id)
+            for (track_id,) in db_session.query(db.PlayerSwagaTrack.track_id).filter_by(user_id=user_id).all()
+        }
     finally:
         db_session.close()
 
@@ -568,8 +572,9 @@ async def show_recent_swaga_tracks(update: Update, context: ContextTypes.DEFAULT
     for idx, trk in enumerate(page_tracks, start=start_idx + 1):
         emoji = SWAGA_COLOR_EMOJIS.get(trk.rarity, '⚫')
         added_at = _format_swaga_track_added_at(getattr(trk, 'created_at', 0))
+        found_status = "найдено" if int(trk.id) in owned_track_ids else "не найдено"
         lines.append(
-            f"{idx}. <b>{trk.name}</b>\n"
+            f"{idx}. <b>{trk.name}</b> ({found_status})\n"
             f"Редкость: {emoji} {trk.rarity}\n"
             f"Добавлен: {added_at}"
         )
