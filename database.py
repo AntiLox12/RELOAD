@@ -17,6 +17,11 @@ from constants import (
     RECEIVER_COMMISSION,
     SHOP_PRICES,
     ADMIN_USERNAMES,
+    AUTO_SEARCH_DAILY_LIMIT,
+    ADMIN_EMOJI,
+    ADMIN_PLUS_EMOJI,
+    VIP_COSTS,
+    VIP_PLUS_COSTS,
     DAILY_BONUS_COOLDOWN,
     DAILY_BONUS_RULES,
     DAILY_BONUS_TIER_ORDER,
@@ -105,6 +110,8 @@ class Player(Base):
     casino_achievements = Column(String, default='')  # разблокированные достижения (через запятую)
     selyuk_fragments = Column(Integer, default=0)  # Фрагменты Селюка
     luck_coupon_charges = Column(Integer, default=0)  # Купон удачи: оставшиеся попытки повышенного шанса на двойной дроп
+    seed_coupon_count = Column(Integer, default=0)
+    quick_access_target = Column(String, default='')
     favorite_drink_1 = Column(Integer, default=0)
     favorite_drink_2 = Column(Integer, default=0)
     favorite_drink_3 = Column(Integer, default=0)
@@ -1455,6 +1462,8 @@ def redeem_promo(user_id: int, code: str) -> dict:
 
 
         result: dict = {"ok": True, "kind": kind, "value": value}
+        access = get_access_profile(int(user_id), player=player)
+        admin_tier = str(access.get('tier') or '') in ('admin', 'admin_plus')
 
         if kind == 'coins':
             add = max(0, value)
@@ -1473,6 +1482,13 @@ def redeem_promo(user_id: int, code: str) -> dict:
             # value — дни VIP
             add_sec = max(0, int(value)) * 86400
             now_ts = int(time.time())
+            if admin_tier:
+                amount = _seconds_to_linear_plan_cost(add_sec, int(VIP_COSTS.get('1d', 0) or 0))
+                player.coins = int(getattr(player, 'coins', 0) or 0) + amount
+                db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+                db.commit()
+                result.update({"coins_added": int(amount), "coins_total": int(player.coins), "converted_to_coins": True, "converted_from": "vip"})
+                return result
             base_ts = int(getattr(player, 'vip_until', 0) or 0)
             start_ts = base_ts if base_ts > now_ts else now_ts
             player.vip_until = start_ts + add_sec
@@ -1489,6 +1505,13 @@ def redeem_promo(user_id: int, code: str) -> dict:
             # value — дни VIP+
             add_sec = max(0, int(value)) * 86400
             now_ts = int(time.time())
+            if admin_tier:
+                amount = _seconds_to_linear_plan_cost(add_sec, int(VIP_PLUS_COSTS.get('1d', 0) or 0))
+                player.coins = int(getattr(player, 'coins', 0) or 0) + amount
+                db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+                db.commit()
+                result.update({"coins_added": int(amount), "coins_total": int(player.coins), "converted_to_coins": True, "converted_from": "vip_plus"})
+                return result
             base_ts = int(getattr(player, 'vip_plus_until', 0) or 0)
             start_ts = base_ts if base_ts > now_ts else now_ts
             player.vip_plus_until = start_ts + add_sec
@@ -1525,6 +1548,66 @@ def redeem_promo(user_id: int, code: str) -> dict:
                 log_action(int(user_id), getattr(player, 'username', None), 'promo_redeem', f'drink:{getattr(drink, "name", "?")}/{rarity}', success=True)
             except Exception:
                 pass
+            return result
+
+        elif kind == 'selyuk_fragment':
+            add = max(0, value)
+            player.selyuk_fragments = int(getattr(player, 'selyuk_fragments', 0) or 0) + add
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"fragments_added": add, "fragments_total": int(player.selyuk_fragments)})
+            return result
+
+        elif kind == 'auto_search_boost':
+            boost_count = max(0, int(value))
+            current_boost_until = int(getattr(player, 'auto_search_boost_until', 0) or 0)
+            current_boost_count = int(getattr(player, 'auto_search_boost_count', 0) or 0)
+            now_ts = int(time.time())
+            if current_boost_until > now_ts:
+                start_time = current_boost_until
+                new_boost_count = current_boost_count + boost_count
+            else:
+                start_time = now_ts
+                new_boost_count = boost_count
+            player.auto_search_boost_count = int(new_boost_count)
+            player.auto_search_boost_until = int(start_time + 86400)
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"boost_count": int(boost_count), "boost_count_after": int(player.auto_search_boost_count), "boost_until": int(player.auto_search_boost_until)})
+            return result
+
+        elif kind == 'luck_coupon':
+            add = max(0, value)
+            player.luck_coupon_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0) + add
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"luck_added": add, "luck_after": int(player.luck_coupon_charges)})
+            return result
+
+        elif kind == 'seed_coupon':
+            add = max(0, value)
+            player.seed_coupon_count = int(getattr(player, 'seed_coupon_count', 0) or 0) + add
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"seed_coupon_added": add, "seed_coupon_after": int(player.seed_coupon_count)})
+            return result
+
+        elif kind == 'search_skip':
+            count = max(0, int(value))
+            if count > 0:
+                player.last_search = 0
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"search_skips_used": count})
+            return result
+
+        elif kind == 'bonus_skip':
+            count = max(0, int(value))
+            if count > 0:
+                player.daily_bonus_manual_ready = 1
+            db.add(PromoUsage(promo_id=int(row.id), user_id=int(user_id)))
+            db.commit()
+            result.update({"bonus_skips_used": count, "bonus_ready": bool(count > 0)})
             return result
 
         else:
@@ -2600,6 +2683,32 @@ def change_seed_inventory(user_id: int, seed_type_id: int, delta: int) -> int:
             return int(getattr(row2, 'quantity', 0) or 0) if row2 else 0
         except Exception:
             return 0
+    finally:
+        dbs.close()
+
+
+def consume_seed_coupon(user_id: int, amount: int = 1) -> dict:
+    dbs = SessionLocal()
+    try:
+        amount = max(1, int(amount or 1))
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=None)
+            dbs.add(player)
+            dbs.commit()
+            dbs.refresh(player)
+        current = int(getattr(player, 'seed_coupon_count', 0) or 0)
+        if current < amount:
+            return {"ok": False, "reason": "not_enough", "current": current}
+        player.seed_coupon_count = current - amount
+        dbs.commit()
+        return {"ok": True, "seed_coupon_after": int(player.seed_coupon_count)}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
     finally:
         dbs.close()
 
@@ -4334,27 +4443,42 @@ def try_farmer_auto_plant(user_id: int) -> dict:
         dbs.close()
 
 
-def get_players_with_auto_search_enabled() -> list[Player]:
+def get_players_with_auto_search_enabled() -> list[dict]:
     """
-    Возвращает список игроков, у которых включён автопоиск (auto_search_enabled = True).
+    Возвращает список словарей с данными игроков, у которых включён автопоиск.
     Используется для восстановления задач JobQueue после рестарта бота.
+    Возвращает dicts вместо ORM-объектов, чтобы избежать DetachedInstanceError.
     """
     dbs = SessionLocal()
     try:
-        return list(
-            dbs.query(Player)
-            .filter(Player.auto_search_enabled == True)  # noqa: E712 - сравнение с True корректно для SQLAlchemy
+        rows = (
+            dbs.query(
+                Player.user_id, Player.username, Player.last_search,
+                Player.auto_search_count, Player.auto_search_reset_ts,
+                Player.language,
+            )
+            .filter(Player.auto_search_enabled == True)  # noqa: E712
             .all()
         )
+        return [
+            {
+                "user_id": r.user_id,
+                "username": r.username,
+                "last_search": r.last_search,
+                "auto_search_count": r.auto_search_count,
+                "auto_search_reset_ts": r.auto_search_reset_ts,
+                "language": r.language,
+            }
+            for r in rows
+        ]
     finally:
         dbs.close()
 
-def get_auto_search_daily_limit(user_id: int) -> int:
+def get_auto_search_daily_limit(user_id: int, username: str | None = None) -> int:
     """
     Возвращает дневной лимит автопоиска для пользователя.
     Базовый лимит + VIP+ удвоение + активный буст (если не истёк).
     """
-    from constants import AUTO_SEARCH_DAILY_LIMIT
     dbs = SessionLocal()
     try:
         player = dbs.query(Player).filter(Player.user_id == user_id).first()
@@ -4364,11 +4488,16 @@ def get_auto_search_daily_limit(user_id: int) -> int:
         base_limit = int(get_setting_int('auto_search_daily_limit_base', int(AUTO_SEARCH_DAILY_LIMIT)))
         vip_mult = float(get_setting_float('auto_search_vip_daily_mult', 1.0))
         vip_plus_mult = float(get_setting_float('auto_search_vip_plus_daily_mult', 2.0))
+        access = get_access_profile(user_id, username=username, player=player)
+        tier = str(access.get('tier') or 'ordinary')
 
-        # Множители лимита (VIP/VIP+)
-        if is_vip_plus(user_id):
+        if tier == 'admin_plus':
+            base_limit = int(base_limit) + 60
+        elif tier == 'admin':
+            base_limit = int(base_limit) + 20
+        elif tier == 'vip_plus':
             base_limit = int(round(base_limit * vip_plus_mult))
-        elif is_vip(user_id):
+        elif tier == 'vip':
             base_limit = int(round(base_limit * vip_mult))
 
         if base_limit < 0:
@@ -4378,11 +4507,37 @@ def get_auto_search_daily_limit(user_id: int) -> int:
         boost_until = int(getattr(player, 'auto_search_boost_until', 0) or 0)
         
         # Проверяем, активен ли буст
-        import time
         if boost_until > int(time.time()):
             return base_limit + boost_count
         else:
             return base_limit
+    finally:
+        dbs.close()
+
+def increment_auto_search_count(user_id: int, delta: int = 1) -> int:
+    """
+    Атомарный инкремент auto_search_count.
+    Возвращает новое значение счётчика, или -1 при ошибке.
+    """
+    dbs = SessionLocal()
+    try:
+        dbs.execute(
+            text("UPDATE players SET auto_search_count = COALESCE(auto_search_count, 0) + :d WHERE user_id = :uid"),
+            {"d": int(delta), "uid": int(user_id)},
+        )
+        dbs.commit()
+        row = dbs.execute(
+            text("SELECT auto_search_count FROM players WHERE user_id = :uid"),
+            {"uid": int(user_id)},
+        ).fetchone()
+        return int(row[0]) if row else -1
+    except Exception as e:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        print(f"Error in increment_auto_search_count for user {user_id}: {e}")
+        return -1
     finally:
         dbs.close()
 
@@ -4391,10 +4546,9 @@ def add_auto_search_boost(user_id: int, boost_count: int, days: int) -> bool:
     Добавляет буст автопоиска пользователю.
     Если буст уже активен, продлевает его и добавляет к количеству.
     """
-    import time
     dbs = SessionLocal()
     try:
-        player = dbs.query(Player).filter(Player.user_id == user_id).first()
+        player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
         if not player:
             return False
         
@@ -4445,7 +4599,6 @@ def add_auto_search_boost_to_all(boost_count: int, days: int) -> int:
     Добавляет буст автопоиска всем пользователям.
     Возвращает количество обновлённых пользователей.
     """
-    import time
     dbs = SessionLocal()
     try:
         now_ts = int(time.time())
@@ -5004,6 +5157,40 @@ def list_pending_incoming_friend_requests(user_id: int, page: int = 0, per_page:
         dbs.close()
 
 
+def list_pending_outgoing_friend_requests(user_id: int, page: int = 0, per_page: int = 6) -> dict:
+    dbs = SessionLocal()
+    try:
+        page = max(0, int(page or 0))
+        per_page = max(1, min(10, int(per_page or 6)))
+        base = (
+            dbs.query(FriendRequest)
+            .options(joinedload(FriendRequest.to_user))
+            .filter(FriendRequest.from_user_id == int(user_id))
+            .filter(FriendRequest.status == 'pending')
+        )
+        total = int(base.count() or 0)
+        rows = (
+            base.order_by(FriendRequest.created_at.desc())
+            .offset(page * per_page)
+            .limit(per_page)
+            .all()
+        )
+        items = []
+        for r in rows:
+            p = getattr(r, 'to_user', None)
+            items.append(
+                {
+                    "request_id": int(r.id),
+                    "to_user_id": int(r.to_user_id),
+                    "to_username": getattr(p, 'username', None) if p else None,
+                    "created_at": int(getattr(r, 'created_at', 0) or 0),
+                }
+            )
+        return {"ok": True, "items": items, "total": total, "page": page, "per_page": per_page}
+    finally:
+        dbs.close()
+
+
 def list_friends(user_id: int, page: int = 0, per_page: int = 8) -> dict:
     dbs = SessionLocal()
     try:
@@ -5466,6 +5653,57 @@ def decrement_coins(user_id: int, amount: int) -> dict:
         }
     finally:
         db.close()
+
+def casino_play_atomic(user_id: int, bet_amount: int, win: bool, multiplier: float = 2.0) -> dict:
+    """Атомарная операция казино: списание ставки и (при победе) выплата в одной транзакции.
+    
+    Возвращает dict:
+      ok: bool
+      reason?: str (insufficient_funds | exception)
+      new_balance?: int
+      net_change?: int (положительный при выигрыше, отрицательный при проигрыше)
+      winnings?: int (сумма выигрыша, 0 при проигрыше)
+    """
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == user_id).with_for_update(read=False).first()
+        if not player:
+            return {"ok": False, "reason": "player_not_found"}
+        
+        current = int(player.coins or 0)
+        bet = int(bet_amount)
+        
+        if current < bet:
+            return {
+                "ok": False,
+                "reason": "insufficient_funds",
+                "current_balance": current,
+            }
+        
+        if win:
+            winnings = int(bet * multiplier)
+            net_change = winnings - bet
+            player.coins = current + net_change
+        else:
+            winnings = 0
+            net_change = -bet
+            player.coins = current - bet
+        
+        dbs.commit()
+        return {
+            "ok": True,
+            "new_balance": int(player.coins),
+            "net_change": net_change,
+            "winnings": winnings,
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
 
 def get_all_drinks():
     """Возвращает список всех существующих энергетиков."""
@@ -6121,6 +6359,10 @@ def ensure_schema():
 
         if 'luck_coupon_charges' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN luck_coupon_charges INTEGER DEFAULT 0")
+        if 'seed_coupon_count' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN seed_coupon_count INTEGER DEFAULT 0")
+        if 'quick_access_target' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN quick_access_target TEXT DEFAULT ''")
 
         if 'favorite_drink_1' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN favorite_drink_1 INTEGER DEFAULT 0")
@@ -6530,6 +6772,286 @@ def is_vip_plus(user_id: int) -> bool:
     except Exception:
         return False
 
+def get_effective_admin_level(user_id: int, username: str | None = None, player: Player | None = None) -> int:
+    try:
+        effective_username = username or getattr(player, 'username', None)
+    except Exception:
+        effective_username = username
+    if effective_username and str(effective_username) in ADMIN_USERNAMES:
+        return 99
+    return get_admin_level(int(user_id))
+
+
+def get_access_tier(user_id: int, username: str | None = None, player: Player | None = None) -> str:
+    admin_level = get_effective_admin_level(user_id, username=username, player=player)
+    if admin_level >= 3:
+        return 'admin_plus'
+    if admin_level >= 1:
+        return 'admin'
+
+    now_ts = int(time.time())
+    vip_plus_until = int(getattr(player, 'vip_plus_until', 0) or 0) if player is not None else int(get_vip_plus_until(user_id) or 0)
+    if vip_plus_until > now_ts:
+        return 'vip_plus'
+
+    vip_until = int(getattr(player, 'vip_until', 0) or 0) if player is not None else int(get_vip_until(user_id) or 0)
+    if vip_until > now_ts:
+        return 'vip'
+    return 'ordinary'
+
+
+def get_access_profile(user_id: int, username: str | None = None, player: Player | None = None) -> dict:
+    now_ts = int(time.time())
+    tier = get_access_tier(user_id, username=username, player=player)
+    admin_level = get_effective_admin_level(user_id, username=username, player=player)
+    vip_until = int(getattr(player, 'vip_until', 0) or 0) if player is not None else int(get_vip_until(user_id) or 0)
+    vip_plus_until = int(getattr(player, 'vip_plus_until', 0) or 0) if player is not None else int(get_vip_plus_until(user_id) or 0)
+    vip_plus_active_timed = bool(vip_plus_until and now_ts < vip_plus_until)
+    vip_active_timed = bool(vip_plus_active_timed or (vip_until and now_ts < vip_until))
+
+    profile = {
+        'tier': tier,
+        'admin_level': int(admin_level),
+        'vip_until': int(vip_until),
+        'vip_plus_until': int(vip_plus_until),
+        'vip_active_timed': bool(vip_active_timed),
+        'vip_plus_active_timed': bool(vip_plus_active_timed),
+        'acts_like_vip': tier in ('vip', 'vip_plus', 'admin', 'admin_plus'),
+        'acts_like_vip_plus': tier in ('vip_plus', 'admin', 'admin_plus'),
+        'quick_access_eligible': tier in ('vip', 'vip_plus', 'admin', 'admin_plus'),
+        'guaranteed_search_count': 2 if tier in ('admin', 'admin_plus') else 0,
+        'fixed_search_reward': 400 if tier == 'admin_plus' else (200 if tier == 'admin' else 0),
+    }
+
+    if tier == 'admin_plus':
+        profile.update({
+            'emoji': ADMIN_PLUS_EMOJI,
+            'label_ru': 'Admin+',
+            'label_en': 'Admin+',
+            'search_cooldown_mult': 0.20,
+            'daily_bonus_cooldown_mult': 0.25,
+            'auto_search_extra': 60,
+        })
+    elif tier == 'admin':
+        profile.update({
+            'emoji': ADMIN_EMOJI,
+            'label_ru': 'Admin',
+            'label_en': 'Admin',
+            'search_cooldown_mult': 0.25,
+            'daily_bonus_cooldown_mult': 0.25,
+            'auto_search_extra': 20,
+        })
+    elif tier == 'vip_plus':
+        profile.update({
+            'emoji': '💎',
+            'label_ru': 'V.I.P+',
+            'label_en': 'V.I.P+',
+            'search_cooldown_mult': 0.25,
+            'daily_bonus_cooldown_mult': 0.25,
+            'auto_search_extra': 0,
+        })
+    elif tier == 'vip':
+        profile.update({
+            'emoji': '👑',
+            'label_ru': 'V.I.P',
+            'label_en': 'V.I.P',
+            'search_cooldown_mult': 0.5,
+            'daily_bonus_cooldown_mult': 0.5,
+            'auto_search_extra': 0,
+        })
+    else:
+        profile.update({
+            'emoji': '📊',
+            'label_ru': 'Обычный игрок',
+            'label_en': 'Regular player',
+            'search_cooldown_mult': 1.0,
+            'daily_bonus_cooldown_mult': 1.0,
+            'auto_search_extra': 0,
+        })
+    return profile
+
+
+def _seconds_to_linear_plan_cost(seconds: int, daily_price: int) -> int:
+    try:
+        seconds = max(0, int(seconds or 0))
+        daily_price = max(0, int(daily_price or 0))
+    except Exception:
+        return 0
+    if seconds <= 0 or daily_price <= 0:
+        return 0
+    return int((seconds * daily_price) // 86400)
+
+
+def convert_active_premium_to_coins_inplace(player: Player, now_ts: int | None = None) -> dict:
+    now_ts = int(now_ts or time.time())
+    vip_remaining = max(0, int(getattr(player, 'vip_until', 0) or 0) - now_ts)
+    vip_plus_remaining = max(0, int(getattr(player, 'vip_plus_until', 0) or 0) - now_ts)
+    vip_compensation = _seconds_to_linear_plan_cost(vip_remaining, int(VIP_COSTS.get('1d', 0) or 0))
+    vip_plus_compensation = _seconds_to_linear_plan_cost(vip_plus_remaining, int(VIP_PLUS_COSTS.get('1d', 0) or 0))
+    total = int(vip_compensation + vip_plus_compensation)
+    if total > 0:
+        player.coins = int(getattr(player, 'coins', 0) or 0) + total
+    player.vip_until = 0
+    player.vip_plus_until = 0
+    return {
+        'vip_remaining_seconds': int(vip_remaining),
+        'vip_plus_remaining_seconds': int(vip_plus_remaining),
+        'vip_compensation': int(vip_compensation),
+        'vip_plus_compensation': int(vip_plus_compensation),
+        'total_compensation': int(total),
+        'coins_after': int(getattr(player, 'coins', 0) or 0),
+    }
+
+
+def assign_admin_level(user_id: int, level: int, username: str | None = None) -> dict:
+    if int(level) not in (1, 2, 3):
+        return {"ok": False, "reason": "invalid_level"}
+    dbs = SessionLocal()
+    try:
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).with_for_update(read=False).first()
+        if not player:
+            player = Player(user_id=int(user_id), username=username)
+            dbs.add(player)
+            dbs.flush()
+        elif username and username != getattr(player, 'username', None):
+            player.username = username
+
+        compensation = convert_active_premium_to_coins_inplace(player, now_ts=int(time.time()))
+
+        existing = dbs.query(AdminUser).filter(AdminUser.user_id == int(user_id)).first()
+        if existing:
+            existing.username = username or getattr(existing, 'username', None)
+            existing.level = int(level)
+        else:
+            dbs.add(AdminUser(user_id=int(user_id), username=username, level=int(level)))
+        dbs.commit()
+        return {
+            "ok": True,
+            "level": int(level),
+            "tier": 'admin_plus' if int(level) >= 3 else 'admin',
+            **compensation,
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def cancel_friend_request_by_id(user_id: int, request_id: int) -> dict:
+    return cancel_friend_request(user_id, request_id)
+
+
+def remove_friend(user_id: int, other_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        user_id = int(user_id)
+        other_id = int(other_id)
+        if user_id == other_id:
+            return {"ok": False, "reason": "self"}
+
+        rows = (
+            dbs.query(Friendship)
+            .filter(
+                or_(
+                    and_(Friendship.user_id == user_id, Friendship.friend_id == other_id),
+                    and_(Friendship.user_id == other_id, Friendship.friend_id == user_id),
+                )
+            )
+            .all()
+        )
+        if not rows:
+            return {"ok": False, "reason": "not_friends"}
+        for row in rows:
+            dbs.delete(row)
+
+        pending = (
+            dbs.query(FriendRequest)
+            .filter(
+                or_(
+                    and_(FriendRequest.from_user_id == user_id, FriendRequest.to_user_id == other_id),
+                    and_(FriendRequest.from_user_id == other_id, FriendRequest.to_user_id == user_id),
+                )
+            )
+            .filter(FriendRequest.status == 'pending')
+            .all()
+        )
+        for row in pending:
+            row.status = 'cancelled'
+            row.updated_at = int(time.time())
+
+        dbs.commit()
+        return {"ok": True}
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
+def _last_transfer_time(dbs, from_user_id: int, kind: str, since_ts: int) -> int:
+    row = (
+        dbs.query(FriendTransferLog.created_at)
+        .filter(FriendTransferLog.from_user_id == int(from_user_id))
+        .filter(FriendTransferLog.kind == str(kind))
+        .filter(FriendTransferLog.created_at >= int(since_ts))
+        .order_by(FriendTransferLog.created_at.desc())
+        .first()
+    )
+    return int(row[0] or 0) if row else 0
+
+
+def get_friend_transfer_limits(from_user_id: int, to_user_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        now_ts = int(time.time())
+        coins_used = _sum_transfers_amount(dbs, from_user_id, 'coins', now_ts - 86400)
+        fragments_used = _sum_transfers_amount(dbs, from_user_id, 'fragments', now_ts - 86400)
+        rating_used = _sum_transfers_amount(dbs, from_user_id, 'rating', now_ts - (48 * 60 * 60))
+        vip_used = _count_transfers(dbs, from_user_id, 'vip_7d', now_ts - int(FRIEND_VIP_GIFT_COOLDOWN_SEC))
+        vip_last = _last_transfer_time(dbs, from_user_id, 'vip_7d', now_ts - int(FRIEND_VIP_GIFT_COOLDOWN_SEC))
+        vip_time_left = max(0, int(FRIEND_VIP_GIFT_COOLDOWN_SEC) - (now_ts - vip_last)) if vip_last else 0
+        return {
+            "ok": True,
+            "coins_remaining": max(0, int(FRIEND_COINS_DAILY_LIMIT) - int(coins_used)),
+            "fragments_remaining": max(0, int(FRIEND_FRAGMENTS_DAILY_LIMIT) - int(fragments_used)),
+            "rating_remaining": max(0, int(FRIEND_RATING_48H_LIMIT) - int(rating_used)),
+            "vip_gift_available": bool(vip_used <= 0),
+            "vip_gift_time_left": int(vip_time_left),
+            "are_friends": are_friends(from_user_id, to_user_id),
+        }
+    finally:
+        dbs.close()
+
+
+def get_friendship_details(user_id: int, other_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        rel = (
+            dbs.query(Friendship)
+            .options(joinedload(Friendship.friend))
+            .filter(Friendship.user_id == int(user_id), Friendship.friend_id == int(other_id))
+            .first()
+        )
+        if not rel:
+            return {"ok": False, "reason": "not_friends"}
+        p = getattr(rel, 'friend', None)
+        return {
+            "ok": True,
+            "friendship_created_at": int(getattr(rel, 'created_at', 0) or 0),
+            "user_id": int(getattr(p, 'user_id', other_id) or other_id),
+            "username": getattr(p, 'username', None) if p else None,
+            "rating": int(getattr(p, 'rating', 0) or 0) if p else 0,
+        }
+    finally:
+        dbs.close()
+
 def purchase_vip(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
     """
     Списывает монеты и устанавливает/продлевает VIP.
@@ -6544,6 +7066,10 @@ def purchase_vip(user_id: int, cost_coins: int, duration_seconds: int) -> dict:
             db.add(player)
             db.commit()
             db.refresh(player)
+
+        access = get_access_profile(user_id, player=player)
+        if access.get('tier') in ('admin', 'admin_plus'):
+            return {"ok": False, "reason": "admin_blocked", "tier": access.get('tier')}
 
         current_coins = int(player.coins or 0)
         if current_coins < cost_coins:
@@ -6586,6 +7112,10 @@ def purchase_vip_plus(user_id: int, cost_coins: int, duration_seconds: int) -> d
             db.add(player)
             db.commit()
             db.refresh(player)
+
+        access = get_access_profile(user_id, player=player)
+        if access.get('tier') in ('admin', 'admin_plus'):
+            return {"ok": False, "reason": "admin_blocked", "tier": access.get('tier')}
 
         current_coins = int(player.coins or 0)
         if current_coins < cost_coins:
@@ -6741,10 +7271,10 @@ def _daily_bonus_rating_bonus_fraction(rating_value: int) -> float:
 
 
 def _daily_bonus_get_vip_flags(player: Player, now_ts: int) -> tuple[bool, bool]:
-    vip_until = int(getattr(player, 'vip_until', 0) or 0)
-    vip_plus_until = int(getattr(player, 'vip_plus_until', 0) or 0)
-    vip_plus_active = bool(vip_plus_until and int(now_ts) < vip_plus_until)
-    vip_active = bool(vip_plus_active or (vip_until and int(now_ts) < vip_until))
+    access = get_access_profile(int(getattr(player, 'user_id', 0) or 0), player=player)
+    tier = str(access.get('tier') or 'ordinary')
+    vip_plus_active = tier in ('vip_plus', 'admin', 'admin_plus')
+    vip_active = tier in ('vip', 'vip_plus', 'admin', 'admin_plus')
     return vip_active, vip_plus_active
 
 
@@ -6980,6 +7510,9 @@ def _daily_bonus_apply_reward(dbs, player: Player, reward_id: str, now_ts: int, 
     spec = dict(DAILY_BONUS_REWARD_CATALOG.get(str(reward_id), {}) or {})
     if not spec:
         raise ValueError(f"Unknown daily bonus reward: {reward_id}")
+    access = get_access_profile(int(getattr(player, 'user_id', 0) or 0), player=player)
+    tier = str(access.get('tier') or 'ordinary')
+    admin_tier = tier in ('admin', 'admin_plus')
 
     result = {
         "source": str(source),
@@ -7019,6 +7552,15 @@ def _daily_bonus_apply_reward(dbs, player: Player, reward_id: str, now_ts: int, 
         })
         return result
 
+    if kind == 'seed_coupon':
+        amount = max(0, int(spec.get('amount', 0) or 0))
+        player.seed_coupon_count = int(getattr(player, 'seed_coupon_count', 0) or 0) + amount
+        result.update({
+            "amount": int(amount),
+            "seed_coupon_after": int(player.seed_coupon_count),
+        })
+        return result
+
     if kind == 'auto_search_boost':
         boost_count = max(0, int(spec.get('boost_count', 0) or 0))
         days = max(1, int(spec.get('days', 1) or 1))
@@ -7043,6 +7585,17 @@ def _daily_bonus_apply_reward(dbs, player: Player, reward_id: str, now_ts: int, 
 
     if kind == 'vip':
         seconds = max(0, int(spec.get('seconds', 0) or 0))
+        if admin_tier:
+            amount = _seconds_to_linear_plan_cost(seconds, int(VIP_COSTS.get('1d', 0) or 0))
+            player.coins = int(getattr(player, 'coins', 0) or 0) + amount
+            result.update({
+                "seconds": int(seconds),
+                "converted_to_coins": True,
+                "converted_from": "vip",
+                "amount": int(amount),
+                "coins_after": int(player.coins),
+            })
+            return result
         current_until = int(getattr(player, 'vip_until', 0) or 0)
         start_ts = current_until if current_until > int(now_ts) else int(now_ts)
         player.vip_until = int(start_ts + seconds)
@@ -7054,6 +7607,17 @@ def _daily_bonus_apply_reward(dbs, player: Player, reward_id: str, now_ts: int, 
 
     if kind == 'vip_plus':
         seconds = max(0, int(spec.get('seconds', 0) or 0))
+        if admin_tier:
+            amount = _seconds_to_linear_plan_cost(seconds, int(VIP_PLUS_COSTS.get('1d', 0) or 0))
+            player.coins = int(getattr(player, 'coins', 0) or 0) + amount
+            result.update({
+                "seconds": int(seconds),
+                "converted_to_coins": True,
+                "converted_from": "vip_plus",
+                "amount": int(amount),
+                "coins_after": int(player.coins),
+            })
+            return result
         current_until = int(getattr(player, 'vip_plus_until', 0) or 0)
         start_ts = current_until if current_until > int(now_ts) else int(now_ts)
         player.vip_plus_until = int(start_ts + seconds)
@@ -7064,8 +7628,7 @@ def _daily_bonus_apply_reward(dbs, player: Player, reward_id: str, now_ts: int, 
         return result
 
     if kind == 'vip_combo':
-        vip_plus_until = int(getattr(player, 'vip_plus_until', 0) or 0)
-        resolved_reward_id = 'vip_plus_1d' if vip_plus_until > int(now_ts) else 'vip_3d'
+        resolved_reward_id = 'vip_plus_1d' if tier in ('vip_plus', 'admin', 'admin_plus') else 'vip_3d'
         applied = _daily_bonus_apply_reward(dbs, player, resolved_reward_id, now_ts, source)
         applied["reward_id"] = str(reward_id)
         applied["resolved_reward_id"] = str(resolved_reward_id)
@@ -7457,7 +8020,7 @@ def decrement_inventory_item(item_id: int) -> bool:
     """Уменьшает количество предмета в инвентаре на 1 или удаляет запись, если осталось 0. Возвращает True, если успешно."""
     db = SessionLocal()
     try:
-        item = db.query(InventoryItem).filter(InventoryItem.id == item_id).first()
+        item = db.query(InventoryItem).filter(InventoryItem.id == item_id).with_for_update().first()
         if not item:
             return False
         if item.quantity <= 1:
@@ -7466,6 +8029,12 @@ def decrement_inventory_item(item_id: int) -> bool:
             item.quantity -= 1
         db.commit()
         return True
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
     finally:
         db.close()
 
@@ -8421,6 +8990,100 @@ def log_gift(giver_id: int, recipient_id: int, drink_id: int, rarity: str, statu
         db.close()
 
 
+def log_gift_bundle(giver_id: int, recipient_id: int, items: list, status: str):
+    """Логирует бандл подарков в одной транзакции."""
+    dbs = SessionLocal()
+    try:
+        for item in items:
+            for _ in range(int(item["quantity"])):
+                dbs.add(GiftHistory(
+                    giver_id=giver_id,
+                    recipient_id=recipient_id,
+                    drink_id=item["drink_id"],
+                    rarity=item["rarity"],
+                    status=status,
+                ))
+        dbs.commit()
+    except Exception as e:
+        logger.exception("[GIFT_DB] log_gift_bundle failed: %s", e)
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+    finally:
+        dbs.close()
+
+
+def transfer_gift_bundle_atomic(
+    giver_id: int,
+    recipient_id: int,
+    items: list,
+) -> dict:
+    """Атомарная передача пачки подарков: списание у гивера + начисление получателю в одной транзакции.
+
+    items: [{"item_id": int, "drink_id": int, "rarity": str, "quantity": int}, ...]
+    Возвращает {"ok": True} или {"ok": False, "reason": "..."}.
+    """
+    dbs = SessionLocal()
+    try:
+        # Списание у гивера с row-locking
+        for bundle_item in items:
+            item = (
+                dbs.query(InventoryItem)
+                .filter(InventoryItem.id == int(bundle_item["item_id"]))
+                .with_for_update()
+                .first()
+            )
+            if not item:
+                dbs.rollback()
+                return {"ok": False, "reason": "item_not_found"}
+            if int(item.player_id) != int(giver_id):
+                dbs.rollback()
+                return {"ok": False, "reason": "not_owner"}
+            if int(item.quantity or 0) < int(bundle_item["quantity"]):
+                dbs.rollback()
+                return {"ok": False, "reason": "insufficient_quantity"}
+
+            new_qty = int(item.quantity) - int(bundle_item["quantity"])
+            if new_qty <= 0:
+                dbs.delete(item)
+            else:
+                item.quantity = new_qty
+
+        # Начисление получателю
+        for bundle_item in items:
+            existing = (
+                dbs.query(InventoryItem)
+                .filter_by(
+                    player_id=int(recipient_id),
+                    drink_id=int(bundle_item["drink_id"]),
+                    rarity=str(bundle_item["rarity"]),
+                )
+                .first()
+            )
+            if existing:
+                existing.quantity = int(existing.quantity or 0) + int(bundle_item["quantity"])
+            else:
+                dbs.add(InventoryItem(
+                    player_id=int(recipient_id),
+                    drink_id=int(bundle_item["drink_id"]),
+                    rarity=str(bundle_item["rarity"]),
+                    quantity=int(bundle_item["quantity"]),
+                ))
+
+        dbs.commit()
+        return {"ok": True}
+    except Exception as e:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        logger.exception("[GIFT_DB] transfer_gift_bundle_atomic failed: %s", e)
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
 def get_user_gifts_sent_today(user_id: int) -> int:
     """Возвращает количество подарков, отправленных пользователем сегодня."""
     db = SessionLocal()
@@ -8428,7 +9091,8 @@ def get_user_gifts_sent_today(user_id: int) -> int:
         today_start = int(time.time()) - (int(time.time()) % 86400)  # начало текущего дня UTC
         count = db.query(GiftHistory).filter(
             GiftHistory.giver_id == user_id,
-            GiftHistory.created_at >= today_start
+            GiftHistory.created_at >= today_start,
+            GiftHistory.status == 'accepted',
         ).count()
         return count
     finally:
@@ -8617,7 +9281,10 @@ def get_gift_stats(user_id: int) -> dict:
     """Возвращает статистику подарков пользователя."""
     db = SessionLocal()
     try:
-        sent = db.query(GiftHistory).filter(GiftHistory.giver_id == user_id).count()
+        sent = db.query(GiftHistory).filter(
+            GiftHistory.giver_id == user_id,
+            GiftHistory.status == 'accepted',
+        ).count()
         received = db.query(GiftHistory).filter(
             GiftHistory.recipient_id == user_id,
             GiftHistory.status == 'accepted'

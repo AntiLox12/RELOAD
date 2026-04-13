@@ -41,9 +41,11 @@ async def show_city_silk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # VIP статус
     if lang == 'en':
-        vip_status = "🔥 V.I.P active" if db.is_vip(user.id) else ""
+        access = db.get_access_profile(user.id, username=getattr(user, 'username', None))
+        vip_status = "🔥 V.I.P active" if access.get('acts_like_vip') else ""
     else:
-        vip_status = "🔥 V.I.P активен" if db.is_vip(user.id) else ""
+        access = db.get_access_profile(user.id, username=getattr(user, 'username', None))
+        vip_status = "🔥 V.I.P активен" if access.get('acts_like_vip') else ""
     vip_line = f"   {vip_status}\n" if vip_status else ""
     
     if lang == 'en':
@@ -219,7 +221,8 @@ async def show_silk_create_plantation(update: Update, context: ContextTypes.DEFA
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
-    is_vip = db.is_vip(user.id)
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
+    is_vip = bool(access.get('acts_like_vip'))
     
     text = f"{SILK_EMOJIS['investment']} **СОЗДАНИЕ ПЛАНТАЦИИ**\n\n"
     text += f"Доступно септимов: **{player.coins:,}**\n"

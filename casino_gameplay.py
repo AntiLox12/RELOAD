@@ -195,10 +195,6 @@ async def play_casino_game(update, context, game_type: str, player_choice: str, 
             await query.answer("Недостаточно септимов", show_alert=True)
             return
 
-        if casino_take_bet(user.id, bet_amount) is None:
-            await query.answer("Недостаточно септимов", show_alert=True)
-            return
-
         game_info = CASINO_GAMES.get(game_type, CASINO_GAMES["coin_flip"])
         win = False
         result_text = ""
@@ -221,10 +217,16 @@ async def play_casino_game(update, context, game_type: str, player_choice: str, 
             win = casino_roll_win(game_info["win_prob"], luck_mult)
             result_text = "🎲 Результат определён"
 
-        winnings = 0
+        # VULN-004 fix: атомарная операция — списание и выплата в одной транзакции
+        play_result = db.casino_play_atomic(user.id, bet_amount, win, multiplier)
+        if not play_result.get("ok"):
+            await query.answer("Недостаточно септимов", show_alert=True)
+            return
+
+        winnings = int(play_result.get("winnings", 0) or 0)
+        new_balance = int(play_result.get("new_balance", 0) or 0)
+
         if win:
-            winnings = int(bet_amount * multiplier)
-            db.increment_coins(user.id, winnings)
             casino_record_result(user.id, True)
             db.log_action(
                 user_id=user.id,
@@ -247,6 +249,7 @@ async def play_casino_game(update, context, game_type: str, player_choice: str, 
 
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         achievement_bonus = check_casino_achievements(user.id, player)
+        # Перечитать после достижений (они могут начислить бонус)
         player = db.get_or_create_player(user.id, user.username or user.first_name)
         new_balance = int(getattr(player, "coins", 0) or 0)
 

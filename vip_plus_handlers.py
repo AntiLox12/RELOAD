@@ -63,14 +63,40 @@ async def show_vip_plus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        tier = "Admin+" if str(access.get('tier') or '') == 'admin_plus' else "Admin"
+        text = (
+            f"<b>{access.get('emoji', '🛡️')} {tier}</b>\n\n"
+            f"Покупка VIP/VIP+ отключена для вашего статуса.\n"
+            f"Привилегии уже выше VIP+."
+        )
+        keyboard = [
+            [InlineKeyboardButton(vip_plus_t(lang, 'btn_back'), callback_data='extra_bonuses')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        message = query.message
+        if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+            try:
+                await message.delete()
+            except BadRequest:
+                pass
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        return
 
     text = vip_plus_t(lang, 'vip_plus_title')
     # Добавим блок о текущем состоянии автопоиска VIP+
     try:
         auto_state = vip_plus_t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else vip_plus_t(lang, 'off')
         auto_count = int(getattr(player, 'auto_search_count', 0) or 0)
-        auto_limit = db.get_auto_search_daily_limit(user.id)  # Используем новую функцию с учётом VIP+
+        auto_limit = db.get_auto_search_daily_limit(user.id, username=getattr(user, 'username', None))
         text += vip_plus_t(lang, 'vip_auto_header')
         text += "\n" + vip_plus_t(lang, 'vip_auto_state').format(state=auto_state)
         text += "\n" + vip_plus_t(lang, 'vip_auto_today').format(count=auto_count, limit=auto_limit)
@@ -81,7 +107,7 @@ async def show_vip_plus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text += f"\n{silent_text}"
         
         # Показываем статус VIP+
-        if db.is_vip_plus(user.id):
+        if str(access.get('tier') or '') == 'vip_plus':
             vip_plus_until = db.get_vip_plus_until(user.id)
             until_str = time.strftime('%d.%m.%Y %H:%M', time.localtime(vip_plus_until)) if vip_plus_until else '—'
             text += f"\n\n{VIP_PLUS_EMOJI} VIP+ до: {until_str}"
@@ -120,7 +146,11 @@ async def show_vip_plus_1d(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await show_vip_plus_menu(update, context)
+        return
 
     cost = VIP_PLUS_COSTS['1d']
     vip_plus_until = db.get_vip_plus_until(user.id)
@@ -174,7 +204,11 @@ async def show_vip_plus_7d(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await show_vip_plus_menu(update, context)
+        return
 
     cost = VIP_PLUS_COSTS['7d']
     vip_plus_until = db.get_vip_plus_until(user.id)
@@ -228,7 +262,11 @@ async def show_vip_plus_30d(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await show_vip_plus_menu(update, context)
+        return
 
     cost = VIP_PLUS_COSTS['30d']
     vip_plus_until = db.get_vip_plus_until(user.id)
@@ -282,7 +320,12 @@ async def confirm_vip_plus_purchase(update: Update, context: ContextTypes.DEFAUL
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await query.answer("Покупка VIP+ недоступна для админ-статуса.", show_alert=True)
+        await show_vip_plus_menu(update, context)
+        return
 
     if plan_key not in VIP_PLUS_COSTS or plan_key not in VIP_PLUS_DURATIONS_SEC:
         await query.answer("Ошибка плана", show_alert=True)
@@ -362,7 +405,11 @@ async def buy_vip_plus(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_
     res = db.purchase_vip_plus(user.id, cost, duration)
     if not res.get('ok'):
         reason = res.get('reason')
-        if reason == 'not_enough_coins':
+        if reason == 'admin_blocked':
+            tier = "Admin+" if str(res.get('tier') or '') == 'admin_plus' else "Admin"
+            await query.answer(f"Покупка VIP+ недоступна для статуса {tier}.", show_alert=True)
+            await show_vip_plus_menu(update, context)
+        elif reason == 'not_enough_coins':
             await query.answer(vip_plus_t(lang, 'vip_plus_not_enough'), show_alert=True)
         else:
             await query.answer('Ошибка. Попробуйте позже.', show_alert=True)

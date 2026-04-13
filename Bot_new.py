@@ -1,4 +1,4 @@
-﻿# file: Bot_new.py
+# file: Bot_new.py
 
 import os
 import logging
@@ -9,7 +9,7 @@ import json
 import secrets
 import html
 import re
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ForceReply, Message, User, InputMediaPhoto
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ForceReply, Message, User, InputMediaPhoto, LabeledPrice
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
@@ -19,14 +19,15 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 import database as db
 from database import SessionLocal, Player
 from sqlalchemy import func
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import config
-from typing import Dict
+from typing import Any, Dict
 from casino_logic import (
     casino_adjusted_prob,
     casino_extra_win_chance,
@@ -87,11 +88,15 @@ from constants import (
     ITEMS_PER_PAGE,
     FAVORITE_DRINK_WEIGHT_MULT,
     VIP_EMOJI,
+    ADMIN_EMOJI,
+    ADMIN_PLUS_EMOJI,
     VIP_COSTS,
     VIP_DURATIONS_SEC,
     VIP_PLUS_EMOJI,
     VIP_PLUS_COSTS,
     VIP_PLUS_DURATIONS_SEC,
+    PROMO_ANNOUNCEMENT_CHAT,
+    PROMO_ANNOUNCEMENT_LINK,
     TG_PREMIUM_COST,
     TG_PREMIUM_DURATION_SEC,
     ADMIN_USERNAMES,
@@ -145,6 +150,19 @@ from admin_permissions import (
     ADMIN_TEXT_ACTION_LEVELS,
     CREATOR_TEXT_ACTION_LEVELS,
 )
+from reload_bot.modules import admin_settings as admin_settings_module
+from reload_bot.modules import admin_logs as admin_logs_module
+from reload_bot.modules import admin_moderation as admin_moderation_module
+from reload_bot.modules import donate as donate_module
+from reload_bot.modules import promo as promo_module
+from reload_bot.runtime import BotRuntime
+from utils import (
+    _parse_duration_to_seconds,
+    _resolve_user_identifier,
+    _format_duration_compact,
+    _format_player_label,
+    esc,
+)
 # --- Настройки ---
 # Константы импортируются из constants.py
 
@@ -154,6 +172,355 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+QUICK_ACCESS_OPTIONS = {
+    'city_casino': {'ru': '🎰 Казино', 'en': '🎰 Casino'},
+    'silk_plantations': {'ru': '🧵 Плантации шёлка', 'en': '🧵 Silk plantations'},
+    'market_plantation': {'ru': '🌱 Просто плантации', 'en': '🌱 Plantation'},
+    'market_receiver': {'ru': '📦 Приёмник', 'en': '📦 Receiver'},
+    'rostov_hub': {'ru': '🧬 Хаб селюков', 'en': '🧬 Selyuk hub'},
+    'rostov_elite_shop': {'ru': '💎 Магазин Элиты', 'en': '💎 Elite shop'},
+}
+PROMO_KIND_OPTIONS = [
+    ('coins', '💰 Монеты'),
+    ('vip', '👑 VIP'),
+    ('vip_plus', '💎 VIP+'),
+    ('drink', '🥤 Энергетик'),
+    ('selyuk_fragment', '🧩 Фрагменты селюка'),
+    ('auto_search_boost', '🚀 Буст автопоиска'),
+    ('luck_coupon', '🎲 Купон удачи'),
+    ('seed_coupon', '🎟 Купон семян'),
+    ('search_skip', '⏱ Пропуск поиска'),
+    ('bonus_skip', '🎁 Пропуск бонуса'),
+]
+SEED_COUPON_PAGE_SIZE = 6
+
+
+def _get_access_profile(user, player=None) -> dict:
+    return db.get_access_profile(
+        int(getattr(user, 'id', 0) or 0),
+        username=getattr(user, 'username', None),
+        player=player,
+    )
+
+
+def _effective_search_cooldown(access_profile: dict) -> float:
+    base_search_cd = float(db.get_setting_int('search_cooldown', SEARCH_COOLDOWN))
+    return base_search_cd * float(access_profile.get('search_cooldown_mult', 1.0) or 1.0)
+
+
+def _status_text_from_access(access_profile: dict, lang: str) -> str:
+    tier = str(access_profile.get('tier') or 'ordinary')
+    emoji = str(access_profile.get('emoji') or '')
+    if tier == 'admin_plus':
+        return f"{emoji} <b>Статус:</b> Admin+ (ур. {int(access_profile.get('admin_level', 0) or 0)})" if lang == 'ru' else f"{emoji} <b>Status:</b> Admin+ (lvl {int(access_profile.get('admin_level', 0) or 0)})"
+    if tier == 'admin':
+        return f"{emoji} <b>Статус:</b> Admin" if lang == 'ru' else f"{emoji} <b>Status:</b> Admin"
+    if tier == 'vip_plus':
+        vip_plus_until = safe_format_timestamp(int(access_profile.get('vip_plus_until', 0) or 0), '%d.%m.%Y %H:%M')
+        return f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_plus_until})" if lang == 'ru' else f"💎 <b>Status:</b> {VIP_PLUS_EMOJI} V.I.P+ (until {vip_plus_until})"
+    if tier == 'vip':
+        vip_until = safe_format_timestamp(int(access_profile.get('vip_until', 0) or 0), '%d.%m.%Y %H:%M')
+        return f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until})" if lang == 'ru' else f"👑 <b>Status:</b> {VIP_EMOJI} V.I.P (until {vip_until})"
+    return "📊 <b>Статус:</b> Обычный игрок" if lang == 'ru' else "📊 <b>Status:</b> Regular player"
+
+
+def _quick_access_label(target: str, lang: str) -> str:
+    meta = QUICK_ACCESS_OPTIONS.get(str(target) or '')
+    if not meta:
+        return "⚡ Быстрый доступ" if lang == 'ru' else "⚡ Quick access"
+    return meta.get(lang, meta.get('ru', '⚡ Быстрый доступ'))
+
+
+def _format_admin_assignment_notice(result: dict) -> str:
+    tier = "Admin+" if str(result.get('tier') or '') == 'admin_plus' else 'Admin'
+    vip_seconds = int(result.get('vip_remaining_seconds', 0) or 0)
+    vip_plus_seconds = int(result.get('vip_plus_remaining_seconds', 0) or 0)
+    vip_coins = int(result.get('vip_compensation', 0) or 0)
+    vip_plus_coins = int(result.get('vip_plus_compensation', 0) or 0)
+    total = int(result.get('total_compensation', 0) or 0)
+    return "\n".join([
+        f"🛡 Вам назначен статус {tier}.",
+        "",
+        "Активные VIP/VIP+ были отключены и конвертированы в септимы:",
+        f"• VIP: {vip_seconds} сек. → {vip_coins} септимов",
+        f"• VIP+: {vip_plus_seconds} сек. → {vip_plus_coins} септимов",
+        f"• Итого: {total} септимов",
+    ])
+
+
+async def _notify_admin_assignment(context: ContextTypes.DEFAULT_TYPE, target_user_id: int, result: dict) -> None:
+    try:
+        await context.bot.send_message(chat_id=int(target_user_id), text=_format_admin_assignment_notice(result))
+    except Exception:
+        pass
+
+
+def _search_animation_frames(lang: str) -> list[str]:
+    if lang == 'en':
+        return [
+            "🔎 <b>Scanning</b>\n░░░░░",
+            "🔎 <b>Scanning</b>\n██░░░",
+            "🔎 <b>Scanning</b>\n█████",
+        ]
+    return [
+        "🔎 <b>Поиск</b>\n░░░░░",
+        "🔎 <b>Поиск</b>\n██░░░",
+        "🔎 <b>Поиск</b>\n█████",
+    ]
+
+
+async def _run_search_animation(edit_call, lang: str) -> None:
+    frames = _search_animation_frames(lang)
+    for idx, frame in enumerate(frames[:-1]):
+        try:
+            await edit_call(frame)
+        except BadRequest:
+            pass
+        await asyncio.sleep(0.55 if idx == 0 else 0.65)
+
+
+def _search_temp_meta(drink_temp: str, lang: str) -> tuple[str, str]:
+    if drink_temp == 'hot':
+        return ('🔥', 'Горячий напиток: давно не выпадал' if lang != 'en' else 'Hot drink: has not appeared for a while')
+    if drink_temp == 'cold':
+        return ('❄️', 'Холодный напиток: выпадал недавно' if lang != 'en' else 'Cold drink: appeared recently')
+    return ('🌡️', 'Нейтральный' if lang != 'en' else 'Neutral')
+
+
+def _format_search_result_caption(
+    *,
+    lang: str,
+    access: dict,
+    drops: list[dict],
+    found_count: int,
+    septims_reward: int,
+    total_autosell_payout: int,
+    coins_after: int,
+    new_rating: int | None,
+    swaga_cards_found: list[str],
+    swaga_cards_total: int,
+    used_luck_coupon: bool,
+    luck_charges_left: int,
+) -> str:
+    tier = str(access.get('tier') or 'ordinary')
+    guaranteed = tier in ('admin', 'admin_plus')
+    status_line = _status_text_from_access(access, lang)
+    header = (
+        "🎉 <b>Поиск завершён</b>"
+        if lang != 'en'
+        else "🎉 <b>Search complete</b>"
+    )
+    if found_count >= 2:
+        header = "🎉 <b>Двойная находка!</b>" if lang != 'en' else "🎉 <b>Double drop!</b>"
+
+    lines = [header, status_line, ""]
+    lines.append("🔍 <b>Найдено</b>" if lang != 'en' else "🔍 <b>Found</b>")
+    for idx, drop in enumerate(drops, start=1):
+        found_drink = drop['drink']
+        rarity = drop['rarity']
+        drink_temp = drop['temp']
+        autosell_enabled = bool(drop.get('autosell_enabled'))
+        autosell_payout = int(drop.get('autosell_payout', 0) or 0)
+        rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
+        temp_emoji, temp_text = _search_temp_meta(drink_temp, lang)
+        prefix = f"{idx}. " if found_count >= 2 else ""
+        lines.append(f"{prefix}<b>{html.escape(getattr(found_drink, 'name', 'Энергетик'))}</b>")
+        lines.append(f"{rarity_emoji} {html.escape(str(rarity))} • {temp_emoji} <i>{html.escape(temp_text)}</i>")
+        if autosell_enabled and autosell_payout > 0:
+            if lang != 'en':
+                lines.append(f"🧾 Автопродажа: +{autosell_payout} септимов")
+            else:
+                lines.append(f"🧾 Autosell: +{autosell_payout} septims")
+        desc = str(getattr(found_drink, 'description', '') or '').strip()
+        if desc:
+            lines.append(f"<i>{html.escape(desc)}</i>")
+        lines.append("")
+
+    lines.append("💰 <b>Награды</b>" if lang != 'en' else "💰 <b>Rewards</b>")
+    if lang != 'en':
+        lines.append(f"🪙 За поиск: <b>+{septims_reward}</b> септимов")
+    else:
+        lines.append(f"🪙 Search reward: <b>+{septims_reward}</b> septims")
+    if total_autosell_payout > 0:
+        if lang != 'en':
+            lines.append(f"🧾 Автопродажа: <b>+{total_autosell_payout}</b> септимов")
+        else:
+            lines.append(f"🧾 Autosell total: <b>+{total_autosell_payout}</b> septims")
+    if new_rating is not None:
+        lines.append(f"⭐ {'Рейтинг' if lang != 'en' else 'Rating'}: <b>{new_rating}</b>")
+    lines.append(f"💼 {'Баланс' if lang != 'en' else 'Balance'}: <b>{coins_after}</b>")
+
+    extras: list[str] = []
+    fixed_reward = int(access.get('fixed_search_reward', 0) or 0)
+    if fixed_reward > 0:
+        if lang != 'en':
+            extras.append(f"{access.get('emoji', '🛡️')} {access.get('label_ru', 'Admin')} бонус: фиксированно +{fixed_reward} септимов")
+        else:
+            extras.append(f"{access.get('emoji', '🛡️')} {access.get('label_en', 'Admin')} bonus: fixed +{fixed_reward} septims")
+    elif access.get('acts_like_vip'):
+        extras.append("👑 VIP бонус: x2 к награде за поиск" if lang != 'en' else "👑 VIP bonus: x2 search coins")
+    if guaranteed:
+        extras.append("🛡 Гарант админа: всегда 2 энергетика" if lang != 'en' else "🛡 Admin guarantee: always 2 drinks")
+    if used_luck_coupon:
+        extras.append(
+            f"🎲 Купон удачи израсходован, осталось: {luck_charges_left}"
+            if lang != 'en'
+            else f"🎲 Luck coupon used, charges left: {luck_charges_left}"
+        )
+    elif guaranteed and int(access.get('guaranteed_search_count', 0) or 0) >= 2:
+        extras.append("🎲 Купон удачи не тратился: двойной дроп уже гарантирован" if lang != 'en' else "🎲 Luck coupon was not consumed: double drop is already guaranteed")
+    if swaga_cards_found:
+        swaga_counts: dict[str, int] = {}
+        for rarity_name in swaga_cards_found:
+            swaga_counts[rarity_name] = swaga_counts.get(rarity_name, 0) + 1
+        swaga_text = ", ".join(f"{qty}x {name}" for name, qty in swaga_counts.items())
+        if lang != 'en':
+            extras.append(f"🎫 Свага-карточки ({swaga_cards_total}): {swaga_text}")
+        else:
+            extras.append(f"🎫 Swaga cards ({swaga_cards_total}): {swaga_text}")
+    if extras:
+        lines.extend(["", "✨ <b>Дополнительно</b>" if lang != 'en' else "✨ <b>Extras</b>", *extras])
+    return "\n".join(line for line in lines if line is not None)
+
+
+def _promo_kind_title(kind: str) -> str:
+    for item_kind, title in PROMO_KIND_OPTIONS:
+        if item_kind == str(kind):
+            return title
+    return str(kind)
+
+
+def _promo_value_hint(kind: str) -> str:
+    mapping = {
+        'coins': 'количество септимов',
+        'vip': 'количество дней VIP',
+        'vip_plus': 'количество дней VIP+',
+        'drink': 'ID энергетика',
+        'selyuk_fragment': 'количество фрагментов',
+        'auto_search_boost': 'доп. поиски на 24 часа',
+        'luck_coupon': 'число зарядов',
+        'seed_coupon': 'число купонов',
+        'search_skip': 'число мгновенных сбросов КД поиска',
+        'bonus_skip': 'число мгновенных сбросов КД бонуса',
+    }
+    return mapping.get(str(kind), 'число')
+
+
+def _promo_reward_summary(kind: str, value: int, rarity: str | None = None, lang: str = 'ru') -> str:
+    kind = str(kind or '').strip().lower()
+    value = int(value or 0)
+    if kind == 'coins':
+        return f"💰 {value} септимов" if lang != 'en' else f"💰 {value} septims"
+    if kind == 'vip':
+        return f"👑 VIP на {value} дн." if lang != 'en' else f"👑 VIP for {value} day(s)"
+    if kind == 'vip_plus':
+        return f"💎 VIP+ на {value} дн." if lang != 'en' else f"💎 VIP+ for {value} day(s)"
+    if kind == 'drink':
+        rarity_suffix = f" [{rarity}]" if rarity else ""
+        return f"🥤 Энергетик ID {value}{rarity_suffix}" if lang != 'en' else f"🥤 Drink ID {value}{rarity_suffix}"
+    if kind == 'selyuk_fragment':
+        return f"🧩 Фрагменты селюка x{value}" if lang != 'en' else f"🧩 Selyuk fragments x{value}"
+    if kind == 'auto_search_boost':
+        return f"🚀 Буст автопоиска +{value} на 24ч" if lang != 'en' else f"🚀 Auto-search boost +{value} for 24h"
+    if kind == 'luck_coupon':
+        return f"🎲 Купон удачи x{value}" if lang != 'en' else f"🎲 Luck coupon x{value}"
+    if kind == 'seed_coupon':
+        return f"🎟 Купон семян x{value}" if lang != 'en' else f"🎟 Seed coupon x{value}"
+    if kind == 'search_skip':
+        return f"⏱ Пропуск КД поиска x{value}" if lang != 'en' else f"⏱ Search skip x{value}"
+    if kind == 'bonus_skip':
+        return f"🎁 Пропуск КД бонуса x{value}" if lang != 'en' else f"🎁 Bonus skip x{value}"
+    return f"{_promo_kind_title(kind)}: {value}"
+
+
+def _format_promo_announcement(wiz: dict, lang: str = 'ru') -> str:
+    code = html.escape(str(wiz.get('code') or ''))
+    reward = html.escape(_promo_reward_summary(wiz.get('kind'), int(wiz.get('value') or 0), wiz.get('rarity'), lang))
+    max_uses = int(wiz.get('max_uses') or 0)
+    per_user = int(wiz.get('per_user_limit') or 0)
+    expires = wiz.get('expires_at')
+    expires_text = safe_format_timestamp(expires) if expires else ('без срока' if lang != 'en' else 'no expiry')
+    total_text = 'без лимита' if max_uses <= 0 and lang != 'en' else ('unlimited' if max_uses <= 0 else str(max_uses))
+    per_user_text = 'без лимита' if per_user <= 0 and lang != 'en' else ('unlimited' if per_user <= 0 else str(per_user))
+    if max_uses > 0:
+        total_text = str(max_uses)
+    if per_user > 0:
+        per_user_text = str(per_user)
+    return "\n".join([
+        "🎁 <b>Новый промокод</b>" if lang != 'en' else "🎁 <b>New promo code</b>",
+        "",
+        f"🔐 <code>{code}</code>",
+        f"🎉 Награда: <b>{reward}</b>" if lang != 'en' else f"🎉 Reward: <b>{reward}</b>",
+        f"📦 Общий лимит: <b>{html.escape(total_text)}</b>" if lang != 'en' else f"📦 Total uses: <b>{html.escape(total_text)}</b>",
+        f"👤 На пользователя: <b>{html.escape(per_user_text)}</b>" if lang != 'en' else f"👤 Per user: <b>{html.escape(per_user_text)}</b>",
+        f"⏳ Срок: <b>{html.escape(str(expires_text))}</b>" if lang != 'en' else f"⏳ Expires: <b>{html.escape(str(expires_text))}</b>",
+        "",
+        f"Активируй в боте: <code>/promo {code}</code>" if lang != 'en' else f"Activate in bot: <code>/promo {code}</code>",
+        f"📣 Канал: {PROMO_ANNOUNCEMENT_LINK}",
+    ])
+
+
+def _get_coupon_seed_types(search_query: str = '') -> list:
+    try:
+        drinks = [d for d in (db.get_all_drinks() or []) if not getattr(d, 'is_special', False)]
+        if drinks:
+            try:
+                db.ensure_seed_types_for_drinks([int(d.id) for d in drinks])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    search_query = str(search_query or '').strip().lower()
+    items = []
+    for seed_type in (db.list_seed_types() or []):
+        drink = getattr(seed_type, 'drink', None)
+        if not getattr(seed_type, 'drink_id', None) or not drink or getattr(drink, 'is_special', False):
+            continue
+        haystack = " ".join(
+            part for part in [
+                str(getattr(seed_type, 'name', '') or ''),
+                str(getattr(seed_type, 'description', '') or ''),
+                str(getattr(drink, 'name', '') or ''),
+                str(getattr(drink, 'description', '') or ''),
+            ] if part
+        ).lower()
+        if search_query and search_query not in haystack:
+            continue
+        items.append(seed_type)
+    return sorted(items, key=lambda st: (str(getattr(getattr(st, 'drink', None), 'name', '') or '').lower(), int(getattr(st, 'id', 0) or 0)))
+
+
+def _is_coupon_seed_allowed(seed_type_id: int) -> bool:
+    try:
+        seed_type = db.get_seed_type_by_id(int(seed_type_id))
+    except Exception:
+        seed_type = None
+    if not seed_type:
+        return False
+    drink = getattr(seed_type, 'drink', None)
+    return bool(getattr(seed_type, 'drink_id', None) and drink and not getattr(drink, 'is_special', False))
+
+
+def _clear_seed_coupon_session(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in (
+        'seed_coupon_shop_active',
+        'seed_coupon_shop_query',
+        'seed_coupon_shop_page',
+        'seed_coupon_shop_origin',
+        'seed_coupon_shop_bed_index',
+    ):
+        context.user_data.pop(key, None)
+
+
+def _seed_coupon_close_callback(context: ContextTypes.DEFAULT_TYPE) -> str:
+    origin = str(context.user_data.get('seed_coupon_shop_origin') or '')
+    bed_index = int(context.user_data.get('seed_coupon_shop_bed_index') or 0)
+    if origin == 'plantation_choose' and bed_index > 0:
+        return f'plantation_choose_{bed_index}'
+    if origin == 'profile_boosts':
+        return 'profile_boosts'
+    return 'market_plantation'
 
 async def _tg_call_with_retry(call, *, retries=3, base_delay=1.5, **kwargs):
     last_exc = None
@@ -192,6 +559,64 @@ async def _send_media_group_long(call, **kwargs):
     return await _tg_call_with_retry(call, retries=3, base_delay=1.5, **kwargs)
 
 
+# Лимит Telegram API: caption для фото/медиа — макс. 1024 символа
+TG_CAPTION_MAX_LENGTH = 1024
+
+
+async def _send_photo_or_text_fallback(bot, *, chat_id: int, photo, caption: str | None,
+                                       reply_markup=None, parse_mode: str = 'HTML'):
+    """Отправляет фото с caption, если caption помещается в лимит (1024 символа).
+    Иначе отправляет фото без caption, а текст — отдельным сообщением.
+    """
+    if caption and len(caption) <= TG_CAPTION_MAX_LENGTH:
+        return await _send_photo_long(
+            bot.send_photo,
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    else:
+        # Фото без caption
+        await _send_photo_long(
+            bot.send_photo,
+            chat_id=chat_id,
+            photo=photo,
+        )
+        # Текст отдельным сообщением (лимит send_message — 4096 символов)
+        if caption:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=caption[:4096],
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+        return None
+
+
+async def _send_media_group_or_text_fallback(bot, *, chat_id: int, photos: list,
+                                              caption: str | None, parse_mode: str = 'HTML'):
+    """Отправляет media group с caption. Если caption превышает лимит —
+    отправляет фото без caption, а текст — отдельным сообщением.
+    """
+    if caption and len(caption) > TG_CAPTION_MAX_LENGTH:
+        # Фото без caption
+        media = [InputMediaPhoto(media=p) for p in photos]
+        await _send_media_group_long(bot.send_media_group, chat_id=chat_id, media=media)
+        # Текст отдельно
+        await bot.send_message(
+            chat_id=chat_id,
+            text=caption[:4096],
+            parse_mode=parse_mode,
+        )
+    else:
+        media = [InputMediaPhoto(media=photos[0], caption=caption, parse_mode=parse_mode)]
+        for p in photos[1:]:
+            media.append(InputMediaPhoto(media=p))
+        await _send_media_group_long(bot.send_media_group, chat_id=chat_id, media=media)
+
+
 async def _send_audio_long(call, **kwargs):
     kwargs.setdefault('read_timeout', 120.0)
     kwargs.setdefault('write_timeout', 120.0)
@@ -211,6 +636,27 @@ def safe_format_timestamp(timestamp, format_str='%d.%m.%Y %H:%M'):
     except (OSError, ValueError, OverflowError) as e:
         logger.warning(f"Invalid timestamp {timestamp}: {e}")
         return None
+
+_LOCKS: OrderedDict[str, asyncio.Lock] = OrderedDict()
+_LOCKS_MAX = 5000
+
+def _get_lock(key: str) -> asyncio.Lock:
+    lock = _LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LOCKS[key] = lock
+        # Очистка незалоченных старых записей при переполнении
+        if len(_LOCKS) > _LOCKS_MAX:
+            to_remove = [
+                k for k, v in list(_LOCKS.items())
+                if not v.locked()
+            ]
+            # Удаляем первую половину незалоченных записей (самые старые)
+            for k in to_remove[:len(to_remove) // 2]:
+                _LOCKS.pop(k, None)
+    else:
+        _LOCKS.move_to_end(key)
+    return lock
 
 def create_progress_bar(percent: float, length: int = 10, filled: str = '█', empty: str = '░') -> str:
     """Создает визуальный прогресс-бар."""
@@ -249,21 +695,12 @@ SEED_CUSTOM_QTY = range(1)
 PENDING_ADDITIONS: dict[int, dict] = {}
 NEXT_PENDING_ID = 1
 
-# --- Блокировки для предотвращения даблкликов/гонок ---
-_LOCKS: Dict[str, asyncio.Lock] = {}
-
-# --- Ожидание причины отклонения (ключ = (chat_id, prompt_message_id)) ---
-REJECT_PROMPTS: Dict[tuple[int, int], dict] = {}
 
 # --- Система автоудаления сообщений для групп (ключ = message_id) ---
 AUTO_DELETE_MESSAGES: Dict[str, dict] = {}
 
-def _get_lock(key: str) -> asyncio.Lock:
-    lock = _LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _LOCKS[key] = lock
-    return lock
+# --- Ожидание причины отклонения (ключ = (chat_id, prompt_message_id)) ---
+REJECT_PROMPTS: Dict[tuple[int, int], dict] = {}
 
 # --- Магазин: кэш предложений на пользователя ---
 # SHOP_OFFERS[user_id] = { 'offers': [ {idx, drink_id, drink_name, rarity} ], 'ts': int }
@@ -511,7 +948,29 @@ TEXTS = {
     'group_only_command': {
         'ru': '❌ Эта команда доступна только в группах.',
         'en': '❌ This command is only available in groups.'
-    }
+    },
+    # --- Donate ---
+    'donate_btn': {'ru': '💫 Поддержать автора', 'en': '💫 Support the author'},
+    'donate_title': {
+        'ru': '💫 <b>Поддержка автора</b>\n\n'
+              'Если вам нравится бот, вы можете поддержать разработчика донатом в Telegram Stars ⭐\n\n'
+              'Каждая звезда — это мотивация развивать бот дальше! 🚀\n\n'
+              'Выберите сумму:',
+        'en': '💫 <b>Support the author</b>\n\n'
+              'If you enjoy the bot, you can support the developer with a Telegram Stars donation ⭐\n\n'
+              'Every star motivates further development! 🚀\n\n'
+              'Choose an amount:'
+    },
+    'donate_thanks': {
+        'ru': '🎉 <b>Огромное спасибо за поддержку!</b>\n\n'
+              '⭐ Вы задонатили <b>{amount}</b> звёзд\n\n'
+              'Ваш вклад помогает развивать бот и делать его лучше! 💖\n'
+              'Спасибо, что верите в проект! 🙏',
+        'en': '🎉 <b>Thank you so much for your support!</b>\n\n'
+              '⭐ You donated <b>{amount}</b> stars\n\n'
+              'Your contribution helps develop the bot and make it better! 💖\n'
+              'Thank you for believing in the project! 🙏'
+    },
 }
 
 def t(lang: str, key: str) -> str:
@@ -629,7 +1088,7 @@ def _daily_bonus_reward_detail_lines(reward_data: dict | None, lang: str = 'ru')
         drink_name = html.escape(str(drink.get('name') or ''))
         description = html.escape(str(drink.get('description') or ''))
         if drink_name:
-            lines.append(f"🥤 <b>{drink_name}</b>")
+            lines.append(f"🥤 <b>{esc(drink_name)}</b>")
         if description:
             lines.append(f"<i>{description}</i>")
 
@@ -648,6 +1107,20 @@ def _daily_bonus_reward_detail_lines(reward_data: dict | None, lang: str = 'ru')
             lines.append(f"🎲 Luck charges: <b>{int(reward_data['luck_after'])}</b>")
         else:
             lines.append(f"🎲 Зарядов купона: <b>{int(reward_data['luck_after'])}</b>")
+    if reward_data.get('seed_coupon_after') is not None:
+        if lang == 'en':
+            lines.append(f"🎟 Seed coupons: <b>{int(reward_data['seed_coupon_after'])}</b>")
+        else:
+            lines.append(f"🎟 Купонов семян: <b>{int(reward_data['seed_coupon_after'])}</b>")
+    if reward_data.get('converted_to_coins'):
+        converted_from = str(reward_data.get('converted_from') or '')
+        amount = int(reward_data.get('amount', reward_data.get('coins_added', 0)) or 0)
+        if lang == 'en':
+            src = 'VIP+' if converted_from == 'vip_plus' else 'VIP'
+            lines.append(f"🔄 {src} reward was converted into <b>{amount}</b> septims for your admin tier.")
+        else:
+            src = 'VIP+' if converted_from == 'vip_plus' else 'VIP'
+            lines.append(f"🔄 Награда {src} конвертирована в <b>{amount}</b> септимов из-за админ-статуса.")
     if reward_data.get('vip_until') is not None:
         vip_until = safe_format_timestamp(int(reward_data['vip_until']))
         if vip_until:
@@ -672,24 +1145,119 @@ def _daily_bonus_reward_detail_lines(reward_data: dict | None, lang: str = 'ru')
                 lines.append(f"🚀 Бустов в запасе: <b>{boost_count}</b> до <b>{boost_until}</b>")
     return lines
 
-# --- Функции-обработчики для кнопок ---
+# --- Донат (поддержка автора через Telegram Stars) ---
+
+DONATE_OPTIONS = [
+    {'stars': 5,   'label': '⭐ 5 звёзд'},
+    {'stars': 10,  'label': '⭐ 10 звёзд'},
+    {'stars': 20,  'label': '⭐ 20 звёзд'},
+    {'stars': 50,  'label': '⭐ 50 звёзд'},
+    {'stars': 100, 'label': '⭐ 100 звёзд'},
+]
+
+
+BOT_RUNTIME: BotRuntime | None = None
+MODULAR_TEXT_ACTION_MODULES = (promo_module, admin_settings_module, admin_moderation_module, admin_logs_module)
+
+
+def build_bot_runtime() -> BotRuntime:
+    return BotRuntime(
+        db=db,
+        logger=logger,
+        t=t,
+        has_creator_panel_access=has_creator_panel_access,
+        has_admin_level=has_admin_level,
+        safe_format_timestamp=safe_format_timestamp,
+        parse_duration_to_seconds=_parse_duration_to_seconds,
+        format_duration_compact=_format_duration_compact,
+        resolve_user_identifier=_resolve_user_identifier,
+        format_player_label=_format_player_label,
+        promo_kind_options=PROMO_KIND_OPTIONS,
+        donate_options=DONATE_OPTIONS,
+        rarities=RARITIES,
+        rarity_order=RARITY_ORDER,
+        color_emojis=COLOR_EMOJIS,
+        promo_announcement_chat=PROMO_ANNOUNCEMENT_CHAT,
+        promo_announcement_link=PROMO_ANNOUNCEMENT_LINK,
+        search_cooldown_default=SEARCH_COOLDOWN,
+        daily_bonus_cooldown_default=DAILY_BONUS_COOLDOWN,
+        auto_search_daily_limit_default=AUTO_SEARCH_DAILY_LIMIT,
+        casino_win_prob_default=CASINO_WIN_PROB,
+        plantation_fertilizer_max_per_bed_default=PLANTATION_FERTILIZER_MAX_PER_BED,
+        plantation_neg_event_interval_sec_default=PLANTATION_NEG_EVENT_INTERVAL_SEC,
+        plantation_neg_event_chance_default=PLANTATION_NEG_EVENT_CHANCE,
+        plantation_neg_event_max_active_default=PLANTATION_NEG_EVENT_MAX_ACTIVE,
+        plantation_neg_event_duration_sec_default=PLANTATION_NEG_EVENT_DURATION_SEC,
+        handlers={},
+        helpers={},
+    )
+
+
+def get_bot_runtime() -> BotRuntime:
+    global BOT_RUNTIME
+    if BOT_RUNTIME is None:
+        BOT_RUNTIME = build_bot_runtime()
+        BOT_RUNTIME.handlers.update({
+            'promo_command': promo_command,
+            'promo_button_start': promo_button_start,
+            'promo_button_cancel': promo_button_cancel,
+            'show_admin_promo_menu': show_admin_promo_menu,
+            'admin_promo_wizard_start': admin_promo_wizard_start,
+            'admin_promo_create_start': admin_promo_create_start,
+            'admin_promo_list_active_show': admin_promo_list_active_show,
+            'admin_promo_list_all_show': admin_promo_list_all_show,
+            'admin_promo_deactivate_start': admin_promo_deactivate_start,
+            'admin_promo_stats_show': admin_promo_stats_show,
+            'promo_wiz_cancel': promo_wiz_cancel,
+            'promo_wiz_confirm': promo_wiz_confirm,
+            'admin_promo_deactivate_pick_show': admin_promo_deactivate_pick_show,
+            'promo_wiz_delivery_select': promo_wiz_delivery_select,
+            'promo_wiz_kind_select': promo_wiz_kind_select,
+            'promo_wiz_rarity_select': promo_wiz_rarity_select,
+            'promo_wiz_active_select': promo_wiz_active_select,
+            'admin_promo_deactivate_confirm': admin_promo_deactivate_confirm,
+            'admin_promo_deactivate_do': admin_promo_deactivate_do,
+            'handle_promo_create': handle_promo_create,
+            'handle_promo_deactivate': handle_promo_deactivate,
+            'handle_promo_wiz_code': handle_promo_wiz_code,
+            'handle_promo_wiz_value': handle_promo_wiz_value,
+            'handle_promo_wiz_max_uses': handle_promo_wiz_max_uses,
+            'handle_promo_wiz_per_user': handle_promo_wiz_per_user,
+            'handle_promo_wiz_expires': handle_promo_wiz_expires,
+        })
+    return BOT_RUNTIME
+
+
+def register_modular_handlers(application, runtime: BotRuntime) -> None:
+    donate_module.register_handlers(application, runtime)
+    promo_module.register_handlers(application, runtime)
+    admin_settings_module.register_handlers(application, runtime)
+    admin_moderation_module.register_handlers(application, runtime)
+    admin_logs_module.register_handlers(application, runtime)
+
+
+async def handle_modular_admin_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    action: str | None,
+    text_input: str,
+) -> bool:
+    if not action:
+        return False
+    runtime = get_bot_runtime()
+    for module in MODULAR_TEXT_ACTION_MODULES:
+        if module.can_handle_text_action(action):
+            return await module.handle_text_action(update, context, action, text_input, runtime)
+    return False
+
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает главное меню. УМЕЕТ ОБРАБАТЫВАТЬ ВОЗВРАТ С ФОТО."""
     user = update.effective_user
     player = db.get_or_create_player(user.id, username=getattr(user, 'username', None), display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)))
 
-    # Проверка кулдауна поиска (VIP+ — x0.25, VIP — x0.5)
-    vip_plus_active = db.is_vip_plus(user.id)
-    vip_active = db.is_vip(user.id)
-    
-    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-    if vip_plus_active:
-        search_cd = base_search_cd / 4  # x0.25 для VIP+
-    elif vip_active:
-        search_cd = base_search_cd / 2  # x0.5 для VIP
-    else:
-        search_cd = base_search_cd       # x1.0 для обычных
+    access = _get_access_profile(user, player=player)
+    search_cd = _effective_search_cooldown(access)
     last_search_val = float(getattr(player, 'last_search', 0) or 0)
     search_time_left = max(0, search_cd - (time.time() - last_search_val))
     lang = getattr(player, 'language', 'ru') or 'ru'
@@ -711,27 +1279,7 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         bonus_status = f"{base_bonus} ✅"
 
-    # Формируем текст статуса VIP
-    vip_status_text = ""
-    if vip_plus_active:
-        vip_plus_until_val = int(getattr(player, 'vip_plus_until', 0) or 0)
-        vip_until = safe_format_timestamp(vip_plus_until_val, '%d.%m.%Y %H:%M')
-        if lang == 'ru':
-            vip_status_text = f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_until})"
-        else:
-            vip_status_text = f"💎 <b>Status:</b> {VIP_PLUS_EMOJI} V.I.P+ (until {vip_until})"
-    elif vip_active:
-        vip_until_val = int(getattr(player, 'vip_until', 0) or 0)
-        vip_until = safe_format_timestamp(vip_until_val, '%d.%m.%Y %H:%M')
-        if lang == 'ru':
-            vip_status_text = f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until})"
-        else:
-            vip_status_text = f"👑 <b>Status:</b> {VIP_EMOJI} V.I.P (until {vip_until})"
-    else:
-        if lang == 'ru':
-            vip_status_text = "📊 <b>Статус:</b> Обычный игрок"
-        else:
-            vip_status_text = "📊 <b>Status:</b> Regular player"
+    vip_status_text = _status_text_from_access(access, lang)
 
     # Получаем количество энергетиков в инвентаре
     energy_count = len(db.get_player_inventory_with_details(user.id))
@@ -764,14 +1312,13 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
     # Улучшенная структура кнопок
-    bonus_info_label = "ℹ️ Инфо" if lang != 'en' else "ℹ️ Info"
+    quick_access_target = str(getattr(player, 'quick_access_target', '') or '').strip()
+    quick_access_callback = quick_access_target if quick_access_target in QUICK_ACCESS_OPTIONS else 'settings_quick_access'
+    quick_access_label = _quick_access_label(quick_access_target, lang)
     keyboard = [
         # Основные действия
         [InlineKeyboardButton(search_status, callback_data='find_energy')],
-        [
-            InlineKeyboardButton(bonus_status, callback_data='claim_bonus'),
-            InlineKeyboardButton(bonus_info_label, callback_data='daily_bonus_info'),
-        ],
+        [InlineKeyboardButton(bonus_status, callback_data='claim_bonus')],
         # Бонусы и города в одной строке
         [
             InlineKeyboardButton("🎁 Бонусы", callback_data='extra_bonuses'),
@@ -784,9 +1331,13 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("🛒 Свага Шоп", callback_data='swaga_shop')],
         [InlineKeyboardButton("🎟 Промокод", callback_data='promo_enter')],
+        # Донат
+        [InlineKeyboardButton(t(lang, 'donate_btn'), callback_data='donate_menu')],
         # Настройки
         [InlineKeyboardButton(t(lang, 'settings'), callback_data='settings')],
     ]
+    if access.get('quick_access_eligible'):
+        keyboard.insert(3, [InlineKeyboardButton(f"⚡ {quick_access_label}", callback_data=quick_access_callback)])
     
     # Добавляем кнопку "Админ панель" для всех админ-уровней и Создателя
     if has_admin_panel_access(user.id, user.username):
@@ -950,793 +1501,6 @@ async def show_admin_grants_menu(update: Update, context: ContextTypes.DEFAULT_T
     except BadRequest:
         pass
 
-
-async def show_admin_settings_autosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-
-    base_limit = db.get_setting_int('auto_search_daily_limit_base', AUTO_SEARCH_DAILY_LIMIT)
-    vip_mult = db.get_setting_float('auto_search_vip_daily_mult', 1.0)
-    vip_plus_mult = db.get_setting_float('auto_search_vip_plus_daily_mult', 2.0)
-
-    text = (
-        "🤖 <b>Автопоиск — лимиты</b>\n\n"
-        f"Базовый дневной лимит: <b>{int(base_limit)}</b>\n"
-        f"VIP множитель: <b>{vip_mult}</b>\n"
-        f"VIP+ множитель: <b>{vip_plus_mult}</b>\n\n"
-        "Выберите, что изменить:"
-    )
-    kb = [
-        [InlineKeyboardButton("Изменить базовый лимит", callback_data='admin_settings_set_auto_base')],
-        [InlineKeyboardButton("Изменить VIP множитель", callback_data='admin_settings_set_auto_vip_mult')],
-        [InlineKeyboardButton("Изменить VIP+ множитель", callback_data='admin_settings_set_auto_vip_plus_mult')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
-    ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def show_admin_settings_gift_protection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await query.answer()
-    except BadRequest:
-        pass
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-
-    settings = db.get_gift_autoblock_settings()
-    duration_sec = int(settings['duration_sec'])
-    duration_days = round(duration_sec / 86400, 2)
-    status_text = "включена" if settings['enabled'] else "выключена"
-    toggle_text = "Выключить защиту" if settings['enabled'] else "Включить защиту"
-
-    text = (
-        "🎁 <b>Gift-защита</b>\n\n"
-        f"Статус: <b>{status_text}</b>\n"
-        f"Лимит подряд одному получателю: <b>{int(settings['consecutive_limit'])}</b>\n"
-        f"Длительность блокировки: <b>{duration_sec}</b> сек. ({duration_days} дн., {_format_duration_compact(duration_sec)})\n\n"
-        "Настройки применяются к автоматической anti-abuse блокировке в системе подарков."
-    )
-    kb = [
-        [InlineKeyboardButton(f"🛡️ {toggle_text}", callback_data='admin_settings_gift_toggle')],
-        [InlineKeyboardButton("🔢 Изменить лимит подряд", callback_data='admin_settings_set_gift_limit')],
-        [InlineKeyboardButton("⏳ Изменить длительность", callback_data='admin_settings_set_gift_duration')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
-    ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_settings_set_gift_limit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_gift_protection')]]
-    try:
-        await query.message.edit_text(
-            "Введите новый лимит подряд одному получателю (целое число ≥ 1):",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_gift_limit'
-
-
-async def admin_settings_set_gift_duration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_gift_protection')]]
-    try:
-        await query.message.edit_text(
-            "Введите длительность gift-блокировки: <code>14d</code>, <code>12h</code> или <code>3600</code>.",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML',
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_gift_duration'
-
-
-async def show_admin_settings_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает настройки удачи в казино."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-
-    win_prob = db.get_setting_float('casino_win_prob', CASINO_WIN_PROB)
-    win_prob = max(0.0, min(1.0, float(win_prob)))
-    percent = round(win_prob * 100, 2)
-    luck_mult = db.get_setting_float('casino_luck_mult', 1.0)
-    try:
-        luck_mult = float(luck_mult)
-    except Exception:
-        luck_mult = 1.0
-    luck_mult = max(0.1, min(5.0, luck_mult))
-
-    text = (
-        "🎰 <b>Настройки казино — удача</b>\n\n"
-        f"Шанс победы (классические ставки): <b>{percent}%</b>\n"
-        f"Внутреннее значение: <b>{win_prob}</b>\n\n"
-        f"Множитель удачи (все игры): <b>x{luck_mult}</b>\n\n"
-        "Применяется к:\n"
-        "• Быстрые ставки в казино\n"
-        "• Пользовательские ставки\n\n"
-        "• Все игры в казино (общий шанс)\n\n"
-        "Выберите действие:"
-    )
-
-    kb = [
-        [InlineKeyboardButton("🎲 Изменить шанс победы", callback_data='admin_settings_set_casino_win_prob')],
-        [InlineKeyboardButton("🍀 Множитель удачи", callback_data='admin_settings_set_casino_luck_mult')],
-        [InlineKeyboardButton("♻️ Сбросить шанс", callback_data='admin_settings_casino_reset_prob')],
-        [InlineKeyboardButton("♻️ Сбросить удачу", callback_data='admin_settings_casino_reset_luck')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
-    ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_settings_set_casino_win_prob_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_casino')]]
-    text = (
-        "🎲 <b>Шанс победы в казино</b>\n\n"
-        "Введите число:\n"
-        "• от 0 до 1 (например, 0.35)\n"
-        "• или в процентах 1–99 (например, 35)\n\n"
-        "Текущая настройка влияет на классические ставки."
-    )
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_casino_win_prob'
-
-
-async def admin_settings_set_casino_luck_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_casino')]]
-    text = (
-        "🍀 <b>Множитель удачи в казино</b>\n\n"
-        "Увеличивает шанс победы во всех играх.\n"
-        "Введите число (например 1.2, 1.5, 2):\n"
-        "• 1.0 — без изменений\n"
-        "• 1.5 — +50% к шансам\n"
-        "• 2.0 — в 2 раза больше\n"
-    )
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_casino_luck_mult'
-
-
-async def admin_settings_set_auto_base_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_autosearch')]]
-    try:
-        await query.message.edit_text("Введите новый базовый дневной лимит автопоиска (целое число ≥ 0):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_auto_base'
-
-
-async def admin_settings_set_auto_vip_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_autosearch')]]
-    try:
-        await query.message.edit_text("Введите VIP множитель дневного лимита (число ≥ 0, например 1 или 1.5):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_auto_vip_mult'
-
-
-async def admin_settings_set_auto_vip_plus_mult_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_autosearch')]]
-    try:
-        await query.message.edit_text("Введите VIP+ множитель дневного лимита (число ≥ 0, например 2):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_auto_vip_plus_mult'
-
-
-async def admin_player_rating_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    player_id = None
-    if query.data and ':' in query.data:
-        parts = query.data.split(':')
-        if len(parts) > 1:
-            try:
-                player_id = int(parts[1])
-            except ValueError:
-                pass
-    
-    if not player_id:
-        await query.answer("❌ Ошибка: ID игрока не указан", show_alert=True)
-        return
-    
-    context.user_data['admin_player_action'] = 'rating'
-    context.user_data['admin_player_id'] = player_id
-    
-    dbs = SessionLocal()
-    try:
-        player = dbs.query(Player).filter(Player.user_id == player_id).first()
-        if player:
-            username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
-            current_rating = int(getattr(player, 'rating', 0) or 0)
-            text = (
-                f"⭐ <b>Изменение рейтинга</b>\n\n"
-                f"Игрок: {username_display}\n"
-                f"Текущий рейтинг: <b>{current_rating}</b> ⭐\n\n"
-                f"Отправьте новое значение рейтинга или изменение:\n"
-                f"• <code>100</code> - установить\n"
-                f"• <code>+10</code> - добавить\n"
-                f"• <code>-5</code> - убрать\n\n"
-                f"Диапазон: 0..1000\n\n"
-                f"Или нажмите Отмена"
-            )
-        else:
-            text = "❌ Игрок не найден!"
-    finally:
-        dbs.close()
-    
-    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data=f'admin_player_details:{player_id}')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def creator_wipe_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not (user.username and user.username in ADMIN_USERNAMES):
-        await query.answer("⛔ Доступ только Создателю!", show_alert=True)
-        return
-    kb = [
-        [InlineKeyboardButton("✅ Подтвердить вайп", callback_data='creator_wipe_confirm')],
-        [InlineKeyboardButton("❌ Отмена", callback_data='creator_panel')],
-    ]
-    try:
-        await query.message.edit_text(
-            "⚠️ Вы собираетесь выполнить ПОЛНЫЙ ВАЙП данных.\n\n"
-            "Будут удалены все пользователи, инвентари, логи, промокоды, настройки и прочее.\n"
-            "Список энергетиков будет сохранён.\n\n"
-            "Подтверждаете?",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-
-
-async def creator_wipe_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not (user.username and user.username in ADMIN_USERNAMES):
-        await query.answer("⛔ Доступ только Создателю!", show_alert=True)
-        return
-    try:
-        users = db.get_all_users_for_broadcast()
-    except Exception:
-        users = []
-    try:
-        groups = db.get_enabled_group_chats()
-    except Exception:
-        groups = []
-    notify_text = (
-        "🧨 Глобальный вайп данных бота выполнен.\n\n"
-        "Все пользовательские данные и прогресс были сброшены.\n"
-        "Список энергетиков сохранён."
-    )
-    ok_u = 0
-    ok_g = 0
-    # Сначала уведомляем группы
-    for g in groups or []:
-        try:
-            await context.bot.send_message(chat_id=getattr(g, 'chat_id', None), text=notify_text)
-            ok_g += 1
-            await asyncio.sleep(0.02)
-        except Exception:
-            pass
-    # Затем пользователей
-    for uid in users or []:
-        try:
-            await context.bot.send_message(chat_id=uid, text=notify_text)
-            ok_u += 1
-            await asyncio.sleep(0.02)
-        except Exception:
-            pass
-    try:
-        db.insert_moderation_log(actor_id=user.id, action='wipe_all', details=f'groups={ok_g}, users={ok_u}')
-    except Exception:
-        pass
-    res = False
-    try:
-        res = db.wipe_all_except_drinks()
-    except Exception:
-        res = False
-    text = "✅ Вайп выполнен" if res else "❌ Ошибка при вайпе"
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')]]))
-    except BadRequest:
-        pass
-
-async def admin_mod_ban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
-    try:
-        await query.message.edit_text(
-            "🚫 Бан пользователя\n\nОтправьте: <code>@username</code> или <code>user_id</code> и опционально длительность (например: 1d, 12h, 30m) и причину.\nПримеры:\n<code>@user 7d спам</code>\n<code>123456 1h флуд</code>\n<code>@user</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'mod_ban'
-
-
-async def admin_mod_unban_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
-    try:
-        await query.message.edit_text(
-            "✅ Разбан пользователя\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'mod_unban'
-
-
-async def admin_mod_banlist_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    items = db.list_active_bans(limit=50)
-    if not items:
-        text = "📋 Активные баны: нет"
-    else:
-        lines = ["📋 Активные баны:"]
-        for it in items:
-            uid = it['user_id']
-            until = it.get('banned_until')
-            until_str = safe_format_timestamp(until) if until else 'навсегда'
-            reason = it.get('reason') or '—'
-            lines.append(f"• {uid} — до: {until_str} — {reason}")
-        text = "\n".join(lines)
-    kb = [[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-
-
-async def admin_mod_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_moderation_menu')]]
-    try:
-        await query.message.edit_text(
-            "🔍 Проверка игрока\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'mod_check'
-
-
-async def admin_mod_history_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    logs = db.get_moderation_logs(limit=30)
-    if not logs:
-        text = "📝 История модерации пуста"
-    else:
-        lines = ["📝 История модерации:"]
-        for r in logs:
-            ts = safe_format_timestamp(r.get('ts')) or '—'
-            act = r.get('action')
-            tgt = r.get('target_id')
-            det = r.get('details') or ''
-            lines.append(f"• {ts} — {act} → {tgt} {('— ' + det) if det else ''}")
-        text = "\n".join(lines[:50])
-    kb = [[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-
-
-async def admin_mod_warnings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Выдать предупреждение", callback_data='admin_warn_add')],
-        [InlineKeyboardButton("📄 Список предупреждений", callback_data='admin_warn_list')],
-        [InlineKeyboardButton("🗑️ Очистить предупреждения", callback_data='admin_warn_clear')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')],
-    ])
-    try:
-        await query.message.edit_text("⚠️ Предупреждения: выберите действие", reply_markup=kb)
-    except BadRequest:
-        pass
-
-
-async def admin_warn_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_admin_level(query.from_user.id, query.from_user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
-    try:
-        await query.message.edit_text(
-            "➕ Выдать предупреждение\n\nОтправьте: <code>@username</code> или <code>user_id</code> и причину\nПример: <code>@user спам</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'warn_add'
-
-
-async def admin_warn_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_admin_level(query.from_user.id, query.from_user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
-    try:
-        await query.message.edit_text(
-            "📄 Список предупреждений\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'warn_list'
-
-
-async def admin_warn_clear_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_admin_level(query.from_user.id, query.from_user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_warnings')]]
-    try:
-        await query.message.edit_text(
-            "🗑️ Очистка предупреждений\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'warn_clear'
-
-
-async def admin_mod_gift_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    items = db.list_active_gift_restrictions(limit=50)
-    text = (
-        "🎁 <b>Gift-блокировки</b>\n\n"
-        f"Активных блокировок: <b>{len(items)}</b>\n\n"
-        "Здесь можно просматривать, выдавать и снимать ограничения только на систему подарков."
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Активные gift-блокировки", callback_data='admin_mod_gift_list')],
-        [InlineKeyboardButton("➕ Выдать / переустановить", callback_data='admin_mod_gift_block')],
-        [InlineKeyboardButton("✅ Снять gift-блокировку", callback_data='admin_mod_gift_unblock')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')],
-    ])
-    try:
-        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_mod_gift_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    items = db.list_active_gift_restrictions(limit=50)
-    if not items:
-        text = "🎁 Активные gift-блокировки: нет"
-    else:
-        lines = ["🎁 <b>Активные gift-блокировки</b>"]
-        for it in items:
-            label = _format_player_label(it['user_id'], it.get('username'), it.get('display_name'))
-            until_str = safe_format_timestamp(it.get('blocked_until')) or '—'
-            source = "авто" if it.get('source') == 'auto' else f"admin:{it.get('blocked_by')}"
-            reason = html.escape(it.get('reason') or '—')
-            lines.append(
-                f"• {html.escape(label)} — до: <b>{until_str}</b>\n"
-                f"  Причина: {reason}\n"
-                f"  Источник: {source}"
-            )
-        text = "\n".join(lines[:51])
-    kb = [[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_mod_gift_block_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_gift_menu')]]
-    try:
-        await query.message.edit_text(
-            "➕ Gift-блокировка\n\n"
-            "Отправьте: <code>@username</code> или <code>user_id</code>, опционально длительность и причину.\n"
-            "Примеры:\n"
-            "<code>@user 14d подозрительная серия</code>\n"
-            "<code>123456789 3600 тест</code>\n"
-            "<code>@user</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'mod_gift_block'
-
-
-async def admin_mod_gift_unblock_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_mod_gift_menu')]]
-    try:
-        await query.message.edit_text(
-            "✅ Снять gift-блокировку\n\nОтправьте: <code>@username</code> или <code>user_id</code>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='HTML'
-        )
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'mod_gift_unblock'
-
-
-def _parse_duration_to_seconds(s: str | None) -> int | None:
-    if not s:
-        return None
-    s = s.strip().lower()
-    m = re.fullmatch(r"(\d+)([smhd])", s)
-    if not m:
-        try:
-            val = int(s)
-            return val if val > 0 else None
-        except Exception:
-            return None
-    num = int(m.group(1))
-    unit = m.group(2)
-    mult = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}.get(unit, 1)
-    return num * mult
-
-
-def _format_duration_compact(seconds: int | None) -> str:
-    if not seconds:
-        return "—"
-    total = max(0, int(seconds))
-    days, rem = divmod(total, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, secs = divmod(rem, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}д")
-    if hours:
-        parts.append(f"{hours}ч")
-    if minutes:
-        parts.append(f"{minutes}м")
-    if secs or not parts:
-        parts.append(f"{secs}с")
-    return " ".join(parts[:3])
-
-
-def _format_player_label(user_id: int, username: str | None = None, display_name: str | None = None) -> str:
-    if username:
-        return f"@{username}"
-    if display_name:
-        return str(display_name)
-    return f"ID:{user_id}"
-
-
-def _resolve_user_identifier(text: str) -> int | None:
-    t = (text or '').strip()
-    if not t:
-        return None
-    res = db.find_player_by_identifier(t)
-    if res.get('ok') and res.get('player'):
-        return int(getattr(res['player'], 'user_id', 0) or 0) or None
-    try:
-        return int(t)
-    except Exception:
-        return None
-
-
-async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Проверяет бан пользователя и, если активен, показывает причину и блокирует действие."""
-    try:
-        user = update.effective_user
-        if not user:
-            return False
-        ban = db.get_active_ban(user.id)
-        if not ban:
-            return False
-        reason = ban.get('reason') or '—'
-        until = ban.get('banned_until')
-        until_str = safe_format_timestamp(until) if until else 'навсегда'
-        text = (
-            "🚫 Ваш аккаунт заблокирован.\n"
-            f"Причина: {html.escape(reason)}\n"
-            f"Срок: {until_str}"
-        )
-        q = getattr(update, 'callback_query', None)
-        if q:
-            try:
-                await q.answer(text, show_alert=True)
-            except Exception:
-                pass
-        else:
-            try:
-                await reply_auto_delete_message(update.effective_message, text, context=context)
-            except Exception:
-                pass
-        return True
-    except Exception:
-        return False
-
-
-async def show_admin_settings_cooldowns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-    bonus_cd = db.get_setting_int('daily_bonus_cooldown', DAILY_BONUS_COOLDOWN)
-    text = (
-        "⏱️ <b>Кулдауны</b>\n\n"
-        f"Поиск: <b>{int(search_cd // 60)} мин</b> ({search_cd} сек)\n"
-        f"Ежедневный бонус: <b>{int(bonus_cd // 3600)} ч</b> ({bonus_cd} сек)\n\n"
-        "Выберите, что изменить:"
-    )
-    kb = [
-        [InlineKeyboardButton("Изменить поиск", callback_data='admin_settings_set_search_cd')],
-        [InlineKeyboardButton("Изменить бонус", callback_data='admin_settings_set_bonus_cd')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
-    ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_settings_set_search_cd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_cooldowns')]]
-    try:
-        await query.message.edit_text("Введите новый кулдаун поиска в секундах:", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_search_cd'
-
-
-async def admin_settings_set_bonus_cd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_cooldowns')]]
-    try:
-        await query.message.edit_text("Введите новый кулдаун ежедневного бонуса в секундах:", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_bonus_cd'
 
 async def creator_reset_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает процесс сброса ежедневного бонуса."""
@@ -1915,6 +1679,9 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await handle_player_rating(update, context, text_input)
         context.user_data.pop('admin_player_action', None)
         context.user_data.pop('admin_player_id', None)
+    elif action and await handle_modular_admin_action(update, context, action, text_input):
+        if context.user_data.get('awaiting_admin_action') == initial_action:
+            context.user_data.pop('awaiting_admin_action', None)
     elif action:
         if action == 'drink_add':
             await handle_drink_add(update, context, text_input)
@@ -1947,9 +1714,9 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 old_name = (d or {}).get('name') if isinstance(d, dict) else None
                 lines = []
                 if old_name is not None:
-                    lines.append(f"Изменить название: <b>{old_name}</b> → <b>{text_input}</b>")
+                    lines.append(f"Изменить название: <b>{esc(old_name)}</b> → <b>{esc(text_input)}</b>")
                 else:
-                    lines.append(f"Изменить название на: <b>{text_input}</b>")
+                    lines.append(f"Изменить название на: <b>{esc(text_input)}</b>")
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Подтвердить", callback_data='drink_confirm_rename')],
                     [InlineKeyboardButton("❌ Отмена", callback_data='drink_cancel_rename')]
@@ -2003,456 +1770,11 @@ async def admin_handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     return
             except Exception:
                 await update.message.reply_html("❌ ID должен быть числом", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='admin_drinks_menu')]]))
-        elif action == 'logs_player':
-            await handle_logs_player(update, context, text_input)
-        elif action == 'promo_create':
-            await handle_promo_create(update, context, text_input)
-        elif action == 'promo_deactivate':
-            await handle_promo_deactivate(update, context, text_input)
-        elif action == 'promo_wiz_code':
-            await handle_promo_wiz_code(update, context, text_input)
-        elif action == 'promo_wiz_value':
-            await handle_promo_wiz_value(update, context, text_input)
-        elif action == 'promo_wiz_max_uses':
-            await handle_promo_wiz_max_uses(update, context, text_input)
-        elif action == 'promo_wiz_per_user':
-            await handle_promo_wiz_per_user(update, context, text_input)
-        elif action == 'promo_wiz_expires':
-            await handle_promo_wiz_expires(update, context, text_input)
         elif action == 'broadcast':
             if getattr(update.message, 'audio', None):
                 await handle_admin_broadcast_audio(update, context, text_input)
             else:
                 await handle_admin_broadcast(update, context, text_input)
-        elif action == 'settings_set_search_cd':
-            kb = [[InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')]]
-            try:
-                new_cd = int(text_input.strip())
-                if new_cd <= 0:
-                    raise ValueError
-                ok = db.set_setting_int('search_cooldown', new_cd)
-                if ok:
-                    await update.message.reply_html(f"✅ Кулдаун поиска обновлён: <b>{new_cd}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число секунд (>0)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_bonus_cd':
-            kb = [[InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')]]
-            try:
-                new_cd = int(text_input.strip())
-                if new_cd <= 0:
-                    raise ValueError
-                ok = db.set_setting_int('daily_bonus_cooldown', new_cd)
-                if ok:
-                    await update.message.reply_html(f"✅ Кулдаун ежедневного бонуса обновлён: <b>{new_cd}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число секунд (>0)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_auto_base':
-            kb = [[InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')]]
-            try:
-                new_val = int(text_input.strip())
-                if new_val < 0:
-                    raise ValueError
-                ok = db.set_setting_int('auto_search_daily_limit_base', new_val)
-                if ok:
-                    await update.message.reply_html(f"✅ Базовый дневной лимит автопоиска обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число (≥ 0)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_auto_vip_mult':
-            kb = [[InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')]]
-            try:
-                new_val = float(text_input.strip().replace(',', '.'))
-                if new_val < 0:
-                    raise ValueError
-                ok = db.set_setting_float('auto_search_vip_daily_mult', new_val)
-                if ok:
-                    await update.message.reply_html(f"✅ VIP множитель обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите число (≥ 0), например 1 или 1.5", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_auto_vip_plus_mult':
-            kb = [[InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')]]
-            try:
-                new_val = float(text_input.strip().replace(',', '.'))
-                if new_val < 0:
-                    raise ValueError
-                ok = db.set_setting_float('auto_search_vip_plus_daily_mult', new_val)
-                if ok:
-                    await update.message.reply_html(f"✅ VIP+ множитель обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите число (≥ 0), например 2", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_gift_limit':
-            kb = [[InlineKeyboardButton("🎁 Gift-защита", callback_data='admin_settings_gift_protection')]]
-            try:
-                new_val = int(text_input.strip())
-                if new_val < 1:
-                    raise ValueError
-                ok = db.set_setting_int('gift_autoblock_consecutive_limit', new_val)
-                if ok:
-                    await update.message.reply_html(
-                        f"✅ Лимит gift-защиты обновлён: <b>{new_val}</b>",
-                        reply_markup=InlineKeyboardMarkup(kb),
-                    )
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число (≥ 1)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_gift_duration':
-            kb = [[InlineKeyboardButton("🎁 Gift-защита", callback_data='admin_settings_gift_protection')]]
-            try:
-                duration_sec = _parse_duration_to_seconds(text_input.strip())
-                if not duration_sec:
-                    raise ValueError
-                ok = db.set_setting_int('gift_autoblock_duration_sec', int(duration_sec))
-                if ok:
-                    await update.message.reply_html(
-                        f"✅ Длительность gift-блокировки обновлена: <b>{duration_sec}</b> сек. ({_format_duration_compact(duration_sec)})",
-                        reply_markup=InlineKeyboardMarkup(kb),
-                    )
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите длительность в формате 14d, 12h или 3600", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_fertilizer_max':
-            kb = [[InlineKeyboardButton("💰 Лимиты", callback_data='admin_settings_limits')]]
-            try:
-                new_val = int(text_input.strip())
-                if new_val < 1:
-                    raise ValueError
-                ok = db.set_setting_int('plantation_fertilizer_max_per_bed', new_val)
-                if ok:
-                    await update.message.reply_html(f"✅ Лимит удобрений обновлён: <b>{new_val}</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число (≥ 1)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_neg_interval':
-            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
-            try:
-                new_val = int(text_input.strip())
-                if new_val < 60:
-                    raise ValueError
-                ok = db.set_setting_int('plantation_negative_event_interval_sec', new_val)
-                if ok:
-                    await update.message.reply_html(f"✅ Интервал обновлён: <b>{new_val}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число (≥ 60)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_neg_chance':
-            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
-            raw = (text_input or '').strip().replace(',', '.')
-            try:
-                val = float(raw)
-                if val > 1:
-                    val = val / 100.0
-                if val <= 0 or val > 1:
-                    raise ValueError
-                ok = db.set_setting_float('plantation_negative_event_chance', val)
-                if ok:
-                    await update.message.reply_html(f"✅ Шанс обновлён: <b>{round(val * 100, 2)}%</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите число 0..1 или проценты 1–100", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_neg_max_active':
-            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
-            raw = (text_input or '').strip().replace(',', '.')
-            try:
-                val = float(raw)
-                if val > 1:
-                    val = val / 100.0
-                if val <= 0 or val > 1:
-                    raise ValueError
-                ok = db.set_setting_float('plantation_negative_event_max_active', val)
-                if ok:
-                    await update.message.reply_html(f"✅ Лимит активных обновлён: <b>{round(val * 100, 2)}%</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите число 0..1 или проценты 1–100", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_neg_duration':
-            kb = [[InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')]]
-            try:
-                new_val = int(text_input.strip())
-                if new_val < 60:
-                    raise ValueError
-                ok = db.set_setting_int('plantation_negative_event_duration_sec', new_val)
-                if ok:
-                    await update.message.reply_html(f"✅ Длительность обновлена: <b>{new_val}</b> сек.", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите целое число (≥ 60)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_casino_win_prob':
-            kb = [[InlineKeyboardButton("🎰 Казино", callback_data='admin_settings_casino')]]
-            raw = (text_input or '').strip().replace(',', '.')
-            try:
-                val = float(raw)
-                # Если ввели в процентах (1..99), переводим в доли
-                if val > 1:
-                    val = val / 100.0
-                if val <= 0 or val >= 1:
-                    raise ValueError
-                ok = db.set_setting_float('casino_win_prob', val)
-                if ok:
-                    await update.message.reply_html(f"✅ Шанс победы обновлён: <b>{round(val * 100, 2)}%</b> (={val})", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите число от 0 до 1 или процент 1–99", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'settings_set_casino_luck_mult':
-            kb = [[InlineKeyboardButton("🎰 Казино", callback_data='admin_settings_casino')]]
-            raw = (text_input or '').strip().replace(',', '.')
-            try:
-                val = float(raw)
-                if val < 0.1 or val > 5:
-                    raise ValueError
-                ok = db.set_setting_float('casino_luck_mult', val)
-                if ok:
-                    await update.message.reply_html(f"✅ Множитель удачи обновлён: <b>x{val}</b>", reply_markup=InlineKeyboardMarkup(kb))
-                else:
-                    await update.message.reply_html("❌ Не удалось сохранить настройку", reply_markup=InlineKeyboardMarkup(kb))
-            except Exception:
-                await update.message.reply_html("❌ Введите число от 0.1 до 5.0 (например 1.5)", reply_markup=InlineKeyboardMarkup(kb))
-        elif action == 'mod_ban':
-            # Формат: <id|@username> [duration] [reason...]
-            parts = text_input.split(maxsplit=2)
-            if not parts:
-                await update.message.reply_html("❌ Укажите пользователя. Пример: <code>@user 7d спам</code>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]))
-            else:
-                ident = parts[0]
-                duration_sec = None
-                reason = None
-                if len(parts) >= 2:
-                    d = _parse_duration_to_seconds(parts[1])
-                    if d:
-                        duration_sec = d
-                        if len(parts) == 3:
-                            reason = parts[2]
-                    else:
-                        # duration не распознан — считаем это началом причины
-                        reason = " ".join(parts[1:])
-                uid = _resolve_user_identifier(ident)
-                if not uid:
-                    await update.message.reply_html(
-                        "❌ Пользователь не найден.\n\n"
-                        "Подсказка:\n"
-                        "• Попросите пользователя написать боту /start (чтобы он появился в базе)\n"
-                        "• Либо введите его числовой ID",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]])
-                    )
-                else:
-                    if db.is_protected_user(uid):
-                        await update.message.reply_html(
-                            "⛔ Нельзя банить администратора или создателя",
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]])
-                        )
-                    else:
-                        ok = db.ban_user(uid, banned_by=update.effective_user.id, reason=reason, duration_seconds=duration_sec)
-                        if ok:
-                            until_str = None
-                            if duration_sec:
-                                until_str = safe_format_timestamp(int(time.time()) + int(duration_sec))
-                            text = f"✅ Пользователь {uid} забанен" + (f" до {until_str}" if until_str else " навсегда")
-                            if reason:
-                                text += f"\nПричина: {html.escape(reason)}"
-                            await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]]))
-                        else:
-                            await update.message.reply_html("❌ Не удалось забанить пользователя", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]))
-        elif action == 'mod_unban':
-            ident = text_input.strip()
-            uid = _resolve_user_identifier(ident)
-            if not uid:
-                await update.message.reply_html(
-                    "❌ Пользователь не найден.\n\n"
-                    "Подсказка:\n"
-                    "• Попросите пользователя написать боту /start\n"
-                    "• Либо введите его числовой ID",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]])
-                )
-            else:
-                ok = db.unban_user(uid, unbanned_by=update.effective_user.id)
-                await update.message.reply_html("✅ Пользователь разбанен" if ok else "❌ Не удалось разбанить пользователя", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]]))
-        elif action == 'mod_check':
-            ident = text_input.strip()
-            uid = _resolve_user_identifier(ident)
-            if not uid:
-                await update.message.reply_html("❌ Пользователь не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_moderation_menu')]]))
-            else:
-                player = db.get_player(uid)
-                banned = db.is_user_banned(uid)
-                gift_restriction = db.get_gift_restriction_info(uid)
-                warns = db.get_warnings(uid, limit=50)
-                vip = db.is_vip(uid)
-                vip_plus = db.is_vip_plus(uid)
-                username = getattr(player, 'username', None) if player else None
-                gift_status = "✅ Активен"
-                if gift_restriction:
-                    until = safe_format_timestamp(gift_restriction.get('blocked_until')) or '—'
-                    gift_status = f"🚫 Gift-блок до {until}"
-                text_lines = [
-                    "🔍 <b>Проверка игрока</b>",
-                    f"ID: <b>{uid}</b>",
-                    f"Username: <b>@{html.escape(username)}</b>" if username else "Username: —",
-                    f"Баланс: <b>{getattr(player, 'coins', 0) if player else 0}</b>",
-                    f"VIP: {'активен' if vip else '—'} | VIP+: {'активен' if vip_plus else '—'}",
-                    f"Статус: {'🚫 Забанен' if banned else '✅ Активен'}",
-                    f"Gift-статус: {gift_status}",
-                    f"Предупреждений: <b>{len(warns)}</b>",
-                ]
-                if gift_restriction:
-                    text_lines.append(f"Gift-причина: {html.escape(gift_restriction.get('reason') or '—')}")
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Модерация", callback_data='admin_moderation_menu')]])
-                await update.message.reply_html("\n".join(text_lines), reply_markup=kb)
-        elif action == 'mod_gift_block':
-            parts = text_input.split(maxsplit=2)
-            if not parts:
-                await update.message.reply_html(
-                    "❌ Укажите пользователя. Пример: <code>@user 14d подозрительная серия</code>",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
-                )
-            else:
-                ident = parts[0]
-                duration_sec = None
-                reason = None
-                if len(parts) >= 2:
-                    parsed_duration = _parse_duration_to_seconds(parts[1])
-                    if parsed_duration:
-                        duration_sec = parsed_duration
-                        if len(parts) == 3:
-                            reason = parts[2]
-                    else:
-                        reason = " ".join(parts[1:])
-                if duration_sec is None:
-                    duration_sec = db.get_gift_autoblock_settings()['duration_sec']
-                uid = _resolve_user_identifier(ident)
-                if not uid:
-                    await update.message.reply_html(
-                        "❌ Пользователь не найден.\n\n"
-                        "Подсказка:\n"
-                        "• Попросите пользователя написать боту /start\n"
-                        "• Либо введите его числовой ID",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]])
-                    )
-                else:
-                    block_reason = reason or "Ручная gift-блокировка администратором"
-                    blocked_until = int(time.time()) + int(duration_sec)
-                    ok = db.add_gift_restriction(
-                        uid,
-                        block_reason,
-                        blocked_until=blocked_until,
-                        blocked_by=update.effective_user.id,
-                    )
-                    if ok:
-                        try:
-                            db.insert_moderation_log(
-                                actor_id=update.effective_user.id,
-                                action='gift_block',
-                                target_id=uid,
-                                details=block_reason,
-                            )
-                        except Exception:
-                            pass
-                        await update.message.reply_html(
-                            "✅ Gift-блокировка выдана.\n"
-                            f"Пользователь: <b>{uid}</b>\n"
-                            f"До: <b>{safe_format_timestamp(blocked_until) or '—'}</b>\n"
-                            f"Длительность: <b>{_format_duration_compact(duration_sec)}</b>\n"
-                            f"Причина: {html.escape(block_reason)}",
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
-                        )
-                    else:
-                        await update.message.reply_html(
-                            "❌ Не удалось выдать gift-блокировку",
-                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
-                        )
-        elif action == 'mod_gift_unblock':
-            ident = text_input.strip()
-            uid = _resolve_user_identifier(ident)
-            if not uid:
-                await update.message.reply_html(
-                    "❌ Пользователь не найден.\n\n"
-                    "Подсказка:\n"
-                    "• Попросите пользователя написать боту /start\n"
-                    "• Либо введите его числовой ID",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]])
-                )
-            else:
-                ok = db.remove_gift_restriction(uid)
-                if ok:
-                    try:
-                        db.insert_moderation_log(
-                            actor_id=update.effective_user.id,
-                            action='gift_unblock',
-                            target_id=uid,
-                            details=None,
-                        )
-                    except Exception:
-                        pass
-                await update.message.reply_html(
-                    "✅ Gift-блокировка снята" if ok else "❌ Не удалось снять gift-блокировку",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Gift-блокировки", callback_data='admin_mod_gift_menu')]]),
-                )
-        elif action == 'warn_add':
-            parts = text_input.split(maxsplit=1)
-            if not parts:
-                await update.message.reply_html("❌ Укажите пользователя", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]]))
-            else:
-                ident = parts[0]
-                reason = parts[1] if len(parts) > 1 else None
-                uid = _resolve_user_identifier(ident)
-                if not uid:
-                    await update.message.reply_html(
-                        "❌ Пользователь не найден.\n\n"
-                        "Подсказка:\n"
-                        "• Попросите пользователя написать боту /start\n"
-                        "• Либо введите его числовой ID",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]])
-                    )
-                else:
-                    ok = db.add_warning(uid, issued_by=update.effective_user.id, reason=reason)
-                    await update.message.reply_html("✅ Предупреждение выдано" if ok else "❌ Не удалось выдать предупреждение", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
-        elif action == 'warn_list':
-            ident = text_input.strip()
-            uid = _resolve_user_identifier(ident)
-            if not uid:
-                await update.message.reply_html(
-                    "❌ Пользователь не найден.\n\n"
-                    "Подсказка:\n"
-                    "• Попросите пользователя написать боту /start\n"
-                    "• Либо введите его числовой ID",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]])
-                )
-            else:
-                items = db.get_warnings(uid, limit=50)
-                if not items:
-                    text = "📄 У пользователя нет предупреждений"
-                else:
-                    lines = ["📄 Предупреждения:"]
-                    for w in items:
-                        ts = safe_format_timestamp(w.get('issued_at')) or '—'
-                        rs = html.escape(w.get('reason') or '')
-                        lines.append(f"• {ts} — {rs}")
-                    text = "\n".join(lines[:100])
-                await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
-        elif action == 'warn_clear':
-            ident = text_input.strip()
-            uid = _resolve_user_identifier(ident)
-            if not uid:
-                await update.message.reply_html("❌ Пользователь не найден", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='admin_mod_warnings')]]))
-            else:
-                count = db.clear_warnings(uid)
-                await update.message.reply_html(f"🗑️ Удалено предупреждений: <b>{count}</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Предупреждения", callback_data='admin_mod_warnings')]]))
-        
         # Очищаем состояние только если обработчик не перевёл нас на следующий шаг.
         # (Например, мастер промокодов выставляет новый awaiting_admin_action на каждом шаге.)
         if context.user_data.get('awaiting_admin_action') == initial_action:
@@ -2549,13 +1871,13 @@ async def handle_drink_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
             drink_name = drink['name']
             success = db.admin_delete_drink(drink_id)
             if success:
-                response = f"✅ Энергетик <b>{drink_name}</b> (ID: {drink_id}) успешно удалён!"
+                response = f"✅ Энергетик <b>{esc(drink_name)}</b> (ID: {drink_id}) успешно удалён!"
                 # Логируем действие
                 db.log_action(
                     user_id=update.effective_user.id,
                     username=update.effective_user.username,
                     action_type='admin_action',
-                    action_details=f'Удалён энергетик: {drink_name} (ID: {drink_id})',
+                    action_details=f'Удалён энергетик: {esc(drink_name)} (ID: {drink_id})',
                     success=True
                 )
             else:
@@ -2574,7 +1896,7 @@ async def handle_drink_search(update: Update, context: ContextTypes.DEFAULT_TYPE
     drinks = db.search_drinks_by_name(text_input)
     
     if drinks:
-        response = f"🔍 <b>Результаты поиска: \"{text_input}\"</b>\n\n"
+        response = f"🔍 <b>Результаты поиска: \"{esc(text_input)}\"</b>\n\n"
         response += f"Найдено: <b>{len(drinks)}</b> напитков\n\n"
         
         for drink in drinks[:20]:  # Показываем первые 20
@@ -2586,47 +1908,7 @@ async def handle_drink_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(drinks) > 20:
             response += f"<i>...и ещё {len(drinks) - 20} напитков</i>"
     else:
-        response = f"❌ Напитки по запросу \"{text_input}\" не найдены"
-    
-    await update.message.reply_html(response, reply_markup=reply_markup)
-
-
-async def handle_logs_player(update: Update, context: ContextTypes.DEFAULT_TYPE, text_input: str):
-    """Обрабатывает просмотр логов конкретного игрока."""
-    keyboard = [[InlineKeyboardButton("📝 Логи системы", callback_data='admin_logs_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    player = None
-    res = db.find_player_by_identifier(text_input)
-    if res.get('ok') and res.get('player'):
-        player = res['player']
-    else:
-        try:
-            user_id = int(str(text_input).strip().lstrip('@'))
-            player = db.get_or_create_player(user_id, f"User{user_id}")
-        except Exception:
-            player = None
-    
-    if not player:
-        response = f"❌ Пользователь {text_input} не найден!"
-    else:
-        logs = db.get_user_logs(player.user_id, limit=15)
-        
-        response = f"👤 <b>Логи игрока @{player.username or player.user_id}</b>\n\n"
-        
-        if logs:
-            for log in logs:
-                status = "✅" if log['success'] else "❌"
-                timestamp_str = safe_format_timestamp(log['timestamp'])
-                response += f"{status} <i>{log['action_type']}</i>\n"
-                if log['action_details']:
-                    response += f"├ {log['action_details'][:50]}\n"
-                if log['amount']:
-                    sign = "+" if log['amount'] > 0 else ""
-                    response += f"├ {sign}{log['amount']} 💰\n"
-                response += f"└ {timestamp_str}\n\n"
-        else:
-            response += "<i>Логов для этого игрока пока нет</i>"
+        response = f"❌ Напитки по запросу \"{esc(text_input)}\" не найдены"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -2650,8 +1932,8 @@ async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE,
             player = res['player']
             db.set_daily_bonus_manual_ready(player.user_id)
             username = getattr(player, 'username', None)
-            shown = f"@{username}" if username else str(player.user_id)
-            response = f"✅ Ежедневный бонус сброшен для {shown}!"
+            shown = f"@{esc(username)}" if username else str(player.user_id)
+            response = f"✅ Ежедневный бонус сброшен для {esc(shown)}!"
         elif res.get('reason') == 'multiple':
             lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
             for c in (res.get('candidates') or []):
@@ -2659,7 +1941,7 @@ async def handle_reset_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
             response = "\n".join(lines)
         else:
-            response = f"❌ Пользователь {text_input} не найден!"
+            response = f"❌ Пользователь {esc(text_input)} не найден!"
     else:
         response = "❌ Неверный формат! Используйте @username или all"
     
@@ -2683,36 +1965,42 @@ async def handle_give_coins(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 amount = int(parts[0])
             else:
                 amount = int(parts[1])
-            res = db.find_player_by_identifier(ident)
-            if res.get('ok') and res.get('player'):
-                player = res['player']
-                username = getattr(player, 'username', None)
-                new_balance = db.increment_coins(player.user_id, amount)
-                # Логируем транзакцию
-                admin_user = update.effective_user
-                db.log_action(
-                    user_id=player.user_id,
-                    username=(username or str(player.user_id)),
-                    action_type='transaction',
-                    action_details=f'Админская выдача: выдано админом @{admin_user.username or admin_user.first_name}',
-                    amount=amount,
-                    success=True
-                )
-                shown = f"@{username}" if username else str(player.user_id)
-                response = f"✅ Выдано <b>{amount}</b> септимов пользователю {shown}\nНовый баланс: <b>{new_balance}</b>"
-            elif res.get('reason') == 'multiple':
-                lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
-                for c in (res.get('candidates') or []):
-                    cu = c.get('username')
-                    lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
-                response = "\n".join(lines)
+            # VULN-008 fix: запрещаем отрицательные и нулевые значения
+            if amount <= 0:
+                response = "❌ Количество должно быть положительным числом!"
+            elif amount > 10_000_000:
+                response = "❌ Максимальная сумма выдачи: 10 000 000 септимов за раз."
             else:
-                response = f"❌ Пользователь {ident} не найден!"
+                res = db.find_player_by_identifier(ident)
+                if res.get('ok') and res.get('player'):
+                    player = res['player']
+                    username = getattr(player, 'username', None)
+                    new_balance = db.increment_coins(player.user_id, amount)
+                    # Логируем транзакцию
+                    admin_user = update.effective_user
+                    db.log_action(
+                        user_id=player.user_id,
+                        username=(username or str(player.user_id)),
+                        action_type='transaction',
+                        action_details=f'Админская выдача: выдано админом @{esc(admin_user.username or admin_user.first_name)}',
+                        amount=amount,
+                        success=True
+                    )
+                    shown = f"@{html.escape(username)}" if username else str(player.user_id)
+                    response = f"✅ Выдано <b>{amount}</b> септимов пользователю {esc(shown)}\nНовый баланс: <b>{new_balance}</b>"
+                elif res.get('reason') == 'multiple':
+                    lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
+                    for c in (res.get('candidates') or []):
+                        cu = c.get('username')
+                        lines.append(f"- @{html.escape(str(cu))} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
+                    response = "\n".join(lines)
+                else:
+                    response = f"❌ Пользователь {html.escape(str(ident))} не найден!"
         except ValueError:
             response = "❌ Количество должно быть числом!"
         except Exception as e:
             logger.error(f"Ошибка выдачи монет: {e}")
-            response = f"❌ Ошибка: {e}"
+            response = f"❌ Ошибка: {html.escape(str(e))}"
     
     await update.message.reply_html(response, reply_markup=reply_markup)
 
@@ -2749,7 +2037,7 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 )
             
             response = (
-                f"📊 <b>Статистика пользователя @{username}</b>\n\n" if username else f"📊 <b>Статистика пользователя {player.user_id}</b>\n\n"
+                f"📊 <b>Статистика пользователя @{esc(username)}</b>\n\n" if username else f"📊 <b>Статистика пользователя {player.user_id}</b>\n\n"
                 f"<b>ID:</b> {player.user_id}\n"
                 f"<b>Баланс:</b> {player.coins} 🪙\n"
                 f"<b>Инвентарь:</b> {inventory_count} предметов\n"
@@ -2760,7 +2048,7 @@ async def handle_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"{bonus_extra}"
             )
         else:
-            response = f"❌ Пользователь {text_input} не найден!"
+            response = f"❌ Пользователь {esc(text_input)} не найден!"
     elif res.get('reason') == 'multiple':
         lines = ["❌ Найдено несколько пользователей, уточните запрос:"]
         for c in (res.get('candidates') or []):
@@ -2783,7 +2071,7 @@ async def handle_player_search(update: Update, context: ContextTypes.DEFAULT_TYP
     if res.get('reason') == 'multiple':
         keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        lines = [f"❌ Найдено несколько игроков по запросу: <code>{text_input}</code>", "", "Уточните запрос. Кандидаты:"]
+        lines = [f"❌ Найдено несколько игроков по запросу: <code>{esc(text_input)}</code>", "", "Уточните запрос. Кандидаты:"]
         for c in (res.get('candidates') or []):
             cu = c.get('username')
             lines.append(f"• @{cu} (ID: {c.get('user_id')})" if cu else f"• ID: {c.get('user_id')}")
@@ -2792,7 +2080,7 @@ async def handle_player_search(update: Update, context: ContextTypes.DEFAULT_TYP
 
     keyboard = [[InlineKeyboardButton("🔙 Управление игроками", callback_data='admin_players_menu')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    response = f"❌ Игрок не найден!\n\nВы искали: <code>{text_input}</code>\n\nИспользуйте:\n• <code>@username</code> или просто <code>username</code>\n• <code>user_id</code> (число)"
+    response = f"❌ Игрок не найден!\n\nВы искали: <code>{esc(text_input)}</code>\n\nИспользуйте:\n• <code>@username</code> или просто <code>username</code>\n• <code>user_id</code> (число)"
     await update.message.reply_html(response, reply_markup=reply_markup)
 
 
@@ -2816,7 +2104,7 @@ async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_html(response, reply_markup=reply_markup)
             return
         
-        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         current_balance = player.coins
         
         # Парсим ввод
@@ -2834,11 +2122,11 @@ async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TY
                     user_id=player_id,
                     username=username_display,
                     action_type='transaction',
-                    action_details=f'Админская выдача: добавлено админом @{admin_user.username or admin_user.first_name}',
+                    action_details=f'Админская выдача: добавлено админом @{esc(admin_user.username or admin_user.first_name)}',
                     amount=amount,
                     success=True
                 )
-                response = f"✅ Добавлено <b>{amount:,}</b> септимов игроку {username_display}\nНовый баланс: <b>{new_balance:,}</b> 🪙"
+                response = f"✅ Добавлено <b>{amount:,}</b> септимов игроку {esc(username_display)}\nНовый баланс: <b>{new_balance:,}</b> 🪙"
             except ValueError:
                 response = "❌ Неверный формат! Используйте число после +"
         elif text_input.startswith('-'):
@@ -2854,11 +2142,11 @@ async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TY
                         user_id=player_id,
                         username=username_display,
                         action_type='transaction',
-                        action_details=f'Админское снятие: убрано админом @{admin_user.username or admin_user.first_name}',
+                        action_details=f'Админское снятие: убрано админом @{esc(admin_user.username or admin_user.first_name)}',
                         amount=-amount,
                         success=True
                     )
-                    response = f"✅ Убрано <b>{amount:,}</b> септимов у игрока {username_display}\nНовый баланс: <b>{new_balance:,}</b> 🪙"
+                    response = f"✅ Убрано <b>{amount:,}</b> септимов у игрока {esc(username_display)}\nНовый баланс: <b>{new_balance:,}</b> 🪙"
                 else:
                     response = f"❌ {result.get('reason', 'Ошибка при уменьшении баланса')}"
             except ValueError:
@@ -2869,7 +2157,7 @@ async def handle_player_balance(update: Update, context: ContextTypes.DEFAULT_TY
                 amount = int(text_input)
                 db.update_player(player_id, coins=amount)
                 new_balance = amount
-                response = f"✅ Баланс игрока {username_display} установлен: <b>{new_balance:,}</b> 🪙"
+                response = f"✅ Баланс игрока {esc(username_display)} установлен: <b>{new_balance:,}</b> 🪙"
             except ValueError:
                 response = "❌ Неверный формат! Используйте число для установки баланса"
         
@@ -2899,7 +2187,7 @@ async def handle_player_rating(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_html(response, reply_markup=reply_markup)
             return
 
-        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         current_rating = int(getattr(player, 'rating', 0) or 0)
         text_input = (text_input or '').strip()
 
@@ -2917,11 +2205,11 @@ async def handle_player_rating(update: Update, context: ContextTypes.DEFAULT_TYP
                         user_id=player_id,
                         username=username_display,
                         action_type='admin_action',
-                        action_details=f'Админское изменение рейтинга: +{delta} (админ @{admin_user.username or admin_user.first_name})',
+                        action_details=f'Админское изменение рейтинга: +{delta} (админ @{esc(admin_user.username or admin_user.first_name)})',
                         amount=delta,
                         success=True
                     )
-                    response = f"✅ Рейтинг игрока {username_display}: <b>{current_rating}</b> → <b>{new_rating}</b> ⭐"
+                    response = f"✅ Рейтинг игрока {esc(username_display)}: <b>{current_rating}</b> → <b>{new_rating}</b> ⭐"
             except ValueError:
                 response = "❌ Неверный формат! Используйте число после +"
         elif text_input.startswith('-'):
@@ -2935,11 +2223,11 @@ async def handle_player_rating(update: Update, context: ContextTypes.DEFAULT_TYP
                         user_id=player_id,
                         username=username_display,
                         action_type='admin_action',
-                        action_details=f'Админское изменение рейтинга: -{delta} (админ @{admin_user.username or admin_user.first_name})',
+                        action_details=f'Админское изменение рейтинга: -{delta} (админ @{esc(admin_user.username or admin_user.first_name)})',
                         amount=-delta,
                         success=True
                     )
-                    response = f"✅ Рейтинг игрока {username_display}: <b>{current_rating}</b> → <b>{new_rating}</b> ⭐"
+                    response = f"✅ Рейтинг игрока {esc(username_display)}: <b>{current_rating}</b> → <b>{new_rating}</b> ⭐"
             except ValueError:
                 response = "❌ Неверный формат! Используйте число после -"
         else:
@@ -2953,11 +2241,11 @@ async def handle_player_rating(update: Update, context: ContextTypes.DEFAULT_TYP
                         user_id=player_id,
                         username=username_display,
                         action_type='admin_action',
-                        action_details=f'Админская установка рейтинга: {current_rating} -> {new_rating} (админ @{admin_user.username or admin_user.first_name})',
+                        action_details=f'Админская установка рейтинга: {current_rating} -> {new_rating} (админ @{esc(admin_user.username or admin_user.first_name)})',
                         amount=new_rating,
                         success=True
                     )
-                    response = f"✅ Рейтинг игрока {username_display} установлен: <b>{new_rating}</b> ⭐"
+                    response = f"✅ Рейтинг игрока {esc(username_display)} установлен: <b>{new_rating}</b> ⭐"
             except ValueError:
                 response = "❌ Неверный формат! Используйте число для установки рейтинга"
 
@@ -2991,16 +2279,18 @@ async def handle_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                         lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
                     response = "\n".join(lines)
                 elif not (res.get('ok') and res.get('player')):
-                    response = f"❌ Пользователь {ident} не найден в базе!"
+                    response = f"❌ Пользователь {esc(ident)} не найден в базе!"
                 else:
                     player = res['player']
                     username = getattr(player, 'username', None)
-                    success = db.add_admin_user(player.user_id, username, level)
-                    shown = f"@{username}" if username else str(player.user_id)
+                    assign_res = db.assign_admin_level(player.user_id, level, username=username)
+                    success = bool(assign_res.get('ok'))
+                    shown = f"@{esc(username)}" if username else str(player.user_id)
                     if success:
-                        response = f"✅ Админ {shown} добавлен с уровнем {level}!"
+                        response = f"✅ Админ {esc(shown)} добавлен с уровнем {level}!"
+                        await _notify_admin_assignment(context, int(player.user_id), assign_res)
                     else:
-                        response = f"⚠️ {shown} уже является админом. Используйте повышение/понижение уровня."
+                        response = f"⚠️ {esc(shown)} уже является админом. Используйте повышение/понижение уровня."
         except ValueError:
             response = "❌ Уровень должен быть числом (1, 2 или 3)!"
         except Exception as e:
@@ -3027,17 +2317,19 @@ async def handle_admin_promote(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         player = res['player']
         username = getattr(player, 'username', None)
-        shown = f"@{username}" if username else str(player.user_id)
+        shown = f"@{esc(username)}" if username else str(player.user_id)
         current_level = db.get_admin_level(player.user_id)
         if current_level == 0:
-            response = f"❌ {shown} не является админом!"
+            response = f"❌ {esc(shown)} не является админом!"
         elif current_level >= 3:
-            response = f"⚠️ {shown} уже имеет максимальный уровень (3)!"
+            response = f"⚠️ {esc(shown)} уже имеет максимальный уровень (3)!"
         else:
             new_level = current_level + 1
-            success = db.set_admin_level(player.user_id, new_level)
+            assign_res = db.assign_admin_level(player.user_id, new_level, username=username)
+            success = bool(assign_res.get('ok'))
             if success:
-                response = f"✅ Уровень админа {shown} повышен: {current_level} → {new_level}"
+                response = f"✅ Уровень админа {esc(shown)} повышен: {current_level} → {new_level}"
+                await _notify_admin_assignment(context, int(player.user_id), assign_res)
             else:
                 response = "❌ Ошибка при повышении уровня!"
     
@@ -3061,17 +2353,17 @@ async def handle_admin_demote(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         player = res['player']
         username = getattr(player, 'username', None)
-        shown = f"@{username}" if username else str(player.user_id)
+        shown = f"@{esc(username)}" if username else str(player.user_id)
         current_level = db.get_admin_level(player.user_id)
         if current_level == 0:
-            response = f"❌ {shown} не является админом!"
+            response = f"❌ {esc(shown)} не является админом!"
         elif current_level <= 1:
-            response = f"⚠️ {shown} имеет минимальный уровень (1). Используйте 'Уволить' для удаления."
+            response = f"⚠️ {esc(shown)} имеет минимальный уровень (1). Используйте 'Уволить' для удаления."
         else:
             new_level = current_level - 1
             success = db.set_admin_level(player.user_id, new_level)
             if success:
-                response = f"✅ Уровень админа {shown} понижен: {current_level} → {new_level}"
+                response = f"✅ Уровень админа {esc(shown)} понижен: {current_level} → {new_level}"
             else:
                 response = "❌ Ошибка при понижении уровня!"
     
@@ -3095,14 +2387,14 @@ async def handle_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         player = res['player']
         username = getattr(player, 'username', None)
-        shown = f"@{username}" if username else str(player.user_id)
+        shown = f"@{esc(username)}" if username else str(player.user_id)
         current_level = db.get_admin_level(player.user_id)
         if current_level == 0:
-            response = f"❌ {shown} не является админом!"
+            response = f"❌ {esc(shown)} не является админом!"
         else:
             success = db.remove_admin_user(player.user_id)
             if success:
-                response = f"✅ Админ {shown} (уровень {current_level}) уволен!"
+                response = f"✅ Админ {esc(shown)} (уровень {current_level}) уволен!"
             else:
                 response = "❌ Ошибка при увольнении админа!"
     
@@ -3134,15 +2426,15 @@ async def handle_vip_give(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                     lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
                 response = "\n".join(lines)
             elif not (res.get('ok') and res.get('player')):
-                response = f"❌ Пользователь {ident} не найден!"
+                response = f"❌ Пользователь {esc(ident)} не найден!"
             else:
                 player = res['player']
                 duration_seconds = days * 86400
                 success = db.set_vip_for_user(player.user_id, duration_seconds)
                 username = getattr(player, 'username', None)
-                shown = f"@{username}" if username else str(player.user_id)
+                shown = f"@{esc(username)}" if username else str(player.user_id)
                 if success:
-                    response = f"✅ VIP выдан пользователю {shown} на <b>{days}</b> дней!"
+                    response = f"✅ VIP выдан пользователю {esc(shown)} на <b>{days}</b> дней!"
                 else:
                     response = "❌ Ошибка при выдаче VIP!"
         except ValueError:
@@ -3179,15 +2471,15 @@ async def handle_vip_plus_give(update: Update, context: ContextTypes.DEFAULT_TYP
                     lines.append(f"- @{cu} (ID: {c.get('user_id')})" if cu else f"- ID: {c.get('user_id')}")
                 response = "\n".join(lines)
             elif not (res.get('ok') and res.get('player')):
-                response = f"❌ Пользователь {ident} не найден!"
+                response = f"❌ Пользователь {esc(ident)} не найден!"
             else:
                 player = res['player']
                 duration_seconds = days * 86400
                 success = db.set_vip_plus_for_user(player.user_id, duration_seconds)
                 username = getattr(player, 'username', None)
-                shown = f"@{username}" if username else str(player.user_id)
+                shown = f"@{esc(username)}" if username else str(player.user_id)
                 if success:
-                    response = f"✅ VIP+ выдан пользователю {shown} на <b>{days}</b> дней!"
+                    response = f"✅ VIP+ выдан пользователю {esc(shown)} на <b>{days}</b> дней!"
                 else:
                     response = "❌ Ошибка при выдаче VIP+!"
         except ValueError:
@@ -3216,10 +2508,10 @@ async def handle_vip_remove(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     else:
         player = res['player']
         username = getattr(player, 'username', None)
-        shown = f"@{username}" if username else str(player.user_id)
+        shown = f"@{esc(username)}" if username else str(player.user_id)
         success = db.remove_vip_from_user(player.user_id)
         if success:
-            response = f"✅ VIP отозван у пользователя {shown}!"
+            response = f"✅ VIP отозван у пользователя {esc(shown)}!"
         else:
             response = "❌ Ошибка при отзыве VIP!"
     
@@ -3243,10 +2535,10 @@ async def handle_vip_plus_remove(update: Update, context: ContextTypes.DEFAULT_T
     else:
         player = res['player']
         username = getattr(player, 'username', None)
-        shown = f"@{username}" if username else str(player.user_id)
+        shown = f"@{esc(username)}" if username else str(player.user_id)
         success = db.remove_vip_plus_from_user(player.user_id)
         if success:
-            response = f"✅ VIP+ отозван у пользователя {shown}!"
+            response = f"✅ VIP+ отозван у пользователя {esc(shown)}!"
         else:
             response = "❌ Ошибка при отзыве VIP+!"
     
@@ -3286,8 +2578,22 @@ async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 parse_mode='HTML'
             )
             success_count += 1
-            # Небольшая задержка, чтобы не превысить лимиты Telegram
-            await asyncio.sleep(0.05)
+            # ~25 msg/sec — безопасно в пределах лимита Telegram (30 msg/sec)
+            await asyncio.sleep(0.04)
+        except RetryAfter as e:
+            # Telegram просит подождать — уважаем лимит
+            wait_time = int(getattr(e, 'retry_after', 5)) + 1
+            logger.warning(f"FloodWait при рассылке: ожидание {wait_time}s")
+            await asyncio.sleep(wait_time)
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=text_input,
+                    parse_mode='HTML'
+                )
+                success_count += 1
+            except Exception:
+                fail_count += 1
         except Exception as e:
             fail_count += 1
             logger.warning(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
@@ -3325,7 +2631,7 @@ async def show_admins_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for admin in admins:
             level_emoji = "⭐" * admin.level
             username_display = f"@{admin.username}" if admin.username else f"ID: {admin.user_id}"
-            text += f"{level_emoji} <b>Уровень {admin.level}</b> - {username_display}\n"
+            text += f"{level_emoji} <b>Уровень {admin.level}</b> - {esc(username_display)}\n"
     else:
         text += "<i>Админов нет</i>\n"
     
@@ -3496,13 +2802,13 @@ async def show_bot_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     for i, (user_id, username, coins) in enumerate(stats.get('top_coins', [])[:5], 1):
-        username_display = f"@{username}" if username else f"ID:{user_id}"
-        text += f"{i}. {username_display} — {coins:,} 🪙\n"
+        username_display = f"@{esc(username)}" if username else f"ID:{user_id}"
+        text += f"{i}. {esc(username_display)} — {coins:,} 🪙\n"
     
     text += "\n<b>🥤 Топ-5 по напиткам:</b>\n"
     for i, (user_id, username, total) in enumerate(stats.get('top_drinks', [])[:5], 1):
-        username_display = f"@{username}" if username else f"ID:{user_id}"
-        text += f"{i}. {username_display} — {total}\n"
+        username_display = f"@{esc(username)}" if username else f"ID:{user_id}"
+        text += f"{i}. {esc(username_display)} — {total}\n"
     
     keyboard = [
         [InlineKeyboardButton("🔄 Обновить", callback_data='admin_bot_stats')],
@@ -3623,13 +2929,13 @@ async def admin_players_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         if players:
             for idx, player in enumerate(players, 1):
-                username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+                username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
                 vip_status = ""
                 if player.vip_plus_until and current_time < player.vip_plus_until:
                     vip_status = " ⭐VIP+"
                 elif player.vip_until and current_time < player.vip_until:
                     vip_status = " 💎VIP"
-                text += f"{idx}. {username_display}{vip_status}\n"
+                text += f"{idx}. {esc(username_display)}{vip_status}\n"
                 text += f"   💰 <b>{player.coins}</b> септимов\n\n"
         else:
             text += "<i>Игроки не найдены</i>\n\n"
@@ -3673,14 +2979,14 @@ async def admin_players_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             for idx, player in enumerate(top_players):
                 medal = medals[idx] if idx < len(medals) else f"{idx + 1}."
-                username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+                username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
                 vip_status = ""
                 if player.vip_plus_until and current_time < player.vip_plus_until:
                     vip_status = " ⭐VIP+"
                 elif player.vip_until and current_time < player.vip_until:
                     vip_status = " 💎VIP"
                 
-                text += f"{medal} {username_display}{vip_status}\n"
+                text += f"{medal} {esc(username_display)}{vip_status}\n"
                 text += f"   💰 <b>{player.coins:,}</b> септимов\n\n"
         else:
             text += "<i>Игроки не найдены</i>\n\n"
@@ -3766,11 +3072,11 @@ async def show_player_details(update: Update, context: ContextTypes.DEFAULT_TYPE
         admin_level = db.get_admin_level(player_id)
         admin_status = f"Уровень {admin_level}" if admin_level > 0 else "Нет"
         
-        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         
         text = (
             f"👤 <b>Информация об игроке</b>\n\n"
-            f"<b>Username:</b> {username_display}\n"
+            f"<b>Username:</b> {esc(username_display)}\n"
             f"<b>ID:</b> <code>{player.user_id}</code>\n"
             f"<b>Баланс:</b> <b>{player.coins:,}</b> 🪙\n"
             f"<b>Рейтинг:</b> <b>{int(getattr(player, 'rating', 0) or 0)}</b> ⭐\n"
@@ -3838,10 +3144,10 @@ async def admin_player_balance_start(update: Update, context: ContextTypes.DEFAU
     try:
         player = dbs.query(Player).filter(Player.user_id == player_id).first()
         if player:
-            username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+            username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
             text = (
                 f"💰 <b>Изменение баланса</b>\n\n"
-                f"Игрок: {username_display}\n"
+                f"Игрок: {esc(username_display)}\n"
                 f"Текущий баланс: <b>{player.coins:,}</b> 🪙\n\n"
                 f"Отправьте новое количество монет или изменение:\n"
                 f"• <code>1000</code> - установить баланс\n"
@@ -3894,7 +3200,7 @@ async def admin_player_vip_menu(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ Игрок не найден", show_alert=True)
             return
         
-        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         current_time = int(time.time())
         
         vip_status = "Нет"
@@ -3905,7 +3211,7 @@ async def admin_player_vip_menu(update: Update, context: ContextTypes.DEFAULT_TY
         
         text = (
             f"💎 <b>Управление VIP</b>\n\n"
-            f"Игрок: {username_display}\n"
+            f"Игрок: {esc(username_display)}\n"
             f"Текущий статус: {vip_status}\n\n"
             f"Выберите действие:"
         )
@@ -3958,10 +3264,10 @@ async def admin_player_logs_show(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("❌ Игрок не найден", show_alert=True)
             return
         
-        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         logs = db.get_user_logs(player_id, limit=15)
         
-        text = f"📝 <b>Логи игрока {username_display}</b>\n\n"
+        text = f"📝 <b>Логи игрока {esc(username_display)}</b>\n\n"
         
         if logs:
             for log in logs:
@@ -4018,12 +3324,12 @@ async def admin_player_selyuki_show(update: Update, context: ContextTypes.DEFAUL
         if not player:
             username_display = f"ID: {player_id}"
         else:
-            username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+            username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         
         # Получаем селюков игрока
         selyuki = db.get_player_selyuki(player_id)
         
-        text = f"👥 <b>СЕЛЮКИ ИГРОКА {username_display}</b>\n\n"
+        text = f"👥 <b>СЕЛЮКИ ИГРОКА {esc(username_display)}</b>\n\n"
         
         if not selyuki:
             text += "<i>У игрока пока нет селюков.</i>"
@@ -4095,9 +3401,9 @@ async def admin_player_reset_bonus_execute(update: Update, context: ContextTypes
             return
         
         db.set_daily_bonus_manual_ready(player_id)
-        username_display = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        username_display = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
         
-        await query.answer(f"✅ Бонус сброшен для {username_display}!", show_alert=False)
+        await query.answer(f"✅ Бонус сброшен для {esc(username_display)}!", show_alert=False)
         
         # Обновляем страницу игрока
         await show_player_details(update, context, player_id)
@@ -4391,7 +3697,7 @@ async def admin_vip_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE
         for p in vip_plus_users[:10]:
             username_display = f"@{p.username}" if p.username else f"ID:{p.user_id}"
             until_str = safe_format_timestamp(p.vip_plus_until)
-            text += f"• {username_display} до {until_str}\n"
+            text += f"• {esc(username_display)} до {until_str}\n"
         if len(vip_plus_users) > 10:
             text += f"<i>...и ещё {len(vip_plus_users) - 10}</i>\n"
         text += "\n"
@@ -4403,7 +3709,7 @@ async def admin_vip_list_show(update: Update, context: ContextTypes.DEFAULT_TYPE
         for p in vip_users[:10]:
             username_display = f"@{p.username}" if p.username else f"ID:{p.user_id}"
             until_str = safe_format_timestamp(p.vip_until)
-            text += f"• {username_display} до {until_str}\n"
+            text += f"• {esc(username_display)} до {until_str}\n"
         if len(vip_users) > 10:
             text += f"<i>...и ещё {len(vip_users) - 10}</i>\n"
     else:
@@ -4513,13 +3819,13 @@ async def show_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYP
         if top_coins:
             text += "\n🏆 <b>Топ-5 по монетам:</b>\n"
             for i, (user_id, username, coins) in enumerate(top_coins, 1):
-                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                display_name = f"@{esc(username)}" if username and username != str(user_id) else f"ID:{user_id}"
                 text += f"{i}. {display_name}: <b>{coins:,}</b>\n"
         
         if top_drinks:
             text += "\n🥤 <b>Топ-5 по напиткам:</b>\n"
             for i, (user_id, username, drinks) in enumerate(top_drinks, 1):
-                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                display_name = f"@{esc(username)}" if username and username != str(user_id) else f"ID:{user_id}"
                 text += f"{i}. {display_name}: <b>{drinks:,}</b>\n"
         
         keyboard = [
@@ -4635,14 +3941,14 @@ async def export_admin_analytics(update: Update, context: ContextTypes.DEFAULT_T
         if top_coins:
             export_text += f"🏆 ТОП-10 ПО МОНЕТАМ:\n"
             for i, (user_id, username, coins) in enumerate(top_coins, 1):
-                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                display_name = f"@{esc(username)}" if username and username != str(user_id) else f"ID:{user_id}"
                 export_text += f"{i}. {display_name}: {coins:,}\n"
             export_text += "\n"
         
         if top_drinks:
             export_text += f"🥤 ТОП-10 ПО НАПИТКАМ:\n"
             for i, (user_id, username, drinks) in enumerate(top_drinks, 1):
-                display_name = f"@{username}" if username and username != str(user_id) else f"ID:{user_id}"
+                display_name = f"@{esc(username)}" if username and username != str(user_id) else f"ID:{user_id}"
                 export_text += f"{i}. {display_name}: {drinks:,}\n"
         
         # Отправляем как сообщение (Telegram имеет лимит на длину сообщения)
@@ -5180,7 +4486,7 @@ async def admin_promo_wizard_start(update: Update, context: ContextTypes.DEFAULT
     context.user_data['awaiting_admin_action'] = 'promo_wiz_code'
     text = (
         "🧙 <b>Мастер создания промокода</b>\n\n"
-        "Шаг 1/6: отправьте <b>код</b> промокода\n"
+        "Шаг 1/9: отправьте <b>код</b> промокода\n"
         "• Можно написать <code>-</code>, чтобы я сгенерировал код автоматически"
     )
     kb = InlineKeyboardMarkup([
@@ -5208,21 +4514,21 @@ async def handle_promo_wiz_code(update: Update, context: ContextTypes.DEFAULT_TY
     wiz['code'] = code
     context.user_data['promo_wiz'] = wiz
     context.user_data.pop('awaiting_admin_action', None)
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💰 Монеты", callback_data='promo_wiz_kind:coins'),
-            InlineKeyboardButton("👑 VIP", callback_data='promo_wiz_kind:vip'),
-        ],
-        [
-            InlineKeyboardButton("💎 VIP+", callback_data='promo_wiz_kind:vip_plus'),
-            InlineKeyboardButton("🥤 Энергетик", callback_data='promo_wiz_kind:drink'),
-        ],
-        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
-    ])
+    kb_rows = []
+    row = []
+    for idx, (kind, title) in enumerate(PROMO_KIND_OPTIONS, start=1):
+        row.append(InlineKeyboardButton(title, callback_data=f'promo_wiz_kind:{kind}'))
+        if len(row) == 2:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+    kb_rows.append([InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')])
+    kb = InlineKeyboardMarkup(kb_rows)
     text = (
         "🧙 <b>Мастер создания промокода</b>\n\n"
         f"Код: <code>{html.escape(code)}</code>\n\n"
-        "Шаг 2/6: выберите тип награды (kind)"
+        "Шаг 2/9: выберите тип награды (kind)"
     )
     await update.message.reply_html(text, reply_markup=kb)
 
@@ -5233,17 +4539,21 @@ async def promo_wiz_kind_select(update: Update, context: ContextTypes.DEFAULT_TY
     if not has_creator_panel_access(query.from_user.id, query.from_user.username):
         await query.answer("⛔ Доступ запрещён!", show_alert=True)
         return
+    kind = str(kind).strip().lower()
+    if kind not in {item[0] for item in PROMO_KIND_OPTIONS}:
+        await query.answer("Неизвестный тип награды.", show_alert=True)
+        return
     wiz = context.user_data.get('promo_wiz') or {}
-    wiz['kind'] = str(kind).strip().lower()
+    wiz['kind'] = kind
     wiz.pop('rarity', None)
+    wiz.pop('delivery_mode', None)
     context.user_data['promo_wiz'] = wiz
     context.user_data['awaiting_admin_action'] = 'promo_wiz_value'
-    hint = "монеты" if wiz['kind'] == 'coins' else ("дни VIP" if wiz['kind'] == 'vip' else ("дни VIP+" if wiz['kind'] == 'vip_plus' else "ID энергетика"))
     text = (
         "🧙 <b>Мастер создания промокода</b>\n\n"
         f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
-        f"Тип: <b>{html.escape(wiz['kind'])}</b>\n\n"
-        f"Шаг 3/6: отправьте значение (value) — <b>{hint}</b>"
+        f"Тип: <b>{html.escape(_promo_kind_title(wiz['kind']))}</b>\n\n"
+        f"Шаг 3/9: отправьте значение (value) — <b>{html.escape(_promo_value_hint(wiz['kind']))}</b>"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
@@ -5265,11 +4575,8 @@ async def handle_promo_wiz_value(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         await update.message.reply_html("❌ Значение должно быть числом.", reply_markup=keyboard)
         return
-    if kind == 'coins' and value <= 0:
-        await update.message.reply_html("❌ Монеты должны быть > 0.", reply_markup=keyboard)
-        return
-    if kind in ('vip', 'vip_plus') and value <= 0:
-        await update.message.reply_html("❌ Дни должны быть > 0.", reply_markup=keyboard)
+    if value <= 0:
+        await update.message.reply_html("❌ Значение должно быть больше 0.", reply_markup=keyboard)
         return
     if kind == 'drink':
         d = db.get_drink_by_id(value)
@@ -5299,15 +4606,15 @@ async def handle_promo_wiz_value(update: Update, context: ContextTypes.DEFAULT_T
         text = (
             "🧙 <b>Мастер создания промокода</b>\n\n"
             f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
-            f"Тип: <b>{html.escape(kind)}</b>\n"
+            f"Тип: <b>{html.escape(_promo_kind_title(kind))}</b>\n"
             f"Drink ID: <b>{value}</b>\n\n"
-            "Шаг 4/6: выберите редкость (rarity)"
+            "Шаг 4/9: выберите редкость (rarity)"
         )
         await update.message.reply_html(text, reply_markup=kb)
         return
     context.user_data['awaiting_admin_action'] = 'promo_wiz_max_uses'
     await update.message.reply_html(
-        "Шаг 4/6: отправьте <b>max_uses</b> (0 = без лимита)",
+        "Шаг 4/9: отправьте <b>max_uses</b> (0 = без лимита)",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')]])
     )
 
@@ -5341,10 +4648,10 @@ async def promo_wiz_rarity_select(update: Update, context: ContextTypes.DEFAULT_
     text = (
         "🧙 <b>Мастер создания промокода</b>\n\n"
         f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
-        f"Тип: <b>{html.escape(str(wiz.get('kind','')))}</b>\n"
+        f"Тип: <b>{html.escape(_promo_kind_title(str(wiz.get('kind',''))))}</b>\n"
         f"Значение: <b>{html.escape(str(wiz.get('value','')))}</b>\n"
         f"Редкость: <b>{html.escape(rarity_text)}</b>\n\n"
-        "Шаг 5/6: отправьте <b>max_uses</b> (0 = без лимита)"
+        "Шаг 5/9: отправьте <b>max_uses</b> (0 = без лимита)"
     )
     try:
         await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
@@ -5368,7 +4675,7 @@ async def handle_promo_wiz_max_uses(update: Update, context: ContextTypes.DEFAUL
     context.user_data['promo_wiz'] = wiz
     context.user_data['awaiting_admin_action'] = 'promo_wiz_per_user'
     await update.message.reply_html(
-        "Шаг 6/6: отправьте <b>per_user_limit</b> (0 = без лимита на пользователя)",
+        "Шаг 5/9: отправьте <b>per_user_limit</b> (0 = без лимита на пользователя)",
         reply_markup=keyboard
     )
 
@@ -5389,7 +4696,7 @@ async def handle_promo_wiz_per_user(update: Update, context: ContextTypes.DEFAUL
     context.user_data['promo_wiz'] = wiz
     context.user_data['awaiting_admin_action'] = 'promo_wiz_expires'
     await update.message.reply_html(
-        "Отправьте срок действия: <code>YYYY-MM-DD HH:MM</code> или <code>-</code> (без срока)",
+        "Шаг 6/9: отправьте срок действия: <code>YYYY-MM-DD HH:MM</code> или <code>-</code> (без срока)",
         reply_markup=keyboard
     )
 
@@ -5417,13 +4724,12 @@ async def handle_promo_wiz_expires(update: Update, context: ContextTypes.DEFAULT
     text = (
         "🧾 <b>Проверьте промокод</b>\n\n"
         f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
-        f"Kind: <b>{html.escape(str(wiz.get('kind','')))}</b>\n"
-        f"Value: <b>{html.escape(str(wiz.get('value','')))}</b>\n"
+        f"Награда: <b>{html.escape(_promo_reward_summary(str(wiz.get('kind','')), int(wiz.get('value') or 0), wiz.get('rarity')))}</b>\n"
         + rarity_line +
         f"max_uses: <b>{html.escape(str(wiz.get('max_uses', 0)))}</b>\n"
         f"per_user_limit: <b>{html.escape(str(wiz.get('per_user_limit', 0)))}</b>\n"
         f"expires: <b>{html.escape(exp_str)}</b>\n\n"
-        "Активировать сразу?"
+        "Шаг 7/9: активировать сразу?"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да", callback_data='promo_wiz_active:1'), InlineKeyboardButton("❌ Нет", callback_data='promo_wiz_active:0')],
@@ -5441,19 +4747,48 @@ async def promo_wiz_active_select(update: Update, context: ContextTypes.DEFAULT_
     wiz = context.user_data.get('promo_wiz') or {}
     wiz['active'] = bool(active)
     context.user_data['promo_wiz'] = wiz
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤫 Тихое создание", callback_data='promo_wiz_delivery:silent')],
+        [InlineKeyboardButton("📣 Создать с оповещением", callback_data='promo_wiz_delivery:announce')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='promo_wiz_cancel')],
+    ])
+    text = (
+        "✅ <b>Шаг 8/9</b>\n\n"
+        "Выберите режим создания промокода.\n"
+        f"📣 Оповещение будет опубликовано в {PROMO_ANNOUNCEMENT_CHAT}."
+    )
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode='HTML')
+    except BadRequest:
+        pass
+
+
+async def promo_wiz_delivery_select(update: Update, context: ContextTypes.DEFAULT_TYPE, delivery_mode: str):
+    query = update.callback_query
+    await query.answer()
+    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
+        await query.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    if delivery_mode not in ('silent', 'announce'):
+        await query.answer("Неизвестный режим.", show_alert=True)
+        return
+    wiz = context.user_data.get('promo_wiz') or {}
+    wiz['delivery_mode'] = delivery_mode
+    context.user_data['promo_wiz'] = wiz
     exp_str = safe_format_timestamp(wiz.get('expires_at')) if wiz.get('expires_at') else '—'
     rarity = wiz.get('rarity')
     rarity_line = f"Rarity: <b>{html.escape(str(rarity))}</b>\n" if rarity else ""
+    delivery_text = "📣 Оповещение в канал" if delivery_mode == 'announce' else "🤫 Тихое создание"
     text = (
-        "✅ <b>Готово к созданию</b>\n\n"
+        "✅ <b>Шаг 9/9: готово к созданию</b>\n\n"
         f"Код: <code>{html.escape(str(wiz.get('code','')))}</code>\n"
-        f"Kind: <b>{html.escape(str(wiz.get('kind','')))}</b>\n"
-        f"Value: <b>{html.escape(str(wiz.get('value','')))}</b>\n"
+        f"Награда: <b>{html.escape(_promo_reward_summary(str(wiz.get('kind','')), int(wiz.get('value') or 0), wiz.get('rarity')))}</b>\n"
         + rarity_line +
         f"max_uses: <b>{html.escape(str(wiz.get('max_uses', 0)))}</b>\n"
         f"per_user_limit: <b>{html.escape(str(wiz.get('per_user_limit', 0)))}</b>\n"
         f"expires: <b>{html.escape(exp_str)}</b>\n"
-        f"active: <b>{'да' if wiz.get('active') else 'нет'}</b>\n\n"
+        f"active: <b>{'да' if wiz.get('active') else 'нет'}</b>\n"
+        f"mode: <b>{html.escape(delivery_text)}</b>\n\n"
         "Создать промокод?"
     )
     kb = InlineKeyboardMarkup([
@@ -5481,14 +4816,37 @@ async def promo_wiz_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expires = wiz.get('expires_at')
     active = bool(wiz.get('active', True))
     rarity = wiz.get('rarity')
+    delivery_mode = str(wiz.get('delivery_mode') or 'silent')
     res = db.create_promo(str(code), str(kind), int(value), int(max_uses), int(per_user), expires, active, rarity=rarity)
     context.user_data.pop('promo_wiz', None)
     context.user_data.pop('awaiting_admin_action', None)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Промокоды", callback_data='admin_promo_menu')]])
     if res.get('ok'):
         suffix = f" (rarity: {html.escape(str(rarity))})" if rarity else ""
+        announce_error = None
+        if delivery_mode == 'announce':
+            try:
+                await context.bot.send_message(
+                    chat_id=PROMO_ANNOUNCEMENT_CHAT,
+                    text=_format_promo_announcement(wiz),
+                    parse_mode='HTML',
+                )
+            except Exception as ex:
+                announce_error = str(ex)
         try:
-            await query.message.edit_text(f"✅ Создан промокод <b>{html.escape(str(code))}</b>{suffix}", reply_markup=kb, parse_mode='HTML')
+            if announce_error:
+                await query.message.edit_text(
+                    f"⚠️ Промокод <b>{html.escape(str(code))}</b>{suffix} создан, но публикация в канал не удалась:\n<code>{html.escape(announce_error)}</code>",
+                    reply_markup=kb,
+                    parse_mode='HTML',
+                )
+            else:
+                delivery_suffix = " с оповещением" if delivery_mode == 'announce' else ""
+                await query.message.edit_text(
+                    f"✅ Создан промокод <b>{html.escape(str(code))}</b>{suffix}{delivery_suffix}",
+                    reply_markup=kb,
+                    parse_mode='HTML',
+                )
         except BadRequest:
             pass
     else:
@@ -5701,525 +5059,6 @@ async def show_admin_promo_menu(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # --- Настройки бота ---
-
-async def show_admin_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню настроек бота."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton("⏱️ Кулдауны", callback_data='admin_settings_cooldowns')],
-        [InlineKeyboardButton("🤖 Автопоиск", callback_data='admin_settings_autosearch')],
-        [InlineKeyboardButton("🎁 Gift-защита", callback_data='admin_settings_gift_protection')],
-        [InlineKeyboardButton("💰 Лимиты", callback_data='admin_settings_limits')],
-        [InlineKeyboardButton("🎰 Настройки казино", callback_data='admin_settings_casino')],
-        [InlineKeyboardButton("🏪 Настройки магазина", callback_data='admin_settings_shop')],
-        [InlineKeyboardButton("🔔 Уведомления", callback_data='admin_settings_notifications')],
-        [InlineKeyboardButton("🌐 Локализация", callback_data='admin_settings_localization')],
-        [InlineKeyboardButton("⚠️ Негативные эффекты", callback_data='admin_settings_negative_effects')],
-        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    text = (
-        "⚙️ <b>Настройки бота</b>\n\n"
-        "Управление параметрами работы бота:\n\n"
-        "⏱️ <b>Кулдауны</b> - время ожидания между действиями\n"
-        "🤖 <b>Автопоиск</b> - лимиты и коэффициенты VIP/VIP+\n"
-        "🎁 <b>Gift-защита</b> - автоблокировки и анти-абуз подарков\n"
-        "💰 <b>Лимиты</b> - ограничения на операции\n"
-        "🎰 <b>Казино</b> - настройки игр и шансов\n"
-        "🏪 <b>Магазин</b> - цены и ассортимент\n"
-        "🔔 <b>Уведомления</b> - настройки уведомлений\n"
-        "🌐 <b>Локализация</b> - языки интерфейса\n\n"
-        "Выберите раздел:"
-    )
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def show_admin_settings_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает настройки лимитов."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-
-    fert_max = max(1, db.get_setting_int('plantation_fertilizer_max_per_bed', PLANTATION_FERTILIZER_MAX_PER_BED))
-
-    text = (
-        "💰 <b>Лимиты</b>\n\n"
-        f"🌿 Лимит удобрений на грядку: <b>{int(fert_max)}</b>\n\n"
-        "Выберите действие:"
-    )
-    kb = [
-        [InlineKeyboardButton("🧪 Изменить лимит удобрений", callback_data='admin_settings_set_fertilizer_max')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
-    ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_settings_set_fertilizer_max_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_limits')]]
-    try:
-        await query.message.edit_text("Введите новый лимит удобрений на грядку (целое число ≥ 1):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_fertilizer_max'
-
-
-async def show_admin_settings_negative_effects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Настройки негативных эффектов на плантациях."""
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    if not has_creator_panel_access(user.id, user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-
-    interval = db.get_setting_int('plantation_negative_event_interval_sec', PLANTATION_NEG_EVENT_INTERVAL_SEC)
-    chance = db.get_setting_float('plantation_negative_event_chance', PLANTATION_NEG_EVENT_CHANCE)
-    max_active = db.get_setting_float('plantation_negative_event_max_active', PLANTATION_NEG_EVENT_MAX_ACTIVE)
-    duration = db.get_setting_int('plantation_negative_event_duration_sec', PLANTATION_NEG_EVENT_DURATION_SEC)
-
-    text = (
-        "⚠️ <b>Негативные эффекты</b>\n\n"
-        f"⏱️ Интервал: <b>{int(interval)}</b> сек.\n"
-        f"🎲 Шанс: <b>{round(float(chance) * 100, 2)}%</b>\n"
-        f"📊 Лимит активных: <b>{round(float(max_active) * 100, 2)}%</b>\n"
-        f"⌛ Длительность: <b>{int(duration)}</b> сек.\n\n"
-        "Выберите, что изменить:"
-    )
-    kb = [
-        [InlineKeyboardButton("⏱️ Интервал", callback_data='admin_settings_set_neg_interval')],
-        [InlineKeyboardButton("🎲 Шанс", callback_data='admin_settings_set_neg_chance')],
-        [InlineKeyboardButton("📊 Лимит активных", callback_data='admin_settings_set_neg_max_active')],
-        [InlineKeyboardButton("⌛ Длительность", callback_data='admin_settings_set_neg_duration')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='admin_settings_menu')],
-    ]
-    try:
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def admin_settings_set_neg_interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
-    try:
-        await query.message.edit_text("Введите интервал в секундах (целое число ≥ 60):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_neg_interval'
-
-
-async def admin_settings_set_neg_chance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
-    try:
-        await query.message.edit_text("Введите шанс (0..1 или проценты 1–100):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_neg_chance'
-
-
-async def admin_settings_set_neg_max_active_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
-    try:
-        await query.message.edit_text("Введите лимит активных (0..1 или проценты 1–100):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_neg_max_active'
-
-
-async def admin_settings_set_neg_duration_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    kb = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_settings_negative_effects')]]
-    try:
-        await query.message.edit_text("Введите длительность эффекта в секундах (целое число ≥ 60):", reply_markup=InlineKeyboardMarkup(kb))
-    except BadRequest:
-        pass
-    context.user_data['awaiting_admin_action'] = 'settings_set_neg_duration'
-
-
-# --- Модерация ---
-
-async def show_admin_moderation_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню модерации."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 2):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    banned_users = db.get_banned_users_count()
-    
-    keyboard = [
-        [InlineKeyboardButton("🚫 Забанить пользователя", callback_data='admin_mod_ban')],
-        [InlineKeyboardButton("✅ Разбанить пользователя", callback_data='admin_mod_unban')],
-        [InlineKeyboardButton("🎁 Gift-блокировки", callback_data='admin_mod_gift_menu')],
-        [InlineKeyboardButton("⚠️ Предупреждения", callback_data='admin_mod_warnings')],
-        [InlineKeyboardButton("📋 Список банов", callback_data='admin_mod_banlist')],
-        [InlineKeyboardButton("🔍 Проверить игрока", callback_data='admin_mod_check')],
-        [InlineKeyboardButton("📝 История действий", callback_data='admin_mod_history')],
-        [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    text = (
-        "🚫 <b>Модерация</b>\n\n"
-        f"Заблокировано пользователей: <b>{banned_users}</b>\n\n"
-        "<b>Доступные действия:</b>\n"
-        "• Блокировка/разблокировка игроков\n"
-        "• Gift-блокировки подарков\n"
-        "• Система предупреждений\n"
-        "• Проверка активности\n"
-        "• История нарушений\n\n"
-        "Выберите действие:"
-    )
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-# --- Логи системы ---
-
-async def show_admin_logs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню логов системы."""
-    try:
-        query = update.callback_query
-        if not query:
-            logger.error("show_admin_logs_menu: query is None")
-            return
-        
-        await query.answer()
-        
-        user = query.from_user
-        if not user:
-            logger.error("show_admin_logs_menu: user is None")
-            return
-        
-        if not has_admin_level(user.id, user.username, 1):
-            await query.answer("⛔ Доступ запрещён!", show_alert=True)
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton("📊 Последние действия", callback_data='admin_logs_recent')],
-            [InlineKeyboardButton("💰 Транзакции", callback_data='admin_logs_transactions')],
-            [InlineKeyboardButton("🎰 Игры в казино", callback_data='admin_logs_casino')],
-            [InlineKeyboardButton("🛒 Покупки", callback_data='admin_logs_purchases')],
-            [InlineKeyboardButton("👤 Действия игрока", callback_data='admin_logs_player')],
-            [InlineKeyboardButton("⚠️ Ошибки системы", callback_data='admin_logs_errors')],
-            [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = (
-            "📝 <b>Логи системы</b>\n\n"
-            "Просмотр истории действий в боте:\n\n"
-            "📊 <b>Последние действия</b> - общая активность\n"
-            "💰 <b>Транзакции</b> - перемещение монет\n"
-            "🎰 <b>Казино</b> - игры и ставки\n"
-            "🛒 <b>Покупки</b> - магазин и обмены\n"
-            "👤 <b>Игрок</b> - действия конкретного пользователя\n"
-            "⚠️ <b>Ошибки</b> - системные проблемы\n\n"
-            "Выберите тип логов:"
-        )
-        
-        if not query.message:
-            logger.error("show_admin_logs_menu: query.message is None")
-            return
-        
-        try:
-            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-        except BadRequest as e:
-            logger.error(f"BadRequest при редактировании сообщения в show_admin_logs_menu: {e}")
-            # Попробуем отправить новое сообщение, если не удалось отредактировать
-            try:
-                await context.bot.send_message(
-                    chat_id=query.from_user.id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode='HTML'
-                )
-            except Exception as send_error:
-                logger.error(f"Ошибка при отправке нового сообщения: {send_error}")
-    except Exception as e:
-        logger.error(f"Ошибка в show_admin_logs_menu: {e}", exc_info=True)
-        query = getattr(update, 'callback_query', None)
-        if query:
-            try:
-                await query.answer("❌ Ошибка при открытии меню логов", show_alert=True)
-            except:
-                pass
-
-
-async def show_admin_logs_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает последние действия в системе."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 1):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    logs = db.get_recent_logs(limit=20)
-    
-    text = "📊 <b>Последние действия</b>\n\n"
-    
-    if logs:
-        for log in logs:
-            status = "✅" if log['success'] else "❌"
-            timestamp_str = safe_format_timestamp(log['timestamp'])
-            text += f"{status} <b>{log['username']}</b> ({log['user_id']})\n"
-            text += f"├ Действие: <i>{log['action_type']}</i>\n"
-            if log['action_details']:
-                details = log['action_details'][:50]
-                text += f"├ Детали: {details}\n"
-            if log['amount']:
-                text += f"└ Сумма: {log['amount']}\n"
-            text += f"⏰ {timestamp_str}\n\n"
-    else:
-        text += "<i>Логов пока нет</i>"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_recent')],
-        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def show_admin_logs_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает логи транзакций."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 1):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    logs = db.get_logs_by_type('transaction', limit=20)
-    
-    text = "💰 <b>Транзакции</b>\n\n"
-    
-    if logs:
-        for log in logs:
-            status = "✅" if log['success'] else "❌"
-            timestamp_str = safe_format_timestamp(log['timestamp'])
-            text += f"{status} <b>{log['username']}</b>\n"
-            if log['amount']:
-                sign = "+" if log['amount'] > 0 else ""
-                text += f"├ Сумма: {sign}{log['amount']} 💰\n"
-            if log['action_details']:
-                text += f"├ {log['action_details'][:60]}\n"
-            text += f"└ {timestamp_str}\n\n"
-    else:
-        text += "<i>Транзакций пока нет</i>"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_transactions')],
-        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def show_admin_logs_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает логи игр в казино."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 1):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    logs = db.get_logs_by_type('casino', limit=20)
-    
-    text = "🎰 <b>Игры в казино</b>\n\n"
-    
-    if logs:
-        for log in logs:
-            status = "✅ Выигрыш" if log['success'] else "❌ Проигрыш"
-            timestamp_str = safe_format_timestamp(log['timestamp'])
-            text += f"{status} - <b>{log['username']}</b>\n"
-            if log['amount']:
-                sign = "+" if log['amount'] > 0 else ""
-                text += f"├ {sign}{log['amount']} 💰\n"
-            if log['action_details']:
-                text += f"├ {log['action_details'][:60]}\n"
-            text += f"└ {timestamp_str}\n\n"
-    else:
-        text += "<i>Логов казино пока нет</i>"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_casino')],
-        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def show_admin_logs_purchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает логи покупок."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 1):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    logs = db.get_logs_by_type('purchase', limit=20)
-    
-    text = "🛒 <b>Покупки</b>\n\n"
-    
-    if logs:
-        for log in logs:
-            status = "✅" if log['success'] else "❌"
-            timestamp_str = safe_format_timestamp(log['timestamp'])
-            text += f"{status} <b>{log['username']}</b>\n"
-            if log['amount']:
-                text += f"├ Цена: {log['amount']} 💰\n"
-            if log['action_details']:
-                text += f"├ {log['action_details'][:60]}\n"
-            text += f"└ {timestamp_str}\n\n"
-    else:
-        text += "<i>Покупок пока нет</i>"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_purchases')],
-        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-async def show_admin_logs_player_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает процесс просмотра логов игрока."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 1):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    text = (
-        "👤 <b>Действия игрока</b>\n\n"
-        "Отправьте <code>@username</code> или <code>user_id</code> игрока\n\n"
-        "Или нажмите Отмена"
-    )
-    
-    keyboard = [[InlineKeyboardButton("❌ Отмена", callback_data='admin_logs_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-    
-    context.user_data['awaiting_admin_action'] = 'logs_player'
-
-
-async def show_admin_logs_errors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает логи ошибок."""
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    if not has_admin_level(user.id, user.username, 1):
-        await query.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    logs = db.get_error_logs(limit=20)
-    
-    text = "⚠️ <b>Ошибки системы</b>\n\n"
-    
-    if logs:
-        for log in logs:
-            timestamp_str = safe_format_timestamp(log['timestamp'])
-            text += f"❌ <b>{log['username']}</b> ({log['user_id']})\n"
-            text += f"├ Действие: <i>{log['action_type']}</i>\n"
-            if log['action_details']:
-                text += f"├ {log['action_details'][:60]}\n"
-            text += f"└ {timestamp_str}\n\n"
-    else:
-        text += "✅ <i>Ошибок не обнаружено!</i>"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs_errors')],
-        [InlineKeyboardButton("🔙 Логи", callback_data='admin_logs_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='HTML')
-    except BadRequest:
-        pass
-
-
-# --- Управление экономикой ---
 
 async def show_admin_economy_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает меню управления экономикой."""
@@ -6458,7 +5297,7 @@ async def global_farmer_harvest_job(context: ContextTypes.DEFAULT_TYPE):
                                 bed_idx = item.get('bed_index')
                                 amount = item.get('items_added')
                                 drink_name = item.get('drink_name', "Неизвестный")
-                                text += f"• Грядка {bed_idx}: {amount} шт. ({drink_name})\n"
+                                text += f"• Грядка {bed_idx}: {amount} шт. ({esc(drink_name)})\n"
                             
                             text += "\nУрожай добавлен в инвентарь."
                             
@@ -6614,7 +5453,7 @@ async def plantation_harvest_job(context: ContextTypes.DEFAULT_TYPE):
                 except:
                     pass
                     
-                text += f"• Грядка {bed_idx}: {amount} шт. ({drink_name})\n"
+                text += f"• Грядка {bed_idx}: {amount} шт. ({esc(drink_name)})\n"
             
             text += "\nУрожай добавлен в инвентарь."
             
@@ -6705,6 +5544,27 @@ async def _send_auto_search_summary(user_id: int, player: Player, context: Conte
         logger.error(f"[AUTO] Failed to send summary for {user_id}: {e}")
 
 
+MAX_AUTO_SEARCH_RETRIES = 5
+
+
+def _reschedule_auto_search(context, user_id: int, delay: float):
+    """Безопасно перепланирует auto_search_job (удаляет старые задачи перед созданием новой)."""
+    try:
+        for job in context.application.job_queue.get_jobs_by_name(f"auto_search_{user_id}"):
+            job.schedule_removal()
+    except Exception:
+        pass
+    try:
+        context.application.job_queue.run_once(
+            auto_search_job,
+            when=max(1.0, delay),
+            chat_id=user_id,
+            name=f"auto_search_{user_id}",
+        )
+    except Exception as e:
+        logger.warning(f"[AUTO] Не удалось перепланировать auto_search для {user_id}: {e}")
+
+
 async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: периодически выполняет автопоиск для VIP-пользователей.
     Самопереназначается с интервалом, равным оставшемуся кулдауну.
@@ -6719,6 +5579,10 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
         if not user_id:
             logger.warning("[AUTO] user_id отсутствует в auto_search_job")
             return
+
+        # Сброс retry-счётчика при успешном старте
+        retry_key = f"auto_search_retries_{user_id}"
+
         player = db.get_or_create_player(user_id, str(user_id))
 
         # Если пользователь успел выключить автопоиск — выходим (не переназначаем)
@@ -6726,10 +5590,11 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
             # Если был тихий режим и есть статистика — отправим отчет
             if getattr(player, 'auto_search_silent', False):
                 await _send_auto_search_summary(user_id, player, context, reason='disabled')
+            context.bot_data.pop(retry_key, None)
             return
 
-        # Проверка VIP
-        if not db.is_vip(user_id):
+        access = db.get_access_profile(user_id, username=getattr(player, 'username', None), player=player)
+        if not access.get('acts_like_vip'):
             # Если был тихий режим — отчет
             if getattr(player, 'auto_search_silent', False):
                 await _send_auto_search_summary(user_id, player, context, reason='vip_expired')
@@ -6740,6 +5605,7 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=user_id, text=t(lang, 'auto_vip_expired'))
             except Exception:
                 pass
+            context.bot_data.pop(retry_key, None)
             return
 
         # Сброс дневного счётчика при наступлении reset_ts или если он не установлен
@@ -6752,7 +5618,7 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
             db.update_player(user_id, auto_search_count=count, auto_search_reset_ts=reset_ts)
 
         # Лимит в сутки (с учётом возможного буста)
-        daily_limit = db.get_auto_search_daily_limit(user_id)
+        daily_limit = db.get_auto_search_daily_limit(user_id, username=getattr(player, 'username', None))
         if count >= daily_limit:
             # Если был тихий режим — отчет
             if getattr(player, 'auto_search_silent', False):
@@ -6764,58 +5630,40 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=user_id, text=t(lang, 'auto_limit_reached'))
             except Exception:
                 pass
+            context.bot_data.pop(retry_key, None)
             return
 
-        # Учитываем кулдаун (VIP+ - x0.25, VIP - x0.5)
-        vip_plus_active = db.is_vip_plus(user_id)
-        vip_active = db.is_vip(user_id)  # сначала проверяли VIP выше
-        
-        base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-        if vip_plus_active:
-            eff_search_cd = base_search_cd / 4
-        elif vip_active:
-            eff_search_cd = base_search_cd / 2
-        else:
-            eff_search_cd = base_search_cd
+        eff_search_cd = _effective_search_cooldown(access)
         time_since_last = time.time() - float(getattr(player, 'last_search', 0) or 0.0)
         if time_since_last < eff_search_cd:
             delay = max(1.0, eff_search_cd - time_since_last)
-            try:
-                context.application.job_queue.run_once(
-                    auto_search_job,
-                    when=delay,
-                    chat_id=user_id,
-                    name=f"auto_search_{user_id}",
-                )
-            except Exception as e:
-                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (кулдаун) для {user_id}: {e}")
+            _reschedule_auto_search(context, user_id, delay)
             return
 
         # Анти-гонки: используем общий локер для поиска
         lock = _get_lock(f"user:{user_id}:search")
         if lock.locked():
             # Если параллельно идёт ручной поиск — попробуем позже
-            try:
-                context.application.job_queue.run_once(
-                    auto_search_job,
-                    when=5,
-                    chat_id=user_id,
-                    name=f"auto_search_{user_id}",
-                )
-            except Exception as e:
-                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (lock) для {user_id}: {e}")
+            _reschedule_auto_search(context, user_id, 5)
             return
+
         async with lock:
             result = await _perform_energy_search(user_id, player.username or str(user_id), context)
 
+            if result.get('status') == 'ok':
+                # Атомарный инкремент счётчика (SEC-01 fix)
+                new_count = db.increment_auto_search_count(user_id)
+                if new_count < 0:
+                    logger.warning(f"[AUTO] Не удалось инкрементировать auto_search_count для {user_id}")
+                    new_count = count + 1
+                count = new_count
+
+        # Сбрасываем retry-счётчик при успехе
+        context.bot_data.pop(retry_key, None)
+
         if result.get('status') == 'ok':
-            # Инкремент счётчика и переназначение по кулдауну
-            try:
-                player = db.get_or_create_player(user_id, player.username or str(user_id))
-                count = int(getattr(player, 'auto_search_count', 0) or 0) + 1
-                db.update_player(user_id, auto_search_count=count)
-            except Exception:
-                pass
+            # Перечитываем player для актуальных данных
+            player = db.get_or_create_player(user_id, player.username or str(user_id))
 
             # Проверяем режим (тихий или обычный)
             is_silent = getattr(player, 'auto_search_silent', False)
@@ -6827,17 +5675,14 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     stats_json = getattr(player, 'auto_search_session_stats', '{}') or '{}'
                     try:
                         stats = json.loads(stats_json)
-                    except:
+                    except Exception:
                         stats = {}
                     
                     # Обновляем данные
                     found_count = int(result.get('found_count', 1) or 1)
                     stats['total_found'] = stats.get('total_found', 0) + found_count
                     
-                    # Извлекаем награду из лога или результата (в result нет точной суммы, но мы можем примерно восстановить или передать из _perform_energy_search)
-                    # В _perform_energy_search мы не возвращаем точную сумму монет, добавим это.
-                    # Пока возьмем из caption парсингом или просто добавим в result
-                    earned_coins = result.get('earned_coins', 0) # Нужно добавить в _perform_energy_search
+                    earned_coins = result.get('earned_coins', 0)
                     stats['total_coins'] = stats.get('total_coins', 0) + earned_coins
                     
                     rarities = result.get('rarities')
@@ -6861,17 +5706,20 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                     img_paths = result.get("image_paths") or []
                     existing = [p for p in img_paths if p and os.path.exists(p)]
                     found_count = int(result.get('found_count', 1) or 1)
+                    caption = result.get("caption")
                     if found_count >= 2 and len(existing) >= 2:
                         f1 = None
                         f2 = None
                         try:
                             f1 = open(existing[0], 'rb')
                             f2 = open(existing[1], 'rb')
-                            media = [
-                                InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
-                                InputMediaPhoto(media=f2),
-                            ]
-                            await _send_media_group_long(context.bot.send_media_group, chat_id=user_id, media=media)
+                            await _send_media_group_or_text_fallback(
+                                context.bot,
+                                chat_id=user_id,
+                                photos=[f1, f2],
+                                caption=caption,
+                                parse_mode='HTML',
+                            )
                         finally:
                             try:
                                 if f1:
@@ -6885,26 +5733,26 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                                 pass
                     elif existing:
                         with open(existing[0], 'rb') as photo:
-                            await _send_photo_long(
-                                context.bot.send_photo,
+                            await _send_photo_or_text_fallback(
+                                context.bot,
                                 chat_id=user_id,
                                 photo=photo,
-                                caption=result.get("caption"),
+                                caption=caption,
                                 reply_markup=result.get("reply_markup"),
-                                parse_mode='HTML'
+                                parse_mode='HTML',
                             )
                     else:
                         await context.bot.send_message(
                             chat_id=user_id,
-                            text=result.get("caption"),
+                            text=(caption or '')[:4096],
                             reply_markup=result.get("reply_markup"),
                             parse_mode='HTML'
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[AUTO] Не удалось отправить результат поиска user {user_id}: {e}")
 
             # Если достигнут лимит — отключаем и уведомляем
-            daily_limit = db.get_auto_search_daily_limit(user_id)
+            daily_limit = db.get_auto_search_daily_limit(user_id, username=getattr(player, 'username', None))
             if count >= daily_limit:
                 # Если был тихий режим — отчет
                 if is_silent:
@@ -6919,29 +5767,13 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Назначаем следующий запуск после полного КД
-            try:
-                context.application.job_queue.run_once(
-                    auto_search_job,
-                    when=eff_search_cd,
-                    chat_id=user_id,
-                    name=f"auto_search_{user_id}",
-                )
-                logger.debug(f"[AUTO] Запланирован следующий автопоиск для {user_id} через {eff_search_cd} сек")
-            except Exception as e:
-                logger.error(f"[AUTO] Критическая ошибка: не удалось запланировать следующий автопоиск для {user_id}: {e}")
+            _reschedule_auto_search(context, user_id, eff_search_cd)
+            logger.debug(f"[AUTO] Запланирован следующий автопоиск для {user_id} через {eff_search_cd} сек")
             return
 
         elif result.get('status') == 'cooldown':
             delay = max(1.0, float(result.get('time_left', 5)))
-            try:
-                context.application.job_queue.run_once(
-                    auto_search_job,
-                    when=delay,
-                    chat_id=user_id,
-                    name=f"auto_search_{user_id}",
-                )
-            except Exception as e:
-                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (cooldown result) для {user_id}: {e}")
+            _reschedule_auto_search(context, user_id, delay)
             return
         elif result.get('status') == 'no_drinks':
             # Сообщим один раз и попробуем через 10 минут
@@ -6949,30 +5781,38 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=user_id, text="В базе данных пока нет энергетиков для автопоиска.")
             except Exception:
                 pass
-            try:
-                context.application.job_queue.run_once(
-                    auto_search_job,
-                    when=600,
-                    chat_id=user_id,
-                    name=f"auto_search_{user_id}",
-                )
-            except Exception as e:
-                logger.warning(f"[AUTO] Не удалось запланировать автопоиск (no_drinks) для {user_id}: {e}")
+            _reschedule_auto_search(context, user_id, 600)
             return
     except Exception:
         logger.exception("[AUTO] Ошибка в auto_search_job")
-        # На случай исключений попробуем снова через 1 минуту
+        # Exponential backoff с потолком (SEC-04 fix)
         try:
             if hasattr(context, 'job') and context.job and context.job.chat_id:
                 user_id = context.job.chat_id
-                context.application.job_queue.run_once(
-                    auto_search_job,
-                    when=60,
-                    chat_id=user_id,
-                    name=f"auto_search_{user_id}",
-                )
+                retry_key = f"auto_search_retries_{user_id}"
+                retries = int(context.bot_data.get(retry_key, 0))
+                if retries >= MAX_AUTO_SEARCH_RETRIES:
+                    logger.error(
+                        f"[AUTO] Превышено число ретраев ({MAX_AUTO_SEARCH_RETRIES}) "
+                        f"для user {user_id}. Отключаю автопоиск."
+                    )
+                    db.update_player(user_id, auto_search_enabled=False)
+                    context.bot_data.pop(retry_key, None)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text="⚠️ Автопоиск был отключён из-за повторяющихся ошибок. "
+                                 "Попробуйте включить повторно в настройках."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    context.bot_data[retry_key] = retries + 1
+                    delay = min(60 * (2 ** retries), 3600)  # 60s, 120s, 240s... max 1h
+                    _reschedule_auto_search(context, user_id, delay)
         except Exception as e:
             logger.warning(f"[AUTO] Не удалось перезапустить auto_search_job после ошибки: {e}")
+
 
 async def silk_harvest_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """Периодическая проверка готовности урожая шёлка."""
@@ -7012,22 +5852,22 @@ async def send_silk_harvest_notification(context: ContextTypes.DEFAULT_TYPE, use
         if count == 1:
             plantation = plantations[0]
             text = (
-                f"{SILK_EMOJIS['ready']} **Урожай готов!**\n\n"
-                f"{SILK_EMOJIS['plantation']} Плантация: **{plantation.plantation_name}**\n"
-                f"{SILK_EMOJIS['coins']} Ожидаемый доход: **{plantation.expected_yield:,}** септимов\n\n"
+                f"{SILK_EMOJIS['ready']} <b>Урожай готов!</b>\n\n"
+                f"{SILK_EMOJIS['plantation']} Плантация: <b>{html.escape(str(plantation.plantation_name))}</b>\n"
+                f"{SILK_EMOJIS['coins']} Ожидаемый доход: <b>{plantation.expected_yield:,}</b> септимов\n\n"
                 f"Пора собирать шёлк!"
             )
         else:
             text = (
-                f"{SILK_EMOJIS['ready']} **Урожай готов!**\n\n"
-                f"{SILK_EMOJIS['plantation']} Готово к сбору: **{count} плантаций**\n\n"
+                f"{SILK_EMOJIS['ready']} <b>Урожай готов!</b>\n\n"
+                f"{SILK_EMOJIS['plantation']} Готово к сбору: <b>{count} плантаций</b>\n\n"
             )
             
             total_expected = sum(p.expected_yield for p in plantations)
             for plantation in plantations:
-                text += f"• {plantation.plantation_name} ({plantation.expected_yield:,} септимов)\n"
+                text += f"• {html.escape(str(plantation.plantation_name))} ({plantation.expected_yield:,} септимов)\n"
             
-            text += f"\n{SILK_EMOJIS['coins']} Общий ожидаемый доход: **{total_expected:,}** септимов"
+            text += f"\n{SILK_EMOJIS['coins']} Общий ожидаемый доход: <b>{total_expected:,}</b> септимов"
         
         keyboard = [
             [InlineKeyboardButton(f"{SILK_EMOJIS['plantation']} Мои плантации", callback_data='silk_plantations')],
@@ -7051,20 +5891,12 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     обновляет БД и возвращает результат в виде словаря.
     """
     player = db.get_or_create_player(user_id, username)
+    access = db.get_access_profile(user_id, username=username, player=player)
+    lang = getattr(player, 'language', 'ru') or 'ru'
     rating_value = int(getattr(player, 'rating', 0) or 0)
 
-    # Проверка кулдауна (VIP — x0.5, VIP+ — x0.25)
     current_time = time.time()
-    vip_plus_active = db.is_vip_plus(user_id)
-    vip_active = db.is_vip(user_id)
-    
-    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-    if vip_plus_active:
-        eff_search_cd = base_search_cd / 4
-    elif vip_active:
-        eff_search_cd = base_search_cd / 2
-    else:
-        eff_search_cd = base_search_cd
+    eff_search_cd = _effective_search_cooldown(access)
     if current_time - player.last_search < eff_search_cd:
         time_left = eff_search_cd - (current_time - player.last_search)
         return {"status": "cooldown", "time_left": time_left}
@@ -7082,26 +5914,32 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
 
     luck_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0)
     used_luck_coupon = False
-    double_drop_chance = 0.50 if luck_charges > 0 else 0.10
-    found_count = 2 if (random.random() < double_drop_chance) else 1
-    if found_count == 2 and luck_charges > 0:
-        used_luck_coupon = True
-        try:
-            db.update_player(user_id, luck_coupon_charges=max(0, luck_charges - 1))
-            luck_charges = max(0, luck_charges - 1)
-        except Exception:
-            pass
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        found_count = 2
+    else:
+        double_drop_chance = 0.50 if luck_charges > 0 else 0.10
+        found_count = 2 if (random.random() < double_drop_chance) else 1
+        if found_count == 2 and luck_charges > 0:
+            used_luck_coupon = True
+            try:
+                db.update_player(user_id, luck_coupon_charges=max(0, luck_charges - 1))
+                luck_charges = max(0, luck_charges - 1)
+            except Exception:
+                pass
 
     drops: list[dict] = []
     rarities_found: list[str] = []
 
-    # Базовая награда монет за факт поиска (один раз за поиск)
-    septims_reward = random.randint(5, 10)
-    if vip_active:
-        septims_reward *= 2
+    septims_reward = int(access.get('fixed_search_reward', 0) or 0)
+    if septims_reward <= 0:
+        septims_reward = random.randint(5, 10)
+        if access.get('acts_like_vip'):
+            septims_reward *= 2
 
     coins_before = int(player.coins or 0)
-    coins_after = coins_before + septims_reward
+    # coins_after вычисляется для отображения, а реальное начисление
+    # делается через атомарный db.increment_coins() ниже (VULN-005 fix).
+    total_reward = septims_reward  # будем накапливать все начисления
 
     total_autosell_payout = 0
 
@@ -7141,7 +5979,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
                     unit_payout = 0
                 if unit_payout > 0:
                     autosell_payout = unit_payout
-                    coins_after += autosell_payout
+                    total_reward += autosell_payout
                     total_autosell_payout += autosell_payout
         except Exception:
             autosell_enabled = False
@@ -7194,15 +6032,19 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         import traceback
         traceback.print_exc()
 
-    # Обновляем игрока: фиксируем время поиска, новый баланс и рейтинг
+    # Обновляем игрока: фиксируем время поиска и рейтинг.
+    # Баланс обновляем атомарно через increment_coins, чтобы не перезаписать
+    # параллельные изменения от других обработчиков (казино, подарки, админ).
     new_rating = db.increment_rating(user_id, 1)
-    db.update_player(user_id, last_search=current_time, coins=coins_after)
+    coins_after_result = db.increment_coins(user_id, total_reward)
+    coins_after = coins_after_result if coins_after_result is not None else (coins_before + total_reward)
+    db.update_player(user_id, last_search=current_time)
     try:
         names = ", ".join([d['drink'].name for d in drops])
     except Exception:
         names = "?"
     logger.info(
-        f"[SEARCH] User {username} ({user_id}) found x{found_count}: {names} | +{septims_reward} coins, autosell_total={total_autosell_payout} -> {coins_after}"
+        f"[SEARCH] User {esc(username)} ({user_id}) found x{found_count}: {names} | +{septims_reward} coins, autosell_total={total_autosell_payout} -> {coins_after}"
     )
 
     # Планируем автонапоминание через JobQueue, если включено (учёт VIP-кулдауна)
@@ -7217,116 +6059,20 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         except Exception as ex:
             logger.warning(f"Не удалось запланировать напоминание: {ex}")
 
-    # Формируем сообщение
-    
-    # Проверяем VIP статус с приоритетом VIP+
-    vip_plus_ts = db.get_vip_plus_until(user_id)
-    vip_ts = db.get_vip_until(user_id)
-    current_time = time.time()
-    
-    if vip_plus_ts and current_time < vip_plus_ts and safe_format_timestamp(vip_plus_ts):
-        vip_line = f"\n{VIP_PLUS_EMOJI} VIP+ до: {safe_format_timestamp(vip_plus_ts)}"
-    elif vip_ts and current_time < vip_ts and safe_format_timestamp(vip_ts):
-        vip_line = f"\n{VIP_EMOJI} V.I.P до: {safe_format_timestamp(vip_ts)}"
-    else:
-        vip_line = ''
-    
-    if found_count == 1 and drops:
-        d0 = drops[0]
-        found_drink = d0['drink']
-        rarity = d0['rarity']
-        drink_temp = d0['temp']
-        autosell_enabled = d0['autosell_enabled']
-        autosell_payout = d0['autosell_payout']
-
-        rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
-        if drink_temp == 'hot':
-            temp_emoji = '🔥'
-            temp_text = 'Горячий напиток! (давно не попадался)'
-        elif drink_temp == 'cold':
-            temp_emoji = '❄️'
-            temp_text = 'Холодный напиток (недавно находили)'
-        else:
-            temp_emoji = '🌡️'
-            temp_text = 'Нейтральный'
-
-        caption_lines = [
-            f"🎉 Ты нашел энергетик!{vip_line}",
-            "",
-            f"<b>Название:</b> {found_drink.name}",
-            f"<b>Редкость:</b> {rarity_emoji} {rarity}",
-            f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>",
-            f"💰 <b>Награда:</b> +{septims_reward} септимов",
-        ]
-
-        if autosell_enabled and autosell_payout > 0:
-            caption_lines.append(f"🧾 <b>Автопродажа:</b> +{autosell_payout} септимов (энергетик сразу продан через Приёмник)")
-
-        caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
-        if new_rating is not None:
-            caption_lines.append(f"⭐ <b>Рейтинг:</b> {new_rating}")
-            
-        if swaga_cards_found:
-            swaga_counts = {}
-            for seq in swaga_cards_found:
-                swaga_counts[seq] = swaga_counts.get(seq, 0) + 1
-            swaga_text = ", ".join([f"{c}x {st}" for st, c in swaga_counts.items()])
-            caption_lines.append(f"🎫 <b>Свага-карточки ({swaga_cards_total}):</b> {swaga_text}")
-            
-        caption_lines.append("")
-        caption_lines.append(f"<i>{found_drink.description}</i>")
-    else:
-        caption_lines = [
-            f"🎉 Джекпот! Ты нашел 2 энергетика!{vip_line}",
-            "",
-        ]
-
-        if used_luck_coupon:
-            caption_lines.append(f"🎲 <b>Купон удачи:</b> использован (осталось {luck_charges})")
-            caption_lines.append("")
-
-        for idx, d in enumerate(drops, start=1):
-            found_drink = d['drink']
-            rarity = d['rarity']
-            drink_temp = d['temp']
-            autosell_enabled = d['autosell_enabled']
-            autosell_payout = d['autosell_payout']
-
-            rarity_emoji = COLOR_EMOJIS.get(rarity, '⚫')
-            if drink_temp == 'hot':
-                temp_emoji = '🔥'
-                temp_text = 'Горячий напиток! (давно не попадался)'
-            elif drink_temp == 'cold':
-                temp_emoji = '❄️'
-                temp_text = 'Холодный напиток (недавно находили)'
-            else:
-                temp_emoji = '🌡️'
-                temp_text = 'Нейтральный'
-
-            caption_lines.append(f"<b>{idx}) {found_drink.name}</b>")
-            caption_lines.append(f"<b>Редкость:</b> {rarity_emoji} {rarity}")
-            caption_lines.append(f"{temp_emoji} <b>Статус:</b> <i>{temp_text}</i>")
-            if autosell_enabled and autosell_payout > 0:
-                caption_lines.append(f"🧾 <b>Автопродажа:</b> +{autosell_payout} септимов (энергетик сразу продан через Приёмник)")
-            caption_lines.append("")
-            caption_lines.append(f"<i>{found_drink.description}</i>")
-            caption_lines.append("")
-
-        caption_lines.append(f"💰 <b>Награда за поиск:</b> +{septims_reward} септимов")
-        if total_autosell_payout > 0:
-            caption_lines.append(f"🧾 <b>Автопродажа всего:</b> +{total_autosell_payout} септимов")
-        caption_lines.append(f"💰 <b>Баланс:</b> {coins_after}")
-        if new_rating is not None:
-            caption_lines.append(f"⭐ <b>Рейтинг:</b> {new_rating}")
-
-        if swaga_cards_found:
-            swaga_counts = {}
-            for seq in swaga_cards_found:
-                swaga_counts[seq] = swaga_counts.get(seq, 0) + 1
-            swaga_text = ", ".join([f"{c}x {st}" for st, c in swaga_counts.items()])
-            caption_lines.append(f"🎫 <b>Свага-карточки ({swaga_cards_total}):</b> {swaga_text}")
-
-    caption = "\n".join(caption_lines)
+    caption = _format_search_result_caption(
+        lang=lang,
+        access=access,
+        drops=drops,
+        found_count=found_count,
+        septims_reward=septims_reward,
+        total_autosell_payout=total_autosell_payout,
+        coins_after=coins_after,
+        new_rating=new_rating,
+        swaga_cards_found=swaga_cards_found,
+        swaga_cards_total=swaga_cards_total,
+        used_luck_coupon=used_luck_coupon,
+        luck_charges_left=luck_charges,
+    )
     image_paths: list[str | None] = []
     try:
         for d in drops:
@@ -7362,33 +6108,15 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         # Предварительная проверка кулдауна для быстрого ответа
         player = db.get_or_create_player(user.id, user.username or user.first_name)
-        vip_plus_active = db.is_vip_plus(user.id)
-        vip_active = db.is_vip(user.id)
-        base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-        if vip_plus_active:
-            eff_search_cd = base_search_cd / 4
-        elif vip_active:
-            eff_search_cd = base_search_cd / 2
-        else:
-            eff_search_cd = base_search_cd
+        access = _get_access_profile(user, player=player)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+        eff_search_cd = _effective_search_cooldown(access)
         if time.time() - player.last_search < eff_search_cd:
             await query.answer("Ещё не время! Подожди немного.", show_alert=True)
             return
         
         await query.answer()
-
-        # Плавная анимация поиска
-        search_frames = [
-            "⏳ Ищем энергетик…",
-            "🔍 Ищем энергетик…",
-            "🕵️‍♂️ Ищем энергетик…"
-        ]
-        for frame in search_frames:
-            try:
-                await query.edit_message_text(frame)
-            except BadRequest:
-                pass  # может быть, если сообщение не изменилось
-            await asyncio.sleep(0.7)
+        await _run_search_animation(lambda text: query.edit_message_text(text, parse_mode='HTML'), lang)
 
         # Выполняем основную логику
         result = await _perform_energy_search(user.id, user.username or user.first_name, context)
@@ -7406,17 +6134,20 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             img_paths = result.get("image_paths") or []
             existing = [p for p in img_paths if p and os.path.exists(p)]
             found_count = int(result.get('found_count', 1) or 1)
+            caption = result.get("caption")
             if found_count >= 2 and len(existing) >= 2:
                 f1 = None
                 f2 = None
                 try:
                     f1 = open(existing[0], 'rb')
                     f2 = open(existing[1], 'rb')
-                    media = [
-                        InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
-                        InputMediaPhoto(media=f2),
-                    ]
-                    await _send_media_group_long(context.bot.send_media_group, chat_id=query.message.chat_id, media=media)
+                    await _send_media_group_or_text_fallback(
+                        context.bot,
+                        chat_id=query.message.chat_id,
+                        photos=[f1, f2],
+                        caption=caption,
+                        parse_mode='HTML',
+                    )
                 finally:
                     try:
                         if f1:
@@ -7430,18 +6161,18 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
             elif existing:
                 with open(existing[0], 'rb') as photo:
-                    await _send_photo_long(
-                        context.bot.send_photo,
+                    await _send_photo_or_text_fallback(
+                        context.bot,
                         chat_id=query.message.chat_id,
                         photo=photo,
-                        caption=result["caption"],
+                        caption=caption,
                         reply_markup=result["reply_markup"],
-                        parse_mode='HTML'
+                        parse_mode='HTML',
                     )
             else:
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text=result["caption"],
+                    text=(caption or '')[:4096],
                     reply_markup=result["reply_markup"],
                     parse_mode='HTML'
                 )
@@ -7503,9 +6234,9 @@ async def show_roulette_animation(
             roulette_text = title + "\n\n"
             for i, (_, display_name) in enumerate(rewards_display):
                 if i == current_pos:
-                    roulette_text += f"➡️ <b>{display_name}</b>\n"
+                    roulette_text += f"➡️ <b>{esc(display_name)}</b>\n"
                 else:
-                    roulette_text += f"     {display_name}\n"
+                    roulette_text += f"     {esc(display_name)}\n"
             
             # Обновляем сообщение
             try:
@@ -7544,6 +6275,7 @@ async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TY
         username=getattr(user, 'username', None),
         display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None)),
     )
+    access = _get_access_profile(user, player=player)
     lang = getattr(player, 'language', 'ru') or 'ru'
     status = db.get_daily_bonus_status(
         user.id,
@@ -7591,7 +6323,8 @@ async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TY
             f" | Гарант эпика: <b>{'готов' if int(status.get('epic_pity_remaining', 0) or 0) <= 0 else 'через ' + str(int(status.get('epic_pity_remaining', 0) or 0))}</b>"
         )
         vip_line = (
-            f"⚡ VIP: КД x0.5, VIP+: КД x0.25. Мягкое окно серии: <b>{_daily_bonus_format_window(int(status.get('grace_window', 0) or 0), lang)}</b>."
+            f"⚡ VIP: КД x0.5, VIP+/Admin/Admin+: КД x0.25. Ваш статус: <b>{html.escape(str(access.get('label_ru') or 'Обычный игрок'))}</b>. "
+            f"Мягкое окно серии: <b>{_daily_bonus_format_window(int(status.get('grace_window', 0) or 0), lang)}</b>."
         )
         bonus_line = (
             f"⭐ Бонус рейтинга к редким шансам: <b>до +5%</b> (сейчас: <b>+{float(status.get('rating_bonus_fraction', 0.0) or 0.0) * 100:.2f}%</b>)."
@@ -7621,7 +6354,8 @@ async def show_daily_bonus_info(update: Update, context: ContextTypes.DEFAULT_TY
             f" | Epic pity: <b>{'ready' if int(status.get('epic_pity_remaining', 0) or 0) <= 0 else 'in ' + str(int(status.get('epic_pity_remaining', 0) or 0))}</b>"
         )
         vip_line = (
-            f"⚡ VIP: x0.5 cooldown, VIP+: x0.25 cooldown. Streak grace window: <b>{_daily_bonus_format_window(int(status.get('grace_window', 0) or 0), lang)}</b>."
+            f"⚡ VIP: x0.5 cooldown, VIP+/Admin/Admin+: x0.25 cooldown. Your status: <b>{html.escape(str(access.get('label_en') or 'Regular player'))}</b>. "
+            f"Streak grace window: <b>{_daily_bonus_format_window(int(status.get('grace_window', 0) or 0), lang)}</b>."
         )
         bonus_line = (
             f"⭐ Rating bonus to rare odds: <b>up to +5%</b> (now: <b>+{float(status.get('rating_bonus_fraction', 0.0) or 0.0) * 100:.2f}%</b>)."
@@ -7816,7 +6550,11 @@ async def claim_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Отправляем финальное сообщение с наградой
         back_label = "🔙 В меню" if lang == 'ru' else "🔙 Menu"
-        keyboard = [[InlineKeyboardButton(back_label, callback_data='menu')]]
+        info_label = "ℹ️ Инфо о бонусе" if lang == 'ru' else "ℹ️ Bonus info"
+        keyboard = [
+            [InlineKeyboardButton(info_label, callback_data='daily_bonus_info')],
+            [InlineKeyboardButton(back_label, callback_data='menu')],
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         drink_payload = roulette_reward.get('drink') or {}
@@ -7920,14 +6658,14 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 inventory_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
                 current_rarity = item.rarity
             display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
-            inventory_text += f"• {display_name} — <b>{item.quantity} шт.</b>\n"
+            inventory_text += f"• {esc(display_name)} — <b>{item.quantity} шт.</b>\n"
 
         # Клавиатура с кнопками предметов (2 в строке)
         keyboard_rows = []
         current_row = []
         for item in page_items:
             display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
-            btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
+            btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {esc(display_name)}"
             callback = f"view_{item.id}_p{page}"
             current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
             if len(current_row) == 2:
@@ -8090,14 +6828,14 @@ async def show_inventory_search_results(update: Update, context: ContextTypes.DE
             search_text += f"\n<b>{rarity_emoji} {item.rarity}</b>\n"
             current_rarity = item.rarity
         display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
-        search_text += f"• {display_name} — <b>{item.quantity} шт.</b>\n"
+        search_text += f"• {esc(display_name)} — <b>{item.quantity} шт.</b>\n"
     
     # Клавиатура с кнопками предметов (2 в строке)
     keyboard_rows = []
     current_row = []
     for item in page_items:
         display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
-        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {esc(display_name)}"
         callback = f"view_{item.id}_sp{page}"
         current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
         if len(current_row) == 2:
@@ -8188,18 +6926,8 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )[:3]
 
     # VIP статус
-    vip_ts = db.get_vip_until(user_id)
-    vip_plus_ts = db.get_vip_plus_until(user_id)
-    vip_active = bool(vip_ts and time.time() < vip_ts)
-    vip_plus_active = bool(vip_plus_ts and time.time() < vip_plus_ts)
-
-    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-    if vip_plus_active:
-        search_cd = base_search_cd / 4
-    elif vip_active:
-        search_cd = base_search_cd / 2
-    else:
-        search_cd = base_search_cd
+    access = _get_access_profile(user, player=player)
+    search_cd = _effective_search_cooldown(access)
     last_search_val = float(getattr(player, 'last_search', 0) or 0)
     search_time_left = max(0, search_cd - (time.time() - last_search_val))
 
@@ -8215,19 +6943,12 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats_text += f"━━━━━━━━━━━━━━━━━━━\n\n"
     
     # Информация о пользователе
-    username_display = f"@{user.username}" if user.username else user.first_name
-    stats_text += f"👤 <b>Игрок:</b> {username_display}\n"
+    username_display = f"@{esc(user.username)}" if user.username else user.first_name
+    stats_text += f"👤 <b>Игрок:</b> {esc(username_display)}\n"
     stats_text += f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
     
-    # VIP статус
-    if vip_plus_active:
-        vip_until_str = safe_format_timestamp(vip_plus_ts, '%d.%m.%Y %H:%M')
-        stats_text += f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_until_str})\n"
-    elif vip_active:
-        vip_until_str = safe_format_timestamp(vip_ts, '%d.%m.%Y %H:%M')
-        stats_text += f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until_str})\n"
-    else:
-        stats_text += f"📊 <b>Статус:</b> Обычный игрок\n"
+    # Статус (через access-tier)
+    stats_text += _status_text_from_access(access, lang) + "\n"
     
     stats_text += f"\n"
 
@@ -8274,8 +6995,8 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"следующий milestone <b>{int(bonus_status.get('next_milestone_target', 0) or 0)}</b>\n"
         )
     
-    # Автопоиск (только для VIP)
-    if vip_active or vip_plus_active:
+    # Автопоиск (только для VIP/Admin)
+    if access.get('quick_access_eligible'):
         auto_status = "Включен ✅" if player.auto_search_enabled else "Выключен ❌"
         stats_text += f"• Автопоиск: {auto_status}\n"
         
@@ -8288,13 +7009,16 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reset_ts == 0 or now_ts >= reset_ts:
             current_count = 0
         
-        # Получаем правильный лимит с учетом VIP+ и бустов
+        # Получаем правильный лимит с учетом VIP+/Admin и бустов
         try:
             daily_limit = db.get_auto_search_daily_limit(user_id)
         except:
             # Если ошибка, используем базовый лимит
             daily_limit = AUTO_SEARCH_DAILY_LIMIT
-            if vip_plus_active:
+            auto_extra = int(access.get('auto_search_extra', 0) or 0)
+            if auto_extra:
+                daily_limit += auto_extra
+            elif access.get('acts_like_vip_plus'):
                 daily_limit *= 2
         
         stats_text += f"  └ Поисков сегодня: {current_count}/{daily_limit}\n"
@@ -8366,10 +7090,15 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif (player.casino_wins or 0) >= 50:
         achievements.append("🎲 Везунчик")
     
-    # Достижения VIP
-    if vip_plus_active:
+    # Достижения VIP/Admin
+    tier = str(access.get('tier') or 'ordinary')
+    if tier == 'admin_plus':
+        achievements.append(f"{ADMIN_PLUS_EMOJI} Admin+")
+    elif tier == 'admin':
+        achievements.append(f"{ADMIN_EMOJI} Admin")
+    elif tier == 'vip_plus' or access.get('vip_plus_active_timed'):
         achievements.append("💎 VIP+ персона")
-    elif vip_active:
+    elif tier == 'vip' or access.get('vip_active_timed'):
         achievements.append("👑 VIP персона")
     
     if achievements:
@@ -8409,20 +7138,10 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = db.get_or_create_player(user_id, user.username or user.first_name)
     lang = player.language
 
-    username_display = f"@{user.username}" if user.username else user.first_name
+    username_display = f"@{esc(user.username)}" if user.username else user.first_name
 
-    vip_ts = db.get_vip_until(user_id)
-    vip_plus_ts = db.get_vip_plus_until(user_id)
-    vip_active = bool(vip_ts and time.time() < vip_ts)
-    vip_plus_active = bool(vip_plus_ts and time.time() < vip_plus_ts)
-
-    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-    if vip_plus_active:
-        search_cd = base_search_cd / 4
-    elif vip_active:
-        search_cd = base_search_cd / 2
-    else:
-        search_cd = base_search_cd
+    access = _get_access_profile(user, player=player)
+    search_cd = _effective_search_cooldown(access)
     last_search_val = float(getattr(player, 'last_search', 0) or 0)
     search_time_left = max(0, search_cd - (time.time() - last_search_val))
 
@@ -8433,14 +7152,7 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     bonus_time_left = int(bonus_status.get('time_left', 0) or 0) if bonus_status.get('ok') and not bonus_status.get('available') else 0
 
-    if vip_plus_active:
-        vip_until_str = safe_format_timestamp(vip_plus_ts, '%d.%m.%Y %H:%M')
-        status_line = f"💎 <b>Статус:</b> {VIP_PLUS_EMOJI} V.I.P+ (до {vip_until_str})" if lang == 'ru' else f"💎 <b>Status:</b> {VIP_PLUS_EMOJI} V.I.P+ (until {vip_until_str})"
-    elif vip_active:
-        vip_until_str = safe_format_timestamp(vip_ts, '%d.%m.%Y %H:%M')
-        status_line = f"👑 <b>Статус:</b> {VIP_EMOJI} V.I.P (до {vip_until_str})" if lang == 'ru' else f"👑 <b>Status:</b> {VIP_EMOJI} V.I.P (until {vip_until_str})"
-    else:
-        status_line = "📊 <b>Статус:</b> Обычный игрок" if lang == 'ru' else "📊 <b>Status:</b> Regular player"
+    status_line = _status_text_from_access(access, lang)
 
     timing_lines = []
     if lang == 'ru':
@@ -8477,7 +7189,7 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timing_block = "\n" + "\n".join(timing_lines) if timing_lines else ""
 
     auto_line = ""
-    if vip_active or vip_plus_active:
+    if access.get('quick_access_eligible'):
         auto_enabled = bool(getattr(player, 'auto_search_enabled', False))
         auto_state = "Включен ✅" if auto_enabled else "Выключен ❌"
 
@@ -8487,10 +7199,14 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reset_ts == 0 or now_ts >= reset_ts:
             current_count = 0
         try:
-            daily_limit = db.get_auto_search_daily_limit(user_id)
+            daily_limit = db.get_auto_search_daily_limit(user_id, username=getattr(user, 'username', None))
         except Exception:
             daily_limit = AUTO_SEARCH_DAILY_LIMIT
-            if vip_plus_active:
+            if str(access.get('tier') or '') == 'admin':
+                daily_limit += 20
+            elif str(access.get('tier') or '') == 'admin_plus':
+                daily_limit += 60
+            elif str(access.get('tier') or '') == 'vip_plus':
                 daily_limit *= 2
 
         if lang == 'ru':
@@ -8506,7 +7222,7 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_text = (
         f"{title}\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>Игрок:</b> {username_display}\n"
+        f"👤 <b>Игрок:</b> {esc(username_display)}\n"
         f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
         f"💰 <b>Баланс:</b> {int(getattr(player, 'coins', 0) or 0)} 🪙\n"
         f"{rating_line}\n"
@@ -8524,7 +7240,7 @@ async def show_my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         friends_label = "👥 Друзья" if lang == 'ru' else "👥 Friends"
     stats_label = "📊 Статистика" if lang == 'ru' else "📊 Stats"
-    boosts_label = "🚀 Бусты" if lang == 'ru' else "🚀 Boosts"
+    boosts_label = "🚀 Бусты и купоны" if lang == 'ru' else "🚀 Boosts & coupons"
     promo_label = "🎟 Промокод" if lang == 'ru' else "🎟 Promo"
     vip_label = "👑 VIP" if lang == 'ru' else "👑 VIP"
     vip_plus_label = f"{VIP_PLUS_EMOJI} VIP+"
@@ -8723,21 +7439,34 @@ async def show_profile_friends(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pending_cnt = 0
     pending_cnt = int(pending_cnt or 0)
+    try:
+        outgoing_cnt = int((db.list_pending_outgoing_friend_requests(user.id, page=0, per_page=1) or {}).get('total') or 0)
+    except Exception:
+        outgoing_cnt = 0
+    try:
+        friends_cnt = int((db.list_friends(user.id, page=0, per_page=1) or {}).get('total') or 0)
+    except Exception:
+        friends_cnt = 0
 
     title = "👥 <b>Друзья</b>" if lang == 'ru' else "👥 <b>Friends</b>"
     text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
     if lang == 'ru':
         text_lines.append(f"📨 Заявки в друзья: <b>{pending_cnt}</b>")
+        text_lines.append(f"📤 Исходящие заявки: <b>{outgoing_cnt}</b>")
+        text_lines.append(f"👤 Друзей: <b>{friends_cnt}</b>")
         text_lines.append("Выберите действие ниже.")
     else:
         text_lines.append(f"📨 Friend requests: <b>{pending_cnt}</b>")
+        text_lines.append(f"📤 Outgoing requests: <b>{outgoing_cnt}</b>")
+        text_lines.append(f"👤 Friends: <b>{friends_cnt}</b>")
         text_lines.append("Choose an action below.")
     text = "\n".join(text_lines)
 
     kb = []
     kb.append([InlineKeyboardButton("➕ Добавить друга" if lang == 'ru' else "➕ Add friend", callback_data='friends_add_start')])
     kb.append([InlineKeyboardButton(("📨 Заявки" if lang == 'ru' else "📨 Requests") + (f" ({pending_cnt})" if pending_cnt > 0 else ""), callback_data='friends_requests_0')])
-    kb.append([InlineKeyboardButton("👤 Мои друзья" if lang == 'ru' else "👤 My friends", callback_data='friends_list_0')])
+    kb.append([InlineKeyboardButton(("📤 Исходящие" if lang == 'ru' else "📤 Outgoing") + (f" ({outgoing_cnt})" if outgoing_cnt > 0 else ""), callback_data='friends_outgoing_0')])
+    kb.append([InlineKeyboardButton(("👤 Мои друзья" if lang == 'ru' else "👤 My friends") + (f" ({friends_cnt})" if friends_cnt > 0 else ""), callback_data='friends_list_0')])
     kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='my_profile')])
     keyboard = kb
 
@@ -8899,7 +7628,17 @@ async def friends_add_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     try:
         sender_name = user.username or user.first_name or str(user.id)
-        notify_text = f"👥 Вам пришла заявка в друзья от @{sender_name}." if lang == 'ru' else f"👥 You received a friend request from @{sender_name}."
+        notify_text = (
+            f"👥 Вам пришла заявка в друзья от @{sender_name}.\nОткройте раздел «Друзья», чтобы принять или отклонить."
+            if lang == 'ru'
+            else f"👥 You received a friend request from @{sender_name}.\nOpen Friends to accept or reject it."
+        )
+        if res.get('auto_accepted'):
+            notify_text = (
+                f"✅ Теперь вы друзья с @{sender_name}."
+                if lang == 'ru'
+                else f"✅ You are now friends with @{sender_name}."
+            )
         await context.bot.send_message(chat_id=int(target_user_id), text=notify_text)
     except Exception:
         pass
@@ -8948,6 +7687,114 @@ async def friends_requests_menu(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
 
 
+async def friends_outgoing_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.list_pending_outgoing_friend_requests(user.id, page=page, per_page=6)
+    items = (res or {}).get('items') or []
+    total = int((res or {}).get('total') or 0)
+    per_page = int((res or {}).get('per_page') or 6)
+
+    title = "📤 <b>Исходящие заявки</b>" if lang == 'ru' else "📤 <b>Outgoing requests</b>"
+    text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
+    if not items:
+        text_lines.append("Вы пока никому не отправляли заявки." if lang == 'ru' else "You have no outgoing requests.")
+    text = "\n".join(text_lines)
+
+    kb = []
+    for it in items:
+        rid = int(it.get('request_id') or 0)
+        uid = int(it.get('to_user_id') or 0)
+        uname = it.get('to_username') or str(uid)
+        kb.append([InlineKeyboardButton(f"@{uname} (ID {uid})", callback_data=f'friends_out_open:{rid}')])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'friends_outgoing_{page-1}'))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'friends_outgoing_{page+1}'))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='profile_friends')])
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def friends_outgoing_open(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    res = db.list_pending_outgoing_friend_requests(user.id, page=0, per_page=50)
+    items = (res or {}).get('items') or []
+    target = next((it for it in items if int(it.get('request_id') or 0) == int(request_id)), None)
+    if not target:
+        await query.answer("Заявка не найдена." if lang == 'ru' else "Request not found.", show_alert=True)
+        await friends_outgoing_menu(update, context, page=0)
+        return
+
+    uname = target.get('to_username') or str(target.get('to_user_id'))
+    uid = int(target.get('to_user_id') or 0)
+    created_at = safe_format_timestamp(int(target.get('created_at', 0) or 0), '%d.%m.%Y %H:%M') or '—'
+    if lang == 'ru':
+        text = (
+            "📤 <b>Исходящая заявка</b>\n\n"
+            f"Кому: @{html.escape(str(uname))}\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"🕒 Отправлена: <b>{html.escape(created_at)}</b>"
+        )
+    else:
+        text = (
+            "📤 <b>Outgoing request</b>\n\n"
+            f"To: @{html.escape(str(uname))}\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"🕒 Sent: <b>{html.escape(created_at)}</b>"
+        )
+    kb = [
+        [InlineKeyboardButton("❌ Отменить заявку" if lang == 'ru' else "❌ Cancel request", callback_data=f'friends_req_cancel:{request_id}')],
+        [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='friends_outgoing_0')],
+    ]
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def friends_req_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, request_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+
+    lookup = db.list_pending_outgoing_friend_requests(user.id, page=0, per_page=50)
+    target = next((it for it in ((lookup or {}).get('items') or []) if int(it.get('request_id') or 0) == int(request_id)), None)
+    res = db.cancel_friend_request_by_id(user.id, int(request_id))
+    if not res or not res.get('ok'):
+        await query.answer("❌ Не удалось отменить заявку." if lang == 'ru' else "❌ Failed to cancel the request.", show_alert=True)
+        await friends_outgoing_menu(update, context, page=0)
+        return
+    if target:
+        try:
+            await context.bot.send_message(
+                chat_id=int(target.get('to_user_id') or 0),
+                text="ℹ️ Отправитель отменил заявку в друзья." if lang == 'ru' else "ℹ️ The sender cancelled the friend request.",
+            )
+        except Exception:
+            pass
+    await query.answer("✅ Заявка отменена." if lang == 'ru' else "✅ Request cancelled.", show_alert=True)
+    await friends_outgoing_menu(update, context, page=0)
+
+
 async def friends_open_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, friend_user_id: int):
     query = update.callback_query
     if query:
@@ -8971,40 +7818,53 @@ async def friends_open_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    try:
-        dbs = SessionLocal()
-        p = dbs.query(Player).filter(Player.user_id == int(friend_user_id)).first()
-    finally:
-        try:
-            dbs.close()
-        except Exception:
-            pass
-
-    uname = getattr(p, 'username', None) if p else None
-    uname_disp = f"@{uname}" if uname else f"ID {int(friend_user_id)}"
-
+    details = db.get_friendship_details(user.id, int(friend_user_id)) or {}
+    username = details.get('username')
+    uname_disp = f"@{esc(username)}" if username else f"ID {int(friend_user_id)}"
+    tier_access = db.get_access_profile(int(friend_user_id), username=username)
+    limits = db.get_friend_transfer_limits(user.id, int(friend_user_id)) or {}
+    tier_name = (
+        "Admin+" if str(tier_access.get('tier') or '') == 'admin_plus'
+        else "Admin" if str(tier_access.get('tier') or '') == 'admin'
+        else "VIP+" if str(tier_access.get('tier') or '') == 'vip_plus'
+        else "VIP" if str(tier_access.get('tier') or '') == 'vip'
+        else ("Обычный" if lang == 'ru' else "Regular")
+    )
+    friendship_dt = safe_format_timestamp(int(details.get('friendship_created_at', 0) or 0), '%d.%m.%Y %H:%M') or '—'
+    vip_left = int(limits.get('vip_gift_time_left', 0) or 0)
+    vip_text = (
+        "доступен" if limits.get('vip_gift_available') else f"через {_fmt_time(vip_left)}"
+        if lang == 'ru'
+        else ("available" if limits.get('vip_gift_available') else f"in {_fmt_time(vip_left)}")
+    )
     title = "👥 <b>Друг</b>" if lang == 'ru' else "👥 <b>Friend</b>"
     if lang == 'ru':
         text = (
             f"{title}\n\n"
             f"{html.escape(uname_disp)}\n"
-            f"🆔 <code>{int(friend_user_id)}</code>\n\n"
-            f"Лимиты:\n"
-            f"- Монеты: до 10 000 в сутки\n"
-            f"- Фрагменты: до 5 в сутки\n"
-            f"- VIP на 7 дней: раз в 2 недели (только VIP, без VIP+)\n"
-            f"- Рейтинг: до 3 за 48 часов"
+            f"🆔 <code>{int(friend_user_id)}</code>\n"
+            f"⭐ Рейтинг: <b>{int(details.get('rating', 0) or 0)}</b>\n"
+            f"{tier_access.get('emoji', '📊')} Статус: <b>{html.escape(tier_name)}</b>\n"
+            f"🤝 В друзьях с: <b>{html.escape(friendship_dt)}</b>\n\n"
+            f"<b>Лимиты переводов:</b>\n"
+            f"• Монеты: ещё <b>{int(limits.get('coins_remaining', 0) or 0)}</b> / сутки\n"
+            f"• Фрагменты: ещё <b>{int(limits.get('fragments_remaining', 0) or 0)}</b> / сутки\n"
+            f"• Рейтинг: ещё <b>{int(limits.get('rating_remaining', 0) or 0)}</b> / 48ч\n"
+            f"• VIP на 7 дней: <b>{html.escape(vip_text)}</b>"
         )
     else:
         text = (
             f"{title}\n\n"
             f"{html.escape(uname_disp)}\n"
-            f"🆔 <code>{int(friend_user_id)}</code>\n\n"
-            f"Limits:\n"
-            f"- Coins: up to 10,000 per day\n"
-            f"- Fragments: up to 5 per day\n"
-            f"- VIP 7d: once per 2 weeks (VIP only, no VIP+)\n"
-            f"- Rating: up to 3 per 48 hours"
+            f"🆔 <code>{int(friend_user_id)}</code>\n"
+            f"⭐ Rating: <b>{int(details.get('rating', 0) or 0)}</b>\n"
+            f"{tier_access.get('emoji', '📊')} Status: <b>{html.escape(tier_name)}</b>\n"
+            f"🤝 Friends since: <b>{html.escape(friendship_dt)}</b>\n\n"
+            f"<b>Transfer limits:</b>\n"
+            f"• Coins: <b>{int(limits.get('coins_remaining', 0) or 0)}</b> left / day\n"
+            f"• Fragments: <b>{int(limits.get('fragments_remaining', 0) or 0)}</b> left / day\n"
+            f"• Rating: <b>{int(limits.get('rating_remaining', 0) or 0)}</b> left / 48h\n"
+            f"• VIP 7d: <b>{html.escape(vip_text)}</b>"
         )
 
     kb = [
@@ -9012,6 +7872,7 @@ async def friends_open_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         [InlineKeyboardButton("🧩 Передать фрагменты" if lang == 'ru' else "🧩 Send fragments", callback_data=f'friends_give_fragments:{int(friend_user_id)}')],
         [InlineKeyboardButton("👑 Подарить VIP (7 дней)" if lang == 'ru' else "👑 Gift VIP (7 days)", callback_data=f'friends_give_vip7:{int(friend_user_id)}')],
         [InlineKeyboardButton("🏆 Передать рейтинг" if lang == 'ru' else "🏆 Send rating", callback_data=f'friends_give_rating:{int(friend_user_id)}')],
+        [InlineKeyboardButton("🗑️ Удалить из друзей" if lang == 'ru' else "🗑️ Remove friend", callback_data=f'friends_remove_confirm:{int(friend_user_id)}')],
         [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='friends_list_0')],
     ]
     if query:
@@ -9021,6 +7882,49 @@ async def friends_open_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
     else:
         await update.effective_message.reply_html(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def friends_remove_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, friend_user_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+    text = (
+        "🗑️ <b>Удалить друга?</b>\n\nПосле подтверждения дружба будет удалена."
+        if lang == 'ru'
+        else "🗑️ <b>Remove friend?</b>\n\nThis will delete the friendship."
+    )
+    kb = [
+        [InlineKeyboardButton("✅ Да, удалить" if lang == 'ru' else "✅ Yes, remove", callback_data=f'friends_remove_do:{int(friend_user_id)}')],
+        [InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data=f'friends_open:{int(friend_user_id)}')],
+    ]
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+
+
+async def friends_remove_do(update: Update, context: ContextTypes.DEFAULT_TYPE, friend_user_id: int):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = player.language
+    res = db.remove_friend(user.id, int(friend_user_id))
+    if not res or not res.get('ok'):
+        await query.answer("❌ Не удалось удалить друга." if lang == 'ru' else "❌ Failed to remove friend.", show_alert=True)
+        await friends_open_menu(update, context, friend_user_id)
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=int(friend_user_id),
+            text="ℹ️ Вас удалили из друзей." if lang == 'ru' else "ℹ️ You were removed from friends.",
+        )
+    except Exception:
+        pass
+    await query.answer("✅ Друг удалён." if lang == 'ru' else "✅ Friend removed.", show_alert=True)
+    await friends_list_menu(update, context, page=0)
 
 
 async def friends_start_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, to_user_id: int):
@@ -9247,7 +8151,7 @@ async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     lang = player.language
 
-    title = "🚀 <b>Бусты</b>" if lang == 'ru' else "🚀 <b>Boosts</b>"
+    title = "🚀 <b>Бусты и купоны</b>" if lang == 'ru' else "🚀 <b>Boosts & coupons</b>"
     text_lines = [title, "", "━━━━━━━━━━━━━━━━━━━", ""]
 
     try:
@@ -9270,6 +8174,21 @@ async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         text_lines.append("ℹ️ Активных бустов нет" if lang == 'ru' else "ℹ️ No active boosts")
 
+    luck_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+    seed_coupons = int(getattr(player, 'seed_coupon_count', 0) or 0)
+    text_lines.extend([
+        "",
+        "<b>Купоны:</b>" if lang == 'ru' else "<b>Coupons:</b>",
+        (f"🎲 Купон удачи: <b>{luck_charges}</b> зарядов" if lang == 'ru' else f"🎲 Luck coupon: <b>{luck_charges}</b> charges"),
+        (f"🎟 Купон семян: <b>{seed_coupons}</b>" if lang == 'ru' else f"🎟 Seed coupon: <b>{seed_coupons}</b>"),
+    ])
+    if seed_coupons > 0:
+        text_lines.append(
+            "Один купон открывает расширенный магазин обычных семян со всем каталогом."
+            if lang == 'ru'
+            else "One coupon opens the extended ordinary seed shop with the full catalog."
+        )
+
     try:
         history = db.get_user_boost_history(user.id, limit=5)
         if history:
@@ -9285,7 +8204,10 @@ async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = "\n".join(text_lines)
     back_label = "🔙 Назад" if lang == 'ru' else "🔙 Back"
-    keyboard = [[InlineKeyboardButton(back_label, callback_data='my_profile')]]
+    keyboard = []
+    if seed_coupons > 0:
+        keyboard.append([InlineKeyboardButton("🎟 Использовать купон семян" if lang == 'ru' else "🎟 Use seed coupon", callback_data='seed_coupon_shop_open:boosts')])
+    keyboard.append([InlineKeyboardButton(back_label, callback_data='my_profile')])
 
     message = query.message
     if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
@@ -9635,7 +8557,7 @@ async def show_favorites_pick_inventory(update: Update, context: ContextTypes.DE
     current_row = []
     for item in page_items:
         display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
-        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {display_name}"
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity,'⚫')} {esc(display_name)}"
         callback = f"fav_pick_{slot}_{item.id}_p{page}"
         current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
         if len(current_row) == 2:
@@ -9793,7 +8715,7 @@ async def show_favorites_pick_inventory_v2(update: Update, context: ContextTypes
     current_row = []
     for item in page_items:
         display_name = item.drink.name or ("Плантационный энергетик" if getattr(getattr(item, 'drink', None), 'is_plantation', False) else "Энергетик")
-        btn_text = f"{COLOR_EMOJIS.get(item.rarity, '⚫')} {display_name}"
+        btn_text = f"{COLOR_EMOJIS.get(item.rarity, '⚫')} {esc(display_name)}"
         callback = f"fav_pick_{slot}_{item.id}_p{page}"
         current_row.append(InlineKeyboardButton(btn_text, callback_data=callback))
         if len(current_row) == 2:
@@ -11795,29 +10717,21 @@ async def handle_custom_bet_input(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     
     async with lock:
-        # Повторно проверяем баланс
-        player = db.get_or_create_player(user.id, user.username or user.first_name)
-        coins_before = int(getattr(player, 'coins', 0) or 0)
-        if coins_before < bet_amount:
-            await msg.reply_text("Недостаточно септимов")
-            # Показываем казино и завершаем conversation
-            await show_casino_after_custom_bet(msg, user, context)
-            return ConversationHandler.END
-        
-        # Списываем ставку
-        after_debit = _casino_take_bet(user.id, bet_amount)
-        if after_debit is None:
-            await msg.reply_text("Ошибка при списании")
-            return ConversationHandler.END
-        
         # Разыгрываем исход
         win_prob = db.get_setting_float('casino_win_prob', CASINO_WIN_PROB)
         win_prob = max(0.0, min(1.0, float(win_prob)))
         win = random.random() < _casino_adjusted_prob(win_prob)
-        coins_after = after_debit
+        
+        # VULN-004 fix: атомарная операция — списание и выплата в одной транзакции
+        play_result = db.casino_play_atomic(user.id, bet_amount, win, multiplier=2.0)
+        if not play_result.get("ok"):
+            await msg.reply_text("Недостаточно септимов")
+            await show_casino_after_custom_bet(msg, user, context)
+            return ConversationHandler.END
+        
+        coins_after = int(play_result.get("new_balance", 0) or 0)
         result_line = ""
         if win:
-            coins_after = db.increment_coins(user.id, bet_amount * 2) or after_debit + bet_amount * 2
             result_line = f"🎉 Победа! Вы получаете +{bet_amount} септимов."
             _casino_record_result(user.id, True)
         else:
@@ -12021,6 +10935,160 @@ async def show_market_plantation(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
         except BadRequest:
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def open_seed_coupon_shop(update: Update, context: ContextTypes.DEFAULT_TYPE, origin: str, bed_index: int = 0):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    lock = _get_lock(f"user:{user.id}:seed_coupon_shop")
+    if lock.locked():
+        await query.answer("Обработка…" if lang == 'ru' else "Processing…", show_alert=False)
+        return
+    async with lock:
+        if int(getattr(player, 'seed_coupon_count', 0) or 0) <= 0:
+            await query.answer("❌ У вас нет купона семян." if lang == 'ru' else "❌ You have no seed coupon.", show_alert=True)
+            return
+
+        res = db.consume_seed_coupon(user.id, 1)
+        if not res.get('ok'):
+            await query.answer("❌ Купон не удалось активировать." if lang == 'ru' else "❌ Failed to activate the coupon.", show_alert=True)
+            return
+
+        context.user_data['seed_coupon_shop_active'] = True
+        context.user_data['seed_coupon_shop_query'] = ''
+        context.user_data['seed_coupon_shop_page'] = 0
+        context.user_data['seed_coupon_shop_origin'] = str(origin or 'market_plantation')
+        context.user_data['seed_coupon_shop_bed_index'] = int(bed_index or 0)
+        await show_seed_coupon_shop(update, context, page=0, already_answered=True)
+
+
+async def show_seed_coupon_shop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    page: int = 0,
+    *,
+    search_query: str | None = None,
+    already_answered: bool = False,
+):
+    query = update.callback_query
+    if query and not already_answered:
+        await query.answer()
+    user = update.effective_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    if not context.user_data.get('seed_coupon_shop_active'):
+        if query:
+            await query.answer("Сессия купона уже завершена." if lang == 'ru' else "Coupon session has already ended.", show_alert=True)
+        return
+
+    if search_query is not None:
+        context.user_data['seed_coupon_shop_query'] = str(search_query).strip()
+        page = 0
+
+    page = max(0, int(page or 0))
+    context.user_data['seed_coupon_shop_page'] = page
+    active_query = str(context.user_data.get('seed_coupon_shop_query') or '').strip()
+    seed_types = _get_coupon_seed_types(active_query)
+    total = len(seed_types)
+    start = page * SEED_COUPON_PAGE_SIZE
+    end = start + SEED_COUPON_PAGE_SIZE
+    page_items = seed_types[start:end]
+
+    title = "🎟 <b>Расширенный магазин семян</b>" if lang == 'ru' else "🎟 <b>Extended seed shop</b>"
+    text_lines = [
+        title,
+        "",
+        f"💰 Баланс: <b>{int(getattr(player, 'coins', 0) or 0)}</b> септимов" if lang == 'ru' else f"💰 Balance: <b>{int(getattr(player, 'coins', 0) or 0)}</b> septims",
+        f"🎟 Купонов осталось: <b>{int(getattr(player, 'seed_coupon_count', 0) or 0)}</b>" if lang == 'ru' else f"🎟 Coupons left: <b>{int(getattr(player, 'seed_coupon_count', 0) or 0)}</b>",
+    ]
+    if active_query:
+        text_lines.append(f"🔎 Поиск: <b>{html.escape(active_query)}</b>" if lang == 'ru' else f"🔎 Search: <b>{html.escape(active_query)}</b>")
+    text_lines.extend(["", "Доступен весь обычный каталог семян." if lang == 'ru' else "The full ordinary seed catalog is available."])
+    if not page_items:
+        text_lines.extend(["", "Ничего не найдено." if lang == 'ru' else "No seeds found."])
+    else:
+        text_lines.extend(["", "Выберите семена:" if lang == 'ru' else "Choose seeds:"])
+        for seed_type in page_items:
+            drink = getattr(seed_type, 'drink', None)
+            name = html.escape(str(getattr(seed_type, 'name', 'Семена') or 'Семена'))
+            drink_name = html.escape(str(getattr(drink, 'name', '') or ''))
+            price = int(getattr(seed_type, 'price_coins', 0) or 0)
+            ymin = int(getattr(seed_type, 'yield_min', 0) or 0)
+            ymax = int(getattr(seed_type, 'yield_max', 0) or 0)
+            grow_m = int((int(getattr(seed_type, 'grow_time_sec', 0) or 0)) / 60)
+            line = f"• {name}"
+            if drink_name:
+                line += f" → {esc(drink_name)}"
+            line += f" — {price} 🪙 | {ymin}-{ymax} | ~{grow_m} мин" if lang == 'ru' else f" — {price} 🪙 | {ymin}-{ymax} | ~{grow_m} min"
+            text_lines.append(line)
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for seed_type in page_items:
+        name = str(getattr(seed_type, 'name', 'Семена') or 'Семена')
+        price = int(getattr(seed_type, 'price_coins', 0) or 0)
+        keyboard.append([InlineKeyboardButton(f"🛒 {name} — {price}", callback_data=f'seed_buy_custom_{int(getattr(seed_type, "id", 0) or 0)}')])
+
+    action_row = [InlineKeyboardButton("🔎 Поиск" if lang == 'ru' else "🔎 Search", callback_data='seed_coupon_shop_search')]
+    if active_query:
+        action_row.append(InlineKeyboardButton("♻️ Сбросить" if lang == 'ru' else "♻️ Clear", callback_data='seed_coupon_shop_clear'))
+    keyboard.append(action_row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f'seed_coupon_shop_page:{page-1}'))
+    if end < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f'seed_coupon_shop_page:{page+1}'))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔙 Завершить" if lang == 'ru' else "🔙 Close", callback_data='seed_coupon_shop_close')])
+
+    text = "\n".join(text_lines)
+    markup = InlineKeyboardMarkup(keyboard)
+    if query:
+        try:
+            await query.edit_message_text(text, reply_markup=markup, parse_mode='HTML')
+            return
+        except BadRequest:
+            pass
+    await context.bot.send_message(chat_id=user.id, text=text, reply_markup=markup, parse_mode='HTML')
+
+
+async def seed_coupon_shop_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    if not context.user_data.get('seed_coupon_shop_active'):
+        await query.answer("Сессия купона уже завершена." if lang == 'ru' else "Coupon session has already ended.", show_alert=True)
+        return
+    context.user_data['awaiting_seed_coupon_search'] = True
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="Введите название семян или напитка." if lang == 'ru' else "Send a seed or drink name.",
+    )
+
+
+async def close_seed_coupon_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    back_callback = _seed_coupon_close_callback(context)
+    _clear_seed_coupon_session(context)
+    if back_callback == 'profile_boosts':
+        await show_profile_boosts(update, context)
+        return
+    if back_callback.startswith('plantation_choose_'):
+        try:
+            bed_index = int(back_callback.split('_')[-1])
+        except Exception:
+            bed_index = 0
+        if bed_index > 0:
+            await show_plantation_choose_seed(update, context, bed_index)
+            return
+    await show_market_plantation(update, context)
 
 
 # === PLANTATION MENU FUNCTIONS ===
@@ -12383,7 +11451,16 @@ async def start_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     user = query.from_user
 
+    if context.user_data.get('seed_coupon_shop_active') and not _is_coupon_seed_allowed(int(seed_type_id)):
+        await query.answer("Семена недоступны для купона." if getattr(db.get_or_create_player(user.id, user.username or user.first_name), 'language', 'ru') == 'ru' else "This seed is not available for the coupon.", show_alert=True)
+        return ConversationHandler.END
+
     context.user_data['seed_custom_buy_id'] = int(seed_type_id)
+    back_callback = 'plantation_shop'
+    if context.user_data.get('seed_coupon_shop_active'):
+        current_page = int(context.user_data.get('seed_coupon_shop_page') or 0)
+        back_callback = f'seed_coupon_shop_page:{current_page}'
+    context.user_data['seed_custom_buy_back_callback'] = back_callback
 
     seed_type = None
     try:
@@ -12403,7 +11480,10 @@ async def start_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         if max_qty <= 0:
             await query.answer("Недостаточно монет", show_alert=True)
-            await show_plantation_shop(update, context)
+            if back_callback.startswith('seed_coupon_shop_page:'):
+                await show_seed_coupon_shop(update, context, page=int(back_callback.split(':', 1)[1]), already_answered=True)
+            else:
+                await show_plantation_shop(update, context)
             return ConversationHandler.END
 
         if getattr(query.message, 'photo', None):
@@ -12500,7 +11580,8 @@ async def seed_custom_buy_max(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"💰 Баланс: {res.get('coins_left')} септимов\n"
             f"📦 В инвентаре: {res.get('inventory_qty')} шт."
         )
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Вернуться в магазин", callback_data='plantation_shop')]])
+        back_callback = str(context.user_data.get('seed_custom_buy_back_callback') or 'plantation_shop')
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Вернуться в магазин", callback_data=back_callback)]])
         try:
             if getattr(query.message, 'photo', None):
                 await query.edit_message_caption(text, reply_markup=keyboard, parse_mode='HTML')
@@ -12599,7 +11680,8 @@ async def handle_seed_custom_qty_input(update: Update, context: ContextTypes.DEF
                 f"📦 В инвентаре: {res.get('inventory_qty')} шт."
             )
 
-        keyboard = [[InlineKeyboardButton("🛒 Вернуться в магазин", callback_data='plantation_shop')]]
+        back_callback = str(context.user_data.get('seed_custom_buy_back_callback') or 'plantation_shop')
+        keyboard = [[InlineKeyboardButton("🛒 Вернуться в магазин", callback_data=back_callback)]]
         await msg.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
 
     return ConversationHandler.END
@@ -12609,7 +11691,15 @@ async def cancel_seed_custom_buy(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     if query:
         await query.answer()
-        await show_plantation_shop(update, context)
+        back_callback = str(context.user_data.get('seed_custom_buy_back_callback') or 'plantation_shop')
+        if back_callback.startswith('seed_coupon_shop_page:'):
+            try:
+                page = int(back_callback.split(':', 1)[1])
+            except Exception:
+                page = 0
+            await show_seed_coupon_shop(update, context, page=page, already_answered=True)
+        else:
+            await show_plantation_shop(update, context)
     return ConversationHandler.END
 
 async def show_plantation_harvest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13609,6 +12699,8 @@ async def show_plantation_choose_seed(update: Update, context: ContextTypes.DEFA
     await query.answer()
     user = query.from_user
     inv = db.get_seed_inventory(user.id) or []
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    seed_coupons = int(getattr(player, 'seed_coupon_count', 0) or 0)
     lines = [f"<b>🌱 Выбор семян для грядки {bed_index}</b>"]
     keyboard = []
     available = [(it.seed_type, int(getattr(it, 'quantity', 0) or 0)) for it in inv if int(getattr(it, 'quantity', 0) or 0) > 0 and it.seed_type]
@@ -13621,6 +12713,9 @@ async def show_plantation_choose_seed(update: Update, context: ContextTypes.DEFA
     else:
         lines.append("\nУ вас нет семян. Купите их в магазине.")
         keyboard.append([InlineKeyboardButton("🛒 Открыть магазин", callback_data='plantation_shop')])
+    if seed_coupons > 0:
+        lines.append(f"\n🎟 Купон семян: {seed_coupons}")
+        keyboard.append([InlineKeyboardButton(f"🎟 Купон семян ({seed_coupons})", callback_data=f'seed_coupon_shop_open:bed:{bed_index}')])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data='plantation_my_beds')])
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
@@ -15980,7 +15075,11 @@ async def buy_vip(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_key: 
         res = db.purchase_vip(user.id, cost, duration)
         if not res.get('ok'):
             reason = res.get('reason')
-            if reason == 'not_enough_coins':
+            if reason == 'admin_blocked':
+                tier = "Admin+" if str(res.get('tier') or '') == 'admin_plus' else "Admin"
+                await query.answer(f"Покупка VIP недоступна для статуса {tier}.", show_alert=True)
+                await show_vip_menu(update, context)
+            elif reason == 'not_enough_coins':
                 await query.answer(t(lang, 'vip_not_enough'), show_alert=True)
             else:
                 await query.answer('Ошибка. Попробуйте позже.', show_alert=True)
@@ -16235,10 +15334,36 @@ async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = _get_access_profile(user, player=player)
     lang = player.language
 
-    # Проверяем наличие активного VIP+
-    has_vip_plus = db.is_vip_plus(user.id)
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        tier = "Admin+" if str(access.get('tier') or '') == 'admin_plus' else "Admin"
+        text = (
+            f"<b>{access.get('emoji', '🛡️')} {tier}</b>\n\n"
+            f"Для вашего статуса покупка VIP/VIP+ отключена.\n"
+            f"Ваши привилегии уже выше VIP+."
+        )
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data='extra_bonuses')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        message = query.message
+        if getattr(message, 'photo', None) or getattr(message, 'document', None) or getattr(message, 'video', None):
+            try:
+                await message.delete()
+            except BadRequest:
+                pass
+            await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        else:
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        return
+
+    has_vip_plus = str(access.get('tier') or '') == 'vip_plus'
     
     if has_vip_plus:
         # Если есть VIP+, показываем предупреждение вместо кнопок тарифов
@@ -16261,7 +15386,7 @@ async def show_vip_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             auto_state = t(lang, 'on') if getattr(player, 'auto_search_enabled', False) else t(lang, 'off')
             auto_count = int(getattr(player, 'auto_search_count', 0) or 0)
-            auto_limit = db.get_auto_search_daily_limit(user.id)  # Используем новую функцию с учётом бустов
+            auto_limit = db.get_auto_search_daily_limit(user.id, username=getattr(user, 'username', None))
             text += t(lang, 'vip_auto_header')
             text += "\n" + t(lang, 'vip_auto_state').format(state=auto_state)
             text += "\n" + t(lang, 'vip_auto_today').format(count=auto_count, limit=auto_limit)
@@ -16331,7 +15456,11 @@ async def show_vip_1d(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = _get_access_profile(user, player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await show_vip_menu(update, context)
+        return
 
     cost = VIP_COSTS['1d']
     vip_until = db.get_vip_until(user.id)
@@ -16370,7 +15499,11 @@ async def show_vip_7d(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = _get_access_profile(user, player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await show_vip_menu(update, context)
+        return
 
     cost = VIP_COSTS['7d']
     vip_until = db.get_vip_until(user.id)
@@ -16409,7 +15542,11 @@ async def show_vip_30d(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = _get_access_profile(user, player=player)
     lang = player.language
+    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
+        await show_vip_menu(update, context)
+        return
 
     cost = VIP_COSTS['30d']
     vip_until = db.get_vip_until(user.id)
@@ -16695,6 +15832,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
+    # VULN-006 fix: защита персональных callback'ов в групповых чатах.
+    # Если сообщение отправлено в группе и callback является "персональным"
+    # (инвентарь, профиль, поиск, избранное, казино и т.д.), проверяем
+    # что кнопку нажал тот же пользователь, которому предназначено сообщение.
+    _PERSONAL_CALLBACK_PREFIXES = (
+        'inventory', 'view_', 'my_profile', 'profile_', 'find_energy',
+        'claim_bonus', 'daily_bonus', 'receiver_', 'fav_', 'favtrack_',
+        'friends_', 'casino_game_', 'casino_custom', 'casino_achievements',
+        'casino_rules', 'city_', 'toggle_', 'autosell_', 'silk_',
+        'language_', 'settings_', 'snooze_remind',
+    )
+    if (query.message
+        and query.message.chat
+        and query.message.chat.type != 'private'
+        and data.startswith(_PERSONAL_CALLBACK_PREFIXES)):
+        # В группе: проверяем что reply_to или from_user совпадает
+        original_msg = query.message
+        # Бот отправил сообщение конкретному пользователю (reply_to_message)
+        original_user_id = None
+        if original_msg.reply_to_message and original_msg.reply_to_message.from_user:
+            original_user_id = original_msg.reply_to_message.from_user.id
+        
+        if original_user_id and original_user_id != query.from_user.id:
+            await query.answer("⛔ Это не ваша кнопка!", show_alert=True)
+            return
+
     if await gift_feature.handle_callback(update, context):
         return
 
@@ -16747,10 +15910,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('swaga_play_'):
         track_id = int(data.split('swaga_play_')[1])
         await swagashop.handle_swaga_play_track(update, context, track_id)
-    elif data == 'promo_enter':
-        await promo_button_start(update, context)
-    elif data == 'promo_cancel':
-        await promo_button_cancel(update, context)
     elif data == 'creator_panel':
         await show_creator_panel(update, context)
     elif data == 'admin_grants_menu':
@@ -16865,108 +16024,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await export_admin_analytics(update, context)
     elif data == 'admin_drinks_menu':
         await show_admin_drinks_menu(update, context)
-    elif data == 'admin_promo_menu':
-        await show_admin_promo_menu(update, context)
-    elif data == 'admin_promo_wizard':
-        await admin_promo_wizard_start(update, context)
-    elif data == 'admin_settings_menu':
-        await show_admin_settings_menu(update, context)
-    elif data == 'admin_settings_limits':
-        await show_admin_settings_limits(update, context)
-    elif data == 'admin_settings_set_fertilizer_max':
-        await admin_settings_set_fertilizer_max_start(update, context)
-    elif data == 'admin_settings_negative_effects':
-        await show_admin_settings_negative_effects(update, context)
-    elif data == 'admin_settings_set_neg_interval':
-        await admin_settings_set_neg_interval_start(update, context)
-    elif data == 'admin_settings_set_neg_chance':
-        await admin_settings_set_neg_chance_start(update, context)
-    elif data == 'admin_settings_set_neg_max_active':
-        await admin_settings_set_neg_max_active_start(update, context)
-    elif data == 'admin_settings_set_neg_duration':
-        await admin_settings_set_neg_duration_start(update, context)
-    elif data == 'admin_settings_cooldowns':
-        await show_admin_settings_cooldowns(update, context)
-    elif data == 'admin_settings_set_search_cd':
-        await admin_settings_set_search_cd_start(update, context)
-    elif data == 'admin_settings_set_bonus_cd':
-        await admin_settings_set_bonus_cd_start(update, context)
-    elif data == 'admin_settings_autosearch':
-        await show_admin_settings_autosearch(update, context)
-    elif data == 'admin_settings_set_auto_base':
-        await admin_settings_set_auto_base_start(update, context)
-    elif data == 'admin_settings_set_auto_vip_mult':
-        await admin_settings_set_auto_vip_mult_start(update, context)
-    elif data == 'admin_settings_set_auto_vip_plus_mult':
-        await admin_settings_set_auto_vip_plus_mult_start(update, context)
-    elif data == 'admin_settings_gift_protection':
-        await show_admin_settings_gift_protection(update, context)
-    elif data == 'admin_settings_set_gift_limit':
-        await admin_settings_set_gift_limit_start(update, context)
-    elif data == 'admin_settings_set_gift_duration':
-        await admin_settings_set_gift_duration_start(update, context)
-    elif data == 'admin_settings_gift_toggle':
-        if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-            await query.answer("⛔ Доступ запрещён!", show_alert=True)
-            return
-        current = db.get_setting_bool('gift_autoblock_enabled', True)
-        ok = db.set_setting_bool('gift_autoblock_enabled', not current)
-        await query.answer("✅ Настройка обновлена" if ok else "❌ Ошибка", show_alert=True)
-        await show_admin_settings_gift_protection(update, context)
-    elif data == 'admin_settings_casino':
-        await show_admin_settings_casino(update, context)
-    elif data == 'admin_settings_set_casino_win_prob':
-        await admin_settings_set_casino_win_prob_start(update, context)
-    elif data == 'admin_settings_set_casino_luck_mult':
-        await admin_settings_set_casino_luck_mult_start(update, context)
-    elif data == 'admin_settings_casino_reset_prob':
-        if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-            await query.answer("⛔ Доступ запрещён!", show_alert=True)
-            return
-        ok = db.set_setting_float('casino_win_prob', CASINO_WIN_PROB)
-        await query.answer("✅ Сброшено" if ok else "❌ Ошибка", show_alert=True)
-        await show_admin_settings_casino(update, context)
-    elif data == 'admin_settings_casino_reset_luck':
-        if not has_creator_panel_access(query.from_user.id, query.from_user.username):
-            await query.answer("⛔ Доступ запрещён!", show_alert=True)
-            return
-        ok = db.set_setting_float('casino_luck_mult', 1.0)
-        await query.answer("✅ Сброшено" if ok else "❌ Ошибка", show_alert=True)
-        await show_admin_settings_casino(update, context)
-    elif data == 'admin_moderation_menu':
-        await show_admin_moderation_menu(update, context)
-    elif data == 'admin_mod_ban':
-        await admin_mod_ban_start(update, context)
-    elif data == 'admin_mod_unban':
-        await admin_mod_unban_start(update, context)
-    elif data == 'admin_mod_gift_menu':
-        await admin_mod_gift_menu(update, context)
-    elif data == 'admin_mod_gift_list':
-        await admin_mod_gift_list_show(update, context)
-    elif data == 'admin_mod_gift_block':
-        await admin_mod_gift_block_start(update, context)
-    elif data == 'admin_mod_gift_unblock':
-        await admin_mod_gift_unblock_start(update, context)
-    elif data == 'admin_mod_banlist':
-        await admin_mod_banlist_show(update, context)
-    elif data == 'admin_mod_check':
-        await admin_mod_check_start(update, context)
-    elif data == 'admin_mod_history':
-        await admin_mod_history_show(update, context)
-    elif data == 'admin_mod_warnings':
-        await admin_mod_warnings_menu(update, context)
-    elif data == 'admin_warn_add':
-        await admin_warn_add_start(update, context)
-    elif data == 'admin_warn_list':
-        await admin_warn_list_start(update, context)
-    elif data == 'admin_warn_clear':
-        await admin_warn_clear_start(update, context)
-    elif data == 'admin_logs_menu':
-        try:
-            await show_admin_logs_menu(update, context)
-        except Exception as e:
-            logger.error(f"Ошибка при открытии меню логов: {e}", exc_info=True)
-            await query.answer("❌ Ошибка при открытии меню логов", show_alert=True)
     elif data == 'admin_economy_menu':
         await show_admin_economy_menu(update, context)
     elif data == 'admin_events_menu':
@@ -17060,20 +16117,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('awaiting_admin_action', None)
     
     # Логи системы
-    elif data == 'admin_logs_recent':
-        await show_admin_logs_recent(update, context)
-    elif data == 'admin_logs_transactions':
-        await show_admin_logs_transactions(update, context)
-    elif data == 'admin_logs_casino':
-        await show_admin_logs_casino(update, context)
-    elif data == 'admin_logs_purchases':
-        await show_admin_logs_purchases(update, context)
-    elif data == 'admin_logs_player':
-        await show_admin_logs_player_start(update, context)
-    elif data == 'admin_logs_errors':
-        await show_admin_logs_errors(update, context)
-    
-    # Заглушки для остальных подразделов (временно возвращают в меню)
     elif data in [
                   'admin_settings_shop', 'admin_settings_notifications',
                   'admin_settings_localization',
@@ -17082,41 +16125,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   'admin_event_list_active', 'admin_event_list_all', 'admin_event_edit', 'admin_event_end',
                   'admin_event_stats']:
         await query.answer("⚙️ Функция в разработке!", show_alert=True)
-    elif data == 'admin_promo_create':
-        await admin_promo_create_start(update, context)
-    elif data == 'admin_promo_deactivate_pick' or data.startswith('admin_promo_deactivate_pick:'):
-        await admin_promo_deactivate_pick_show(update, context)
-    elif data == 'admin_promo_list_active':
-        await admin_promo_list_active_show(update, context)
-    elif data == 'admin_promo_list_all':
-        await admin_promo_list_all_show(update, context)
-    elif data == 'admin_promo_deactivate':
-        await admin_promo_deactivate_start(update, context)
-    elif data == 'admin_promo_stats':
-        await admin_promo_stats_show(update, context)
-    elif data == 'promo_wiz_cancel':
-        await promo_wiz_cancel(update, context)
-    elif data == 'promo_wiz_confirm':
-        await promo_wiz_confirm(update, context)
-    elif data.startswith('promo_wiz_kind:'):
-        await promo_wiz_kind_select(update, context, data.split(':', 1)[1])
-    elif data.startswith('promo_wiz_rarity:'):
-        await promo_wiz_rarity_select(update, context, data.split(':', 1)[1])
-    elif data.startswith('promo_wiz_active:'):
-        await promo_wiz_active_select(update, context, data.split(':', 1)[1] == '1')
-    elif data.startswith('promo_deact:'):
-        try:
-            pid = int(data.split(':', 1)[1])
-            await admin_promo_deactivate_confirm(update, context, pid)
-        except Exception:
-            await query.answer('Ошибка', show_alert=True)
-    elif data.startswith('promo_deact_do:'):
-        try:
-            pid = int(data.split(':', 1)[1])
-            await admin_promo_deactivate_do(update, context, pid)
-        except Exception:
-            await query.answer('Ошибка', show_alert=True)
-    
     elif data == 'find_energy':
         await find_energy(update, context)
     elif data == 'claim_bonus':
@@ -17216,20 +16224,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lock = _get_lock(f"favorites:{user_id}")
         async with lock:
             await show_favorites_pick_inventory_v2(update, context, slot=slot, page=1)
-            return
-            player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
-            lang = getattr(player, 'language', 'ru') or 'ru'
-            item_id = int(getattr(player, f'favorite_drink_{slot}', 0) or 0)
-
-            if item_id > 0:
-                res = db.clear_favorite_drink_slot(user_id, slot)
-                if not res or not res.get('ok'):
-                    await query.answer('Ошибка', show_alert=True)
-                    return
-                await query.answer('✅ Удалено' if lang == 'ru' else '✅ Removed')
-                await show_profile_favorites_v2(update, context)
-            else:
-                await show_favorites_pick_inventory_v2(update, context, slot=slot, page=1)
     elif data.startswith('fav_clear_'):
         query = update.callback_query
         try:
@@ -17342,6 +16336,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             page = 0
         await friends_requests_menu(update, context, page=page)
+    elif data.startswith('friends_outgoing_'):
+        try:
+            page = int(data.split('_')[-1])
+        except Exception:
+            page = 0
+        await friends_outgoing_menu(update, context, page=page)
+    elif data.startswith('friends_out_open:'):
+        try:
+            rid = int(data.split(':', 1)[1])
+        except Exception:
+            rid = 0
+        if rid:
+            await friends_outgoing_open(update, context, rid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
     elif data.startswith('friends_req_open:'):
         try:
             rid = int(data.split(':', 1)[1])
@@ -17369,6 +16378,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await friends_req_reject(update, context, rid)
         else:
             await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_req_cancel:'):
+        try:
+            rid = int(data.split(':', 1)[1])
+        except Exception:
+            rid = 0
+        if rid:
+            await friends_req_cancel(update, context, rid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
     elif data.startswith('friends_list_'):
         try:
             page = int(data.split('_')[-1])
@@ -17382,6 +16400,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid = 0
         if uid:
             await friends_open_menu(update, context, uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_remove_confirm:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_remove_confirm(update, context, uid)
+        else:
+            await query.answer('Ошибка', show_alert=True)
+    elif data.startswith('friends_remove_do:'):
+        try:
+            uid = int(data.split(':', 1)[1])
+        except Exception:
+            uid = 0
+        if uid:
+            await friends_remove_do(update, context, uid)
         else:
             await query.answer('Ошибка', show_alert=True)
     elif data.startswith('friends_give_coins:'):
@@ -17744,6 +16780,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_plantation_my_beds(update, context)
     elif data == 'plantation_shop':
         await show_plantation_shop(update, context)
+    elif data.startswith('seed_coupon_shop_open:'):
+        if data == 'seed_coupon_shop_open:boosts':
+            await open_seed_coupon_shop(update, context, origin='profile_boosts')
+        elif data.startswith('seed_coupon_shop_open:bed:'):
+            try:
+                bed_index = int(data.split(':')[-1])
+            except Exception:
+                bed_index = 0
+            await open_seed_coupon_shop(update, context, origin='plantation_choose', bed_index=bed_index)
+        else:
+            await open_seed_coupon_shop(update, context, origin='market_plantation')
+    elif data.startswith('seed_coupon_shop_page:'):
+        try:
+            page = int(data.split(':', 1)[1])
+        except Exception:
+            page = 0
+        await show_seed_coupon_shop(update, context, page=page)
+    elif data == 'seed_coupon_shop_search':
+        await seed_coupon_shop_search_start(update, context)
+    elif data == 'seed_coupon_shop_clear':
+        await show_seed_coupon_shop(update, context, page=0, search_query='')
+    elif data == 'seed_coupon_shop_close':
+        await close_seed_coupon_shop(update, context)
     elif data == 'plantation_fertilizers_shop':
         await show_plantation_fertilizers_shop(update, context)
     elif data == 'plantation_fertilizers_inv':
@@ -18084,6 +17143,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_settings(update, context)
     elif data == 'settings_lang':
         await settings_lang_menu(update, context)
+    elif data == 'settings_quick_access':
+        await show_settings_quick_access(update, context)
+    elif data.startswith('quick_access_set:'):
+        await set_quick_access_target(update, context, data.split(':', 1)[1])
     elif data == 'settings_reminder':
         await toggle_reminder(update, context)
     elif data == 'settings_plantation_reminder':
@@ -18232,7 +17295,7 @@ async def approve_pending_edit(update: Update, context: ContextTypes.DEFAULT_TYP
             actor_name = f"@{actor.username}" if actor.username else actor.first_name
             drink = db.get_drink_by_id(pending.drink_id)
             drink_name = drink.name if drink else f"ID {pending.drink_id}"
-            notif = f"✏️ Правка заявки #{request_id} применена {actor_name}. Напиток: {drink_name}, поле: {pending.field}"
+            notif = f"✏️ Правка заявки #{request_id} применена {actor_name}. Напиток: {esc(drink_name)}, поле: {pending.field}"
             await asyncio.gather(*[context.bot.send_message(chat_id=aid, text=notif) for aid in admin_ids], return_exceptions=True)
     except Exception:
         pass
@@ -18494,7 +17557,7 @@ async def approve_pending_deletion(update: Update, context: ContextTypes.DEFAULT
         pass
     # Уведомляем инициатора
     try:
-        await context.bot.send_message(chat_id=pending.proposer_id, text=f"Ваша заявка #{request_id} на удаление '{drink_name}' одобрена. Напиток удалён.")
+        await context.bot.send_message(chat_id=pending.proposer_id, text=f"Ваша заявка #{request_id} на удаление '{esc(drink_name)}' одобрена. Напиток удалён.")
     except Exception:
         pass
     # Уведомляем остальных админов
@@ -18503,7 +17566,7 @@ async def approve_pending_deletion(update: Update, context: ContextTypes.DEFAULT
         admin_ids = [aid for aid in db.get_admin_user_ids() if aid != actor.id]
         if admin_ids:
             actor_name = f"@{actor.username}" if actor.username else actor.first_name
-            notif = f"🗑️ Удаление заявки #{request_id} одобрено {actor_name}. Напиток: {drink_name}"
+            notif = f"🗑️ Удаление заявки #{request_id} одобрено {actor_name}. Напиток: {esc(drink_name)}"
             await asyncio.gather(*[context.bot.send_message(chat_id=aid, text=notif) for aid in admin_ids], return_exceptions=True)
     except Exception:
         pass
@@ -18599,7 +17662,7 @@ async def handle_reject_reason_reply(update: Update, context: ContextTypes.DEFAU
                     actor_name = f"@{actor.username}" if actor.username else actor.first_name
                     drink = db.get_drink_by_id(pending.drink_id)
                     drink_name = drink.name if drink else f"ID {pending.drink_id}"
-                    notif = f"🚫 Правка заявки #{request_id} отклонена {actor_name}. Напиток: {drink_name}, поле: {pending.field}\nПричина: {reason or '—'}"
+                    notif = f"🚫 Правка заявки #{request_id} отклонена {actor_name}. Напиток: {esc(drink_name)}, поле: {pending.field}\nПричина: {reason or '—'}"
                     await asyncio.gather(*[context.bot.send_message(chat_id=aid, text=notif) for aid in admin_ids], return_exceptions=True)
             except Exception:
                 pass
@@ -18639,7 +17702,7 @@ async def handle_reject_reason_reply(update: Update, context: ContextTypes.DEFAU
             drink = db.get_drink_by_id(pending.drink_id)
             drink_name = drink.name if drink else f"ID {pending.drink_id}"
             try:
-                await context.bot.send_message(chat_id=pending.proposer_id, text=f"Ваша заявка #{request_id} на удаление '{drink_name}' отклонена.\nПричина: {reason or '—'}")
+                await context.bot.send_message(chat_id=pending.proposer_id, text=f"Ваша заявка #{request_id} на удаление '{esc(drink_name)}' отклонена.\nПричина: {reason or '—'}")
             except Exception:
                 pass
             try:
@@ -18647,7 +17710,7 @@ async def handle_reject_reason_reply(update: Update, context: ContextTypes.DEFAU
                 admin_ids = [aid for aid in db.get_admin_user_ids() if aid != actor.id]
                 if admin_ids:
                     actor_name = f"@{actor.username}" if actor.username else actor.first_name
-                    notif = f"🚫 Удаление заявки #{request_id} отклонено {actor_name}. Напиток: {drink_name}\nПричина: {reason or '—'}"
+                    notif = f"🚫 Удаление заявки #{request_id} отклонено {actor_name}. Напиток: {esc(drink_name)}\nПричина: {reason or '—'}"
                     await asyncio.gather(*[context.bot.send_message(chat_id=aid, text=notif) for aid in admin_ids], return_exceptions=True)
             except Exception:
                 pass
@@ -19376,7 +18439,7 @@ async def requests_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             drink = db.get_drink_by_id(ep.drink_id)
             drink_name = drink.name if drink else f"ID {ep.drink_id}"
             cap = (
-                f"#EDIT{ep.id} — {drink_name} (ID {ep.drink_id})\n"
+                f"#EDIT{ep.id} — {esc(drink_name)} (ID {ep.drink_id})\n"
                 f"Поле: {ep.field}\n"
                 f"Новое значение: {ep.new_value}"
             )
@@ -19391,7 +18454,7 @@ async def requests_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             drink = db.get_drink_by_id(dp.drink_id)
             drink_name = drink.name if drink else f"ID {dp.drink_id}"
             cap = (
-                f"#DEL{dp.id} — {drink_name} (ID {dp.drink_id})\n"
+                f"#DEL{dp.id} — {esc(drink_name)} (ID {dp.drink_id})\n"
                 f"Причина: {dp.reason or '—'}"
             )
             kb = InlineKeyboardMarkup([
@@ -19546,7 +18609,7 @@ async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=target_id,
             username=getattr(target_player, 'username', None) or target_username or str(target_id),
             action_type='transaction',
-            action_details=f'Команда /addcoins: выдано админом @{user.username or user.first_name}',
+            action_details=f'Команда /addcoins: выдано админом @{esc(user.username or user.first_name)}',
             amount=amount,
             success=True
         )
@@ -19560,7 +18623,7 @@ async def addcoins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     shown = f"@{target_username}" if target_username else str(target_id)
-    await update.message.reply_text(f"✅ Начислено {amount} септимов пользователю {shown}.\nНовый баланс: {new_balance}")
+    await update.message.reply_text(f"✅ Начислено {amount} септимов пользователю {esc(shown)}.\nНовый баланс: {new_balance}")
 
 async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/delmoney — только для Создателя. Списывает монеты у пользователя по ID или username.
@@ -19652,7 +18715,7 @@ async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=target_id,
             username=getattr(target_player, 'username', None) or target_username or str(target_id),
             action_type='transaction',
-            action_details=f'Команда /delmoney: убрано админом @{user.username or user.first_name}',
+            action_details=f'Команда /delmoney: убрано админом @{esc(user.username or user.first_name)}',
             amount=-removed_amount,
             success=True
         )
@@ -19668,7 +18731,7 @@ async def delmoney_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shown = f"@{target_username}" if target_username else str(target_id)
     new_balance = result.get('new_balance', 0)
     removed_amount = result.get('removed_amount', amount)
-    await update.message.reply_text(f"✅ Списано {removed_amount} септимов у пользователя {shown}.\nНовый баланс: {new_balance}")
+    await update.message.reply_text(f"✅ Списано {removed_amount} септимов у пользователя {esc(shown)}.\nНовый баланс: {new_balance}")
 
 async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Добавление отменено.")
@@ -19692,6 +18755,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = query.from_user.id
     player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    access = _get_access_profile(query.from_user, player=player)
 
     lang = player.language
     lang_readable = 'Русский' if lang == 'ru' else 'English'
@@ -19712,7 +18776,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_ts = int(getattr(player, 'auto_search_reset_ts', 0) or 0)
     count = int(getattr(player, 'auto_search_count', 0) or 0)
     try:
-        daily_limit = int(db.get_auto_search_daily_limit(user_id))
+        daily_limit = int(db.get_auto_search_daily_limit(user_id, username=getattr(query.from_user, 'username', None)))
     except Exception:
         daily_limit = 0
     left_today = max(0, daily_limit - count) if daily_limit > 0 else 0
@@ -19743,9 +18807,16 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(t(lang, 'btn_toggle_plantation_rem'), callback_data='settings_plantation_reminder')],
         [InlineKeyboardButton(t(lang, 'btn_toggle_auto'), callback_data='settings_auto')],
         [InlineKeyboardButton(t(lang, 'autosell'), callback_data='settings_autosell')],
+    ]
+    if access.get('quick_access_eligible'):
+        current_target = str(getattr(player, 'quick_access_target', '') or '').strip()
+        quick_text = _quick_access_label(current_target, lang)
+        prefix = "⚡ Быстрый доступ" if lang == 'ru' else "⚡ Quick access"
+        keyboard.append([InlineKeyboardButton(f"{prefix}: {quick_text}", callback_data='settings_quick_access')])
+    keyboard.extend([
         [InlineKeyboardButton(t(lang, 'btn_reset'), callback_data='settings_reset')],
         [InlineKeyboardButton(t(lang, 'btn_back'), callback_data='menu')]
-    ]
+    ])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     message = query.message
@@ -19770,6 +18841,59 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
             except Exception:
                 pass
+
+
+async def show_settings_quick_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = _get_access_profile(user, player=player)
+    lang = player.language
+    if not access.get('quick_access_eligible'):
+        await query.answer("Функция доступна только VIP-игрокам." if lang == 'ru' else "This feature is available only to premium users.", show_alert=True)
+        await show_settings(update, context)
+        return
+
+    current_target = str(getattr(player, 'quick_access_target', '') or '').strip()
+    current_label = _quick_access_label(current_target, lang)
+    title = "⚡ <b>Быстрый доступ</b>" if lang == 'ru' else "⚡ <b>Quick access</b>"
+    text = "\n".join([
+        title,
+        "",
+        f"Текущее назначение: <b>{html.escape(current_label)}</b>" if lang == 'ru' else f"Current target: <b>{html.escape(current_label)}</b>",
+        "Выберите раздел для кнопки в главном меню." if lang == 'ru' else "Choose the destination for the main menu button.",
+    ])
+    keyboard = []
+    for callback_data, labels in QUICK_ACCESS_OPTIONS.items():
+        label = labels.get(lang, labels.get('ru'))
+        prefix = "✅ " if callback_data == current_target else ""
+        keyboard.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f'quick_access_set:{callback_data}')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад" if lang == 'ru' else "🔙 Back", callback_data='settings')])
+    try:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except BadRequest:
+        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def set_quick_access_target(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    access = _get_access_profile(user, player=player)
+    lang = player.language
+    if not access.get('quick_access_eligible'):
+        await query.answer("Функция доступна только VIP-игрокам." if lang == 'ru' else "This feature is available only to premium users.", show_alert=True)
+        await show_settings(update, context)
+        return
+    target = str(target or '').strip()
+    if target not in QUICK_ACCESS_OPTIONS:
+        await query.answer("Неизвестный раздел." if lang == 'ru' else "Unknown destination.", show_alert=True)
+        return
+    db.update_player(user.id, quick_access_target=target)
+    await query.answer("Кнопка обновлена." if lang == 'ru' else "Button updated.", show_alert=True)
+    await show_settings_quick_access(update, context)
 
 async def settings_lang_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -19899,25 +19023,25 @@ async def toggle_plantation_reminder(update: Update, context: ContextTypes.DEFAU
 
 async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     user_id = query.from_user.id
     player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    access = _get_access_profile(query.from_user, player=player)
     lang = player.language
 
     current = bool(getattr(player, 'auto_search_enabled', False))
     if not current:
-        # Включаем — проверим VIP
-        if not db.is_vip(user_id):
+        if not access.get('acts_like_vip'):
             await query.answer(t(lang, 'auto_requires_vip'), show_alert=True)
             await show_settings(update, context)
             return
+        await query.answer()
         db.update_player(user_id, auto_search_enabled=True)
-        # Сбросим окно, если не задано
+        # Сбрасываем окно и счётчик, если reset_ts не задан или уже истёк (BUG-05 fix)
         now_ts = int(time.time())
         reset_ts = int(getattr(player, 'auto_search_reset_ts', 0) or 0)
-        if reset_ts == 0:
-            db.update_player(user_id, auto_search_reset_ts=now_ts + 24*60*60)
+        if reset_ts == 0 or now_ts >= reset_ts:
+            db.update_player(user_id, auto_search_count=0, auto_search_reset_ts=now_ts + 24*60*60)
         # Снесём предыдущие задачи и запланируем новую
         try:
             jobs = context.application.job_queue.get_jobs_by_name(f"auto_search_{user_id}")
@@ -19936,12 +19060,13 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error(f"[AUTO] Критическая ошибка: не удалось запланировать автопоиск для {user_id}: {e}")
         try:
-            current_limit = db.get_auto_search_daily_limit(user_id)
+            current_limit = db.get_auto_search_daily_limit(user_id, username=getattr(query.from_user, 'username', None))
             await context.bot.send_message(chat_id=user_id, text=t(lang, 'auto_enabled').format(limit=current_limit))
         except Exception:
             pass
     else:
         # Выключаем
+        await query.answer(t(lang, 'auto_disabled'), show_alert=True)
         
         # Если был включен тихий режим, отправим сводку перед выключением
         if getattr(player, 'auto_search_silent', False):
@@ -19954,7 +19079,6 @@ async def toggle_auto_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 j.schedule_removal()
         except Exception:
             pass
-        await query.answer(t(lang, 'auto_disabled'), show_alert=True)
     
     await show_settings(update, context)
 
@@ -20659,21 +19783,59 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await msg.reply_html(f"✅ Начислено: <b>+{res.get('coins_added', 0)}</b> септимов. Теперь у вас: <b>{res.get('coins_total', 0)}</b>.")
             return
         if kind == 'vip':
-            until = res.get('vip_until')
-            until_str = safe_format_timestamp(until) if until else '—'
-            await msg.reply_html(f"✅ VIP продлён до: <b>{until_str}</b>.")
+            if res.get('converted_to_coins'):
+                await msg.reply_html(f"✅ VIP автоматически конвертирован в <b>{res.get('coins_added', 0)}</b> септимов. Баланс: <b>{res.get('coins_total', 0)}</b>.")
+            else:
+                until = res.get('vip_until')
+                until_str = safe_format_timestamp(until) if until else '—'
+                await msg.reply_html(f"✅ VIP продлён до: <b>{until_str}</b>.")
             return
         if kind == 'vip_plus':
-            until = res.get('vip_plus_until')
-            until_str = safe_format_timestamp(until) if until else '—'
-            await msg.reply_html(f"✅ VIP+ продлён до: <b>{until_str}</b>.")
+            if res.get('converted_to_coins'):
+                await msg.reply_html(f"✅ VIP+ автоматически конвертирован в <b>{res.get('coins_added', 0)}</b> септимов. Баланс: <b>{res.get('coins_total', 0)}</b>.")
+            else:
+                until = res.get('vip_plus_until')
+                until_str = safe_format_timestamp(until) if until else '—'
+                await msg.reply_html(f"✅ VIP+ продлён до: <b>{until_str}</b>.")
             return
         if kind == 'drink':
             dn = res.get('drink_name', 'Энергетик')
             rarity = res.get('rarity', 'Basic')
             await msg.reply_html(f"✅ Получен энергетик: <b>{dn}</b> [{rarity}].")
             return
+        if kind == 'selyuk_fragment':
+            await msg.reply_html(f"✅ Получено фрагментов селюка: <b>+{res.get('fragments_added', 0)}</b>. Всего: <b>{res.get('fragments_total', 0)}</b>.")
+            return
+        if kind == 'auto_search_boost':
+            until_str = safe_format_timestamp(res.get('boost_until')) if res.get('boost_until') else '—'
+            await msg.reply_html(
+                f"✅ Получен буст автопоиска: <b>+{res.get('boost_count', 0)}</b>.\n"
+                f"Суммарно в запасе: <b>{res.get('boost_count_after', 0)}</b>\n"
+                f"Действует до: <b>{until_str}</b>."
+            )
+            return
+        if kind == 'luck_coupon':
+            await msg.reply_html(f"✅ Получен купон удачи: <b>+{res.get('luck_added', 0)}</b>. Зарядов: <b>{res.get('luck_after', 0)}</b>.")
+            return
+        if kind == 'seed_coupon':
+            await msg.reply_html(f"✅ Получен купон семян: <b>+{res.get('seed_coupon_added', 0)}</b>. Всего: <b>{res.get('seed_coupon_after', 0)}</b>.")
+            return
+        if kind == 'search_skip':
+            await msg.reply_html(f"✅ Кулдаун поиска сброшен. Пропусков применено: <b>{res.get('search_skips_used', 0)}</b>.")
+            return
+        if kind == 'bonus_skip':
+            await msg.reply_html(f"✅ Кулдаун ежедневного бонуса сброшен. Пропусков применено: <b>{res.get('bonus_skips_used', 0)}</b>.")
+            return
         await msg.reply_text("Промокод активирован.")
+        return
+
+    if context.user_data.get('awaiting_seed_coupon_search'):
+        context.user_data.pop('awaiting_seed_coupon_search', None)
+        search_query = incoming.strip()
+        if not search_query:
+            await msg.reply_text("❌ Пустой запрос. Попробуйте снова.")
+            return
+        await show_seed_coupon_shop(update, context, page=0, search_query=search_query)
         return
 
     # Проверяем, ждём ли мы ввод для поиска по инвентарю
@@ -20856,22 +20018,17 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     async with lock:
         # Предварительная проверка кулдауна (учёт VIP+/VIP), чтобы не показывать спиннер впустую
         player = db.get_or_create_player(user.id, user.username or user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
         now_ts = time.time()
-        vip_plus_active = db.is_vip_plus(user.id)
-        vip_active = db.is_vip(user.id)
-        base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-        if vip_plus_active:
-            eff_search_cd = base_search_cd / 4
-        elif vip_active:
-            eff_search_cd = base_search_cd / 2
-        else:
-            eff_search_cd = base_search_cd
+        access = _get_access_profile(user, player=player)
+        eff_search_cd = _effective_search_cooldown(access)
         if now_ts - player.last_search < eff_search_cd:
             time_left = eff_search_cd - (now_ts - player.last_search)
             await msg.reply_text(f"Ещё не время! Подожди немного (⏳ {int(time_left // 60)}:{int(time_left % 60):02d}).")
             return
 
         search_message = await msg.reply_text("⏳ Ищем энергетик…")
+        await _run_search_animation(lambda text: search_message.edit_text(text, parse_mode='HTML'), lang)
 
         result = await _perform_energy_search(user.id, user.username or user.first_name, context)
 
@@ -21125,6 +20282,39 @@ def get_rarity_emoji(rarity: str) -> str:
     return COLOR_EMOJIS.get(rarity, '⭐')
 
 
+async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Проверяет активный бан и мягко останавливает действие пользователя."""
+    try:
+        user = update.effective_user
+        if not user:
+            return False
+        ban = db.get_active_ban(user.id)
+        if not ban:
+            return False
+        reason = ban.get('reason') or '—'
+        until = ban.get('banned_until')
+        until_str = safe_format_timestamp(until) if until else 'навсегда'
+        text = (
+            "🚫 Ваш аккаунт заблокирован.\n"
+            f"Причина: {html.escape(reason)}\n"
+            f"Срок: {until_str}"
+        )
+        q = getattr(update, 'callback_query', None)
+        if q:
+            try:
+                await q.answer(text, show_alert=True)
+            except Exception:
+                pass
+        else:
+            try:
+                await reply_auto_delete_message(update.effective_message, text, context=context)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 gift_feature = GiftFeature(
     logger=logger,
     abort_if_banned=abort_if_banned,
@@ -21156,6 +20346,7 @@ def _load_rarity_emoji_overrides_into_constants() -> None:
 
 def main():
     """Запускает бота."""
+    global BOT_RUNTIME
     db.ensure_schema()
     _load_rarity_emoji_overrides_into_constants()
     # Инициализируем дефолтные типы семян для плантации (идемпотентно)
@@ -21192,13 +20383,13 @@ def main():
         pool_timeout=15.0,
     )
     application = ApplicationBuilder().token(config.TOKEN).request(request).build()
+    BOT_RUNTIME = get_bot_runtime()
  
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, debug_log_commands), group=2)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
     application.add_handler(CommandHandler("moneyleaderboard", show_money_leaderboard))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("promo", promo_command))
     application.add_handler(CommandHandler("myboosts", myboosts_command))
     application.add_handler(CommandHandler("fullhelp", fullhelp_command))
     application.add_handler(CommandHandler("admin", admin_command))
@@ -21282,6 +20473,7 @@ def main():
     
     application.add_handler(CallbackQueryHandler(handle_selyuk_farmer_upgrade_action, pattern='^selyuk_farmer_upgrade_action$'))
     application.add_handler(CallbackQueryHandler(admin_player_selyuki_show, pattern='^admin_player_selyuki:'))
+    register_modular_handlers(application, BOT_RUNTIME)
     application.add_handler(CallbackQueryHandler(button_handler))
     # ВАЖНО: перехватываем ответы на ForceReply с причиной отклонения до общего текстового обработчика
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply), group=0)
@@ -21360,7 +20552,7 @@ def main():
                     boost_info = db.get_boost_info(player.user_id)
                     if boost_info['is_active']:
                         remaining_time = boost_info['time_remaining_formatted']
-                        username = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+                        username = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
                         
                         user_message = (
                             f"⏰ Внимание! Ваш автопоиск буст скоро истекает!\n"
@@ -21380,7 +20572,7 @@ def main():
                         # Уведомляем админов о скором истечении
                         admin_ids = db.get_admin_user_ids()
                         admin_message = (
-                            f"⏰ Буст автопоиска у {username} истекает!\n"
+                            f"⏰ Буст автопоиска у {esc(username)} истекает!\n"
                             f"🚀 Буст: +{boost_info['boost_count']} поисков\n"
                             f"⏱ Осталось: {remaining_time}\n"
                             f"📅 Истекает: {boost_info['boost_until_formatted']}"
@@ -21424,7 +20616,7 @@ def main():
                         except Exception as e:
                             logger.warning(f"[BOOST_HISTORY] Failed to record boost expiration for {username}: {e}")
                         
-                        username = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+                        username = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
                         
                         # Уведомляем пользователя об истечении
                         user_message = (
@@ -21445,7 +20637,7 @@ def main():
                         # Уведомляем админов об истечении
                         admin_ids = db.get_admin_user_ids()
                         admin_message = (
-                            f"⏱ Буст автопоиска у {username} истёк!\n"
+                            f"⏱ Буст автопоиска у {esc(username)} истёк!\n"
                             f"🚀 Было: +{boost_info['boost_count']} поисков\n"
                             f"📊 Новый лимит: {db.get_auto_search_daily_limit(player.user_id)}"
                         )
@@ -21497,32 +20689,22 @@ def main():
             restored = 0
             for idx, p in enumerate(players):
                 try:
-                    user_id = getattr(p, 'user_id', None)
+                    user_id = p.get('user_id')
                     if not user_id:
                         continue
-                    # Отключим автопоиск, если VIP уже не активен
-                    if not db.is_vip(user_id):
+                    access = db.get_access_profile(int(user_id), username=p.get('username'))
+                    if not access.get('acts_like_vip'):
                         try:
                             db.update_player(user_id, auto_search_enabled=False)
                         except Exception:
                             pass
                         continue
-                    # Рассчитываем задержку первого запуска с учётом кулдауна (VIP+/VIP)
-                    vip_plus_active = db.is_vip_plus(user_id)
-                    vip_active = db.is_vip(user_id)
-                    
-                    base_search_cd = db.get_setting_int('search_cooldown', SEARCH_COOLDOWN)
-                    if vip_plus_active:
-                        eff_search_cd = base_search_cd / 4
-                    elif vip_active:
-                        eff_search_cd = base_search_cd / 2
-                    else:
-                        eff_search_cd = base_search_cd
-                    last_search_ts = float(getattr(p, 'last_search', 0) or 0.0)
+                    eff_search_cd = _effective_search_cooldown(access)
+                    last_search_ts = float(p.get('last_search', 0) or 0.0)
                     time_since_last = max(0.0, time.time() - last_search_ts)
                     delay = eff_search_cd - time_since_last
-                    # Минимальная задержка и рассев по индексу, чтобы не запускать всё разом
-                    base_stagger = 5.0 + float(idx % 10)
+                    # Линейный рассев по индексу для равномерного распределения нагрузки
+                    base_stagger = 5.0 + float(idx) * 2.0
                     when_delay = max(base_stagger, delay, 1.0)
                     try:
                         application.job_queue.run_once(
@@ -21552,3 +20734,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+

@@ -165,6 +165,13 @@ DAILY_BONUS_REWARD_CATALOG = {
         'label_ru': '🎲 Купон удачи x1',
         'label_en': '🎲 Luck coupon x1',
     },
+    'seed_coupon_1': {
+        'kind': 'seed_coupon',
+        'amount': 1,
+        'tier': 'common',
+        'label_ru': '🎟 Купон семян x1',
+        'label_en': '🎟 Seed coupon x1',
+    },
     'auto_search_boost_2_24h': {
         'kind': 'auto_search_boost',
         'boost_count': 2,
@@ -226,9 +233,10 @@ DAILY_BONUS_REWARD_CATALOG = {
 DAILY_BONUS_ROULETTE_TABLE = {
     'common': [
         {'reward_id': 'coins_250', 'weight': 42},
-        {'reward_id': 'coins_400', 'weight': 30},
+        {'reward_id': 'coins_400', 'weight': 28},
         {'reward_id': 'selyuk_fragment_1', 'weight': 15},
         {'reward_id': 'luck_coupon_1', 'weight': 13},
+        {'reward_id': 'seed_coupon_1', 'weight': 2},
     ],
     'rare': [
         {'reward_id': 'coins_700', 'weight': 28},
@@ -419,6 +427,11 @@ VIP_PLUS_DURATIONS_SEC = {
     '7d': 7 * 24 * 60 * 60,
     '30d': 30 * 24 * 60 * 60,
 }
+ADMIN_EMOJI = '🛡️'
+ADMIN_PLUS_EMOJI = '🛡️✨'
+
+PROMO_ANNOUNCEMENT_CHAT = '@energobot_support'
+PROMO_ANNOUNCEMENT_LINK = 'https://t.me/energobot_support'
 
 # --- TG Premium ---
 TG_PREMIUM_COST = 1000000 

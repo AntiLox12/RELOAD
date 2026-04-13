@@ -686,20 +686,7 @@ async def addautosearch_command(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             success = db.add_auto_search_boost(target_player.user_id, count, days)
             if success:
-                # Добавляем запись в историю с информацией об админе
-                try:
-                    db.add_boost_history_record(
-                        user_id=target_player.user_id,
-                        username=target_player.username,
-                        action='granted',
-                        boost_count=count,
-                        boost_days=days,
-                        granted_by=user.id,
-                        granted_by_username=user.username,
-                        details=f"Выдан админом {user.username or f'ID:{user.id}'}"
-                    )
-                except Exception as e:
-                    logger.warning(f"[BOOST_HISTORY] Failed to record boost grant for @{target}: {e}")
+                # Заметка: запись в boost_history уже добавляется внутри db.add_auto_search_boost()
                 
                 # Получаем информацию о новом лимите
                 new_limit = db.get_auto_search_daily_limit(target_player.user_id)

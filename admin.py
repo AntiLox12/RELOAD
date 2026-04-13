@@ -8,6 +8,23 @@ from constants import ADMIN_USERNAMES
 # Bootstrap-админы берутся из constants.ADMIN_USERNAMES
 
 
+def _format_admin_assignment_notice(result: dict) -> str:
+    tier = "Admin+" if str(result.get('tier') or '') == 'admin_plus' else 'Admin'
+    vip_seconds = int(result.get('vip_remaining_seconds', 0) or 0)
+    vip_plus_seconds = int(result.get('vip_plus_remaining_seconds', 0) or 0)
+    vip_coins = int(result.get('vip_compensation', 0) or 0)
+    vip_plus_coins = int(result.get('vip_plus_compensation', 0) or 0)
+    total = int(result.get('total_compensation', 0) or 0)
+    return "\n".join([
+        f"🛡 Вам назначен статус {tier}.",
+        "",
+        "Активные VIP/VIP+ были отключены и конвертированы в септимы:",
+        f"• VIP: {vip_seconds} сек. → {vip_coins} септимов",
+        f"• VIP+: {vip_plus_seconds} сек. → {vip_plus_coins} септимов",
+        f"• Итого: {total} септимов",
+    ])
+
+
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     "/admin add|remove|list — управление администраторами. add/remove работают по reply или ID."
     user = update.effective_user
@@ -119,10 +136,20 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_level not in (1, 2, 3):
             await update.message.reply_text("Уровень должен быть 1, 2 или 3")
             return
-        ok = db.set_admin_level(target_id, new_level)
+        try:
+            chat_obj = await context.bot.get_chat(target_id)
+            target_username = getattr(chat_obj, 'username', None)
+        except Exception:
+            target_username = None
+        assign_res = db.assign_admin_level(target_id, new_level, username=target_username)
+        ok = bool(assign_res.get('ok'))
         if ok:
             try:
                 db.insert_moderation_log(user.id, 'admin_level_change', target_id=target_id, details=f"level={new_level}")
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(target_id, _format_admin_assignment_notice(assign_res))
             except Exception:
                 pass
         await update.message.reply_text("Уровень обновлён" if ok else "Не найден админ с таким ID")
@@ -165,10 +192,15 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_username = getattr(chat_obj, 'username', None)
             except Exception:
                 target_username = None
-        created = db.add_admin_user(target_id, target_username, level_to_set if level_to_set is not None else 1)
+        assign_res = db.assign_admin_level(target_id, level_to_set if level_to_set is not None else 1, username=target_username)
+        created = bool(assign_res.get('ok'))
         if created:
             try:
                 db.insert_moderation_log(user.id, 'admin_add', target_id=target_id, details=f"level={level_to_set if level_to_set is not None else 1}")
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(target_id, _format_admin_assignment_notice(assign_res))
             except Exception:
                 pass
         await update.message.reply_text("Добавлен" if created else "Уже был админом")

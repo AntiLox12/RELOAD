@@ -2,12 +2,28 @@ import time
 import logging
 import asyncio
 import re
+import html as _html
+import weakref
 import database as db
 from typing import Dict
 
+
+def esc(text) -> str:
+    """Экранирует HTML-спецсимволы для безопасной вставки в parse_mode=HTML сообщения.
+    
+    Использование: f"Привет, <b>{esc(username)}</b>!"
+    Безопасно для None — вернёт пустую строку.
+    """
+    if text is None:
+        return ""
+    return _html.escape(str(text))
+
 logger = logging.getLogger(__name__)
 
-_LOCKS: Dict[str, asyncio.Lock] = {}
+# WeakValueDictionary автоматически удаляет Lock когда на него
+# не остаётся ссылок, предотвращая утечку памяти при большом
+# количестве уникальных ключей (user_id:action).
+_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 def _get_lock(key: str) -> asyncio.Lock:
     lock = _LOCKS.get(key)
@@ -68,3 +84,34 @@ def _resolve_user_identifier(text: str) -> int | None:
         return int(t)
     except Exception:
         return None
+
+
+def _format_duration_compact(seconds_value: int | float) -> str:
+    """Форматирует секунды в компактную строку вида '7d 2h 30m'."""
+    total = max(0, int(seconds_value or 0))
+    if total == 0:
+        return "0s"
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs and not days:
+        parts.append(f"{secs}s")
+    return " ".join(parts) if parts else "0s"
+
+
+def _format_player_label(user_id: int, username: str | None = None, display_name: str | None = None) -> str:
+    """Возвращает человекочитаемую метку игрока для админ-панели."""
+    parts: list[str] = []
+    if display_name:
+        parts.append(str(display_name))
+    if username:
+        parts.append(f"@{username}")
+    parts.append(f"[{user_id}]")
+    return " ".join(parts)

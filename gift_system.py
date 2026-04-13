@@ -1,6 +1,8 @@
 import html
 import logging
+import random
 import time
+from collections import defaultdict
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -15,6 +17,9 @@ class GiftFeature:
     DAILY_LIMIT = 20
     COOLDOWN_SECONDS = 40
     ITEMS_PER_PAGE = 6
+    OFFER_EXPIRY_SECONDS = 600  # 10 минут на ответ получателя
+    MAX_PENDING_OFFERS = 500   # Максимум незавершённых предложений
+    COMMAND_RATE_LIMIT_SEC = 5  # IMP-4: минимальный интервал между /gift командами от одного пользователя
 
     def __init__(
         self,
@@ -35,8 +40,26 @@ class GiftFeature:
         self.get_rarity_emoji = get_rarity_emoji
         self.get_lock = get_lock
         self.gift_offers: dict[int, dict[str, Any]] = {}
-        self.next_gift_id = 1
+        self.next_gift_id = int(time.time()) * 1000  # Устойчив к рестартам
         self.selection_state: dict[int, dict[str, Any]] = {}
+        self._gift_command_timestamps: dict[int, float] = defaultdict(float)  # IMP-4: rate limiter
+
+    def _cleanup_stale(self) -> None:
+        """Удаляет просроченные offer'ы и selection_state."""
+        now = int(time.time())
+        expired_ids = [
+            gid for gid, offer in self.gift_offers.items()
+            if now - offer.get("created_at", 0) > self.OFFER_EXPIRY_SECONDS
+        ]
+        for gid in expired_ids:
+            self.gift_offers.pop(gid, None)
+
+        stale_users = [
+            uid for uid, state in self.selection_state.items()
+            if now - state.get("created_at", 0) > self.OFFER_EXPIRY_SECONDS
+        ]
+        for uid in stale_users:
+            self.selection_state.pop(uid, None)
 
     def _format_timestamp(self, timestamp: int | None) -> str:
         if not timestamp:
@@ -224,6 +247,13 @@ class GiftFeature:
             await update.message.reply_text("Этой командой можно пользоваться только в группах.")
             return
 
+        # IMP-4: In-memory rate limiter — защита от спама командой /gift
+        giver_uid = update.effective_user.id
+        now = time.time()
+        if now - self._gift_command_timestamps[giver_uid] < self.COMMAND_RATE_LIMIT_SEC:
+            return
+        self._gift_command_timestamps[giver_uid] = now
+
         recipient_id = None
         recipient_username = None
         recipient_display = None
@@ -320,7 +350,23 @@ class GiftFeature:
             await self.reply_auto_delete_message(update.message, "Ваш инвентарь пуст — нечего дарить.", context=context)
             return
 
+        # Отменяем предыдущую сессию выбора, если была (BUG-5)
+        old_state = self.selection_state.get(giver_id)
+        if old_state and old_state.get("search_message_id"):
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=giver_id,
+                    message_id=old_state["search_message_id"],
+                    text="❌ Предыдущий выбор подарка отменён.",
+                )
+            except Exception:
+                pass
+
+        # Очистка просроченных записей
+        self._cleanup_stale()
+
         self.selection_state[giver_id] = {
+            "created_at": int(time.time()),
             "group_id": update.effective_chat.id,
             "recipient_username": recipient_username or "",
             "recipient_id": recipient_id,
@@ -427,6 +473,8 @@ class GiftFeature:
         return True
 
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if not update.effective_user:
+            return False
         user_id = update.effective_user.id
         state = self.selection_state.get(user_id)
         if not state or not state.get("awaiting_search"):
@@ -569,20 +617,33 @@ class GiftFeature:
         accepted: bool,
     ):
         query = update.callback_query
-        await query.answer()
         lock = self.get_lock(f"gift:{gift_id}")
         if lock.locked():
             await query.answer("Этот подарок уже обрабатывается…", show_alert=True)
             return
 
+        await query.answer()
         async with lock:
             offer = self.gift_offers.get(gift_id)
             if not offer:
-                await query.answer("Предложение не найдено.", show_alert=True)
+                try:
+                    await query.edit_message_text("⏰ Предложение подарка истекло. Попросите отправить заново.")
+                except Exception:
+                    pass
                 return
 
             rec_id = offer.get("recipient_id")
             rec_un = (offer.get("recipient_username") or "").lower()
+
+            # CRIT-3: Строгая проверка — подарок должен иметь идентификатор получателя
+            if not rec_id and not rec_un:
+                self.gift_offers.pop(gift_id, None)
+                try:
+                    await query.edit_message_text("❌ Ошибка: получатель не определён.")
+                except Exception:
+                    pass
+                return
+
             if rec_id:
                 if query.from_user.id != rec_id:
                     await query.answer("Это не вам предназначалось!", show_alert=True)
@@ -600,7 +661,7 @@ class GiftFeature:
                 getattr(query.from_user, "full_name", None) or getattr(query.from_user, "first_name", None),
             )
             if not accepted:
-                self._log_bundle(offer, recipient_id, "declined")
+                db.log_gift_bundle(offer["giver_id"], recipient_id, offer["items"], "declined")
                 try:
                     await query.edit_message_text(
                         "❌ <b>Подарок отклонён</b>\n\n"
@@ -618,6 +679,25 @@ class GiftFeature:
                 except Exception:
                     pass
                 self.gift_offers.pop(gift_id, None)
+                # IMP-5: Audit log для отклонённого подарка
+                try:
+                    db.log_action(
+                        user_id=offer["giver_id"],
+                        username=offer.get("giver_name"),
+                        action_type="gift_declined",
+                        action_details=f"by={recipient_id}, total={offer['total_quantity']}",
+                        amount=offer["total_quantity"],
+                        success=True,
+                    )
+                except Exception:
+                    pass
+                # IMP-1: Отменяем expire job
+                try:
+                    jobs = context.job_queue.get_jobs_by_name(f"gift_expire_{gift_id}")
+                    for job in jobs:
+                        job.schedule_removal()
+                except Exception:
+                    pass
                 return
 
             giver_restriction = db.get_gift_restriction_info(offer["giver_id"])
@@ -672,31 +752,39 @@ class GiftFeature:
                     )
                     return
 
+            # CRIT-1: Атомарная передача — списание и начисление в одной DB-транзакции
             giver_lock = self.get_lock(f"gift-transfer:{offer['giver_id']}")
             async with giver_lock:
-                if not self._bundle_available(offer["items"], offer["giver_id"]):
+                result = db.transfer_gift_bundle_atomic(
+                    giver_id=offer["giver_id"],
+                    recipient_id=recipient_id,
+                    items=offer["items"],
+                )
+                if not result["ok"]:
                     await query.edit_message_text("Не удалось передать подарок: часть напитков уже исчезла из инвентаря.")
                     self.gift_offers.pop(gift_id, None)
                     return
 
-                for bundle_item in offer["items"]:
-                    for _ in range(bundle_item["quantity"]):
-                        success = db.decrement_inventory_item(bundle_item["item_id"])
-                        if not success:
-                            await query.edit_message_text("Не удалось передать подарок: часть напитков уже исчезла из инвентаря.")
-                            self.gift_offers.pop(gift_id, None)
-                            return
-                for bundle_item in offer["items"]:
-                    for _ in range(bundle_item["quantity"]):
-                        db.add_drink_to_inventory(recipient_id, bundle_item["drink_id"], bundle_item["rarity"])
-
-            self._log_bundle(offer, recipient_id, "accepted")
+            db.log_gift_bundle(offer["giver_id"], recipient_id, offer["items"], "accepted")
             self.logger.info(
                 "[GIFT] %s -> %s: %s",
                 offer["giver_name"],
                 query.from_user.username or query.from_user.id,
                 ", ".join(f"{item['drink_name']} x{item['quantity']}" for item in offer["items"]),
             )
+
+            # IMP-5: Audit log для принятого подарка
+            try:
+                db.log_action(
+                    user_id=offer["giver_id"],
+                    username=offer.get("giver_name"),
+                    action_type="gift_accepted",
+                    action_details=f"to={recipient_id}, items={len(offer['items'])}, total={offer['total_quantity']}",
+                    amount=offer["total_quantity"],
+                    success=True,
+                )
+            except Exception:
+                pass
 
             try:
                 await query.edit_message_text(
@@ -722,22 +810,34 @@ class GiftFeature:
             except Exception:
                 pass
 
+            # IMP-2: Уведомление получателю с кнопкой «Посмотреть инвентарь»
             try:
                 await context.bot.send_message(
                     chat_id=recipient_id,
                     text=(
                         "🎁 <b>Вы получили подарок!</b>\n\n"
-                        f"От: @{offer['giver_name']}\n"
+                        f"От: @{html.escape(offer['giver_name'])}\n"
                         f"{self._bundle_lines(offer['items'])}\n\n"
                         f"Всего: <b>{offer['total_quantity']}</b>\n"
                         "<i>Напитки добавлены в ваш инвентарь.</i>"
                     ),
                     parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("📦 Мой инвентарь", callback_data="inventory")]]
+                    ),
                 )
             except Exception:
                 pass
 
             self.gift_offers.pop(gift_id, None)
+
+            # IMP-1: Отменяем запланированную задачу истечения, т.к. offer обработан
+            try:
+                jobs = context.job_queue.get_jobs_by_name(f"gift_expire_{gift_id}")
+                for job in jobs:
+                    job.schedule_removal()
+            except Exception:
+                pass
 
     def _is_gift_callback(self, data: str) -> bool:
         prefixes = (
@@ -774,19 +874,18 @@ class GiftFeature:
         return sum(int(qty or 0) for qty in state.get("cart", {}).values())
 
     def _cart_summary(self, state: dict[str, Any]) -> str:
+        # IMP-3: Показываем все позиции корзины (MAX_BUNDLE_SIZE максимум 10)
         if not state["cart"]:
             return "Корзина пуста. Нажмите на напиток и выберите количество."
         lines = []
         inventory_map = {item.id: item for item in state["inventory_items"]}
-        for item_id, qty in list(state["cart"].items())[:5]:
+        for item_id, qty in state["cart"].items():
             item = inventory_map.get(item_id)
             if not item or qty <= 0:
                 continue
             lines.append(
                 f"• {self.get_rarity_emoji(item.rarity)} {html.escape(item.drink.name)} x{qty}"
             )
-        if len(state["cart"]) > 5:
-            lines.append("• ...")
         return "Сейчас выбрано:\n" + "\n".join(lines)
 
     def _find_item(self, state: dict[str, Any], item_id: int):
@@ -1046,10 +1145,14 @@ class GiftFeature:
                 }
             )
 
+        # Очистка просроченных предложений перед созданием нового
+        self._cleanup_stale()
+
         gift_id = self.next_gift_id
         self.next_gift_id += 1
         giver_name = query.from_user.username or query.from_user.first_name
         offer = {
+            "created_at": int(time.time()),
             "giver_id": query.from_user.id,
             "giver_name": giver_name,
             "recipient_username": state.get("recipient_username"),
@@ -1093,6 +1196,30 @@ class GiftFeature:
         )
         self.selection_state.pop(query.from_user.id, None)
 
+        # IMP-1: Запланировать автоматическое истечение предложения через JobQueue
+        try:
+            context.job_queue.run_once(
+                self._expire_offer_job,
+                when=self.OFFER_EXPIRY_SECONDS,
+                data=gift_id,
+                name=f"gift_expire_{gift_id}",
+            )
+        except Exception:
+            pass
+
+        # IMP-5: Audit log для создания предложения
+        try:
+            db.log_action(
+                user_id=query.from_user.id,
+                username=giver_name,
+                action_type="gift_offered",
+                action_details=f"to={recipient_id or offer.get('recipient_username','?')}, items={len(bundle_items)}, total={total_selected}",
+                amount=total_selected,
+                success=True,
+            )
+        except Exception:
+            pass
+
     def _bundle_lines(self, bundle_items: list[dict[str, Any]]) -> str:
         lines = []
         for item in bundle_items:
@@ -1111,6 +1238,39 @@ class GiftFeature:
                     rarity=item["rarity"],
                     status=status,
                 )
+
+    # IMP-1: Автоматическое истечение предложения подарка через JobQueue
+    async def _expire_offer_job(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        gift_id = context.job.data
+        offer = self.gift_offers.pop(gift_id, None)
+        if not offer:
+            return
+        # Уведомляем дарителя
+        try:
+            await context.bot.send_message(
+                chat_id=offer["giver_id"],
+                text=(
+                    "⏰ <b>Подарок не был принят</b>\n\n"
+                    f"{self._bundle_lines(offer['items'])}\n\n"
+                    f"Всего: <b>{offer['total_quantity']}</b>\n"
+                    "<i>Предложение истекло через 10 минут.</i>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        # IMP-5: Audit log для истечения
+        try:
+            db.log_action(
+                user_id=offer["giver_id"],
+                username=offer.get("giver_name"),
+                action_type="gift_expired",
+                action_details=f"to={offer.get('recipient_id') or offer.get('recipient_username','?')}, total={offer['total_quantity']}",
+                amount=offer["total_quantity"],
+                success=True,
+            )
+        except Exception:
+            pass
 
     def _bundle_available(self, bundle_items: list[dict[str, Any]], giver_id: int) -> bool:
         for item in bundle_items:

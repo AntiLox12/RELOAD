@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import database as db
-from constants import ADMIN_USERNAMES
 
 
 def get_effective_admin_level(user_id: int, username: str | None) -> int:
     """Return effective level: Creator=99, admin=1..3, regular user=0."""
-    if username and username in ADMIN_USERNAMES:
-        return 99
-    return db.get_admin_level(user_id)
+    return db.get_effective_admin_level(user_id, username=username)
 
 
 def has_admin_level(user_id: int, username: str | None, min_level: int) -> bool:
