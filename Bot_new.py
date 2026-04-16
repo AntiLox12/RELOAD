@@ -5560,6 +5560,111 @@ def _reschedule_auto_search(context, user_id: int, delay: float):
         logger.warning(f"[AUTO] Не удалось перепланировать auto_search для {user_id}: {e}")
 
 
+async def _schedule_auto_search_retry(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    *,
+    reason: str,
+    notify_on_disable: bool = True,
+) -> None:
+    """Планирует повтор автопоиска с backoff или отключает его после исчерпания ретраев."""
+    retry_key = f"auto_search_retries_{user_id}"
+    retries = int(context.bot_data.get(retry_key, 0) or 0)
+
+    if retries >= MAX_AUTO_SEARCH_RETRIES:
+        logger.error(
+            f"[AUTO] Превышено число ретраев ({MAX_AUTO_SEARCH_RETRIES}) для user {user_id}. "
+            f"Причина: {reason}. Отключаю автопоиск."
+        )
+        db.update_player(user_id, auto_search_enabled=False)
+        context.bot_data.pop(retry_key, None)
+        if notify_on_disable:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ Автопоиск был отключён из-за повторяющихся ошибок. "
+                         "Попробуйте включить повторно в настройках."
+                )
+            except Exception:
+                pass
+        return
+
+    next_retry = retries + 1
+    context.bot_data[retry_key] = next_retry
+    delay = min(60 * (2 ** retries), 3600)  # 60s, 120s, 240s... max 1h
+    logger.warning(
+        f"[AUTO] Retry {next_retry}/{MAX_AUTO_SEARCH_RETRIES} для user {user_id} "
+        f"через {delay} сек. Причина: {reason}"
+    )
+    _reschedule_auto_search(context, user_id, delay)
+
+
+def _restore_auto_search_jobs(application, *, only_missing: bool = False) -> int:
+    """Восстанавливает задачи автопоиска для включённых пользователей."""
+    try:
+        players = db.get_players_with_auto_search_enabled()
+    except Exception as e:
+        logger.warning(f"[AUTO] Не удалось получить список игроков для восстановления автопоиска: {e}")
+        return 0
+
+    restored = 0
+    now_ts = time.time()
+    for idx, p in enumerate(players):
+        try:
+            user_id = p.get('user_id')
+            if not user_id:
+                continue
+
+            job_name = f"auto_search_{user_id}"
+            if only_missing:
+                try:
+                    if application.job_queue.get_jobs_by_name(job_name):
+                        continue
+                except Exception:
+                    pass
+
+            access = db.get_access_profile(int(user_id), username=p.get('username'))
+            if not access.get('acts_like_vip'):
+                try:
+                    db.update_player(user_id, auto_search_enabled=False)
+                except Exception:
+                    pass
+                continue
+
+            eff_search_cd = _effective_search_cooldown(access)
+            last_search_ts = float(p.get('last_search', 0) or 0.0)
+            time_since_last = max(0.0, now_ts - last_search_ts)
+            delay = eff_search_cd - time_since_last
+
+            # Линейный рассев по индексу для более ровной нагрузки.
+            base_stagger = 5.0 + float(idx) * 2.0
+            when_delay = max(base_stagger, delay, 1.0)
+
+            application.job_queue.run_once(
+                auto_search_job,
+                when=when_delay,
+                chat_id=user_id,
+                name=job_name,
+            )
+            restored += 1
+        except Exception:
+            logger.exception("[AUTO] Ошибка при попытке восстановить автопоиск пользователя")
+            continue
+
+    return restored
+
+
+async def auto_search_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+    """Поднимает обратно задачи автопоиска, если флаг включён, а JobQueue-задача пропала."""
+    application = getattr(context, 'application', None)
+    if not application or not application.job_queue:
+        return
+
+    restored = _restore_auto_search_jobs(application, only_missing=True)
+    if restored:
+        logger.info(f"[AUTO] Watchdog восстановил задач автопоиска: {restored}")
+
+
 async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
     """JobQueue: периодически выполняет автопоиск для VIP-пользователей.
     Самопереназначается с интервалом, равным оставшемуся кулдауну.
@@ -5809,33 +5914,20 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 pass
             _reschedule_auto_search(context, user_id, 600)
             return
+        elif result.get('status') == 'error':
+            logger.warning(f"[AUTO] _perform_energy_search вернул status=error для user {user_id}: {result}")
+            await _schedule_auto_search_retry(context, user_id, reason='perform_search_error')
+            return
+        else:
+            logger.warning(f"[AUTO] Неожиданный статус автопоиска для user {user_id}: {result}")
+            await _schedule_auto_search_retry(context, user_id, reason=f"unexpected_status:{result.get('status')}")
+            return
     except Exception:
         logger.exception("[AUTO] Ошибка в auto_search_job")
-        # Exponential backoff с потолком (SEC-04 fix)
         try:
             if hasattr(context, 'job') and context.job and context.job.chat_id:
                 user_id = context.job.chat_id
-                retry_key = f"auto_search_retries_{user_id}"
-                retries = int(context.bot_data.get(retry_key, 0))
-                if retries >= MAX_AUTO_SEARCH_RETRIES:
-                    logger.error(
-                        f"[AUTO] Превышено число ретраев ({MAX_AUTO_SEARCH_RETRIES}) "
-                        f"для user {user_id}. Отключаю автопоиск."
-                    )
-                    db.update_player(user_id, auto_search_enabled=False)
-                    context.bot_data.pop(retry_key, None)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text="⚠️ Автопоиск был отключён из-за повторяющихся ошибок. "
-                                 "Попробуйте включить повторно в настройках."
-                        )
-                    except Exception:
-                        pass
-                else:
-                    context.bot_data[retry_key] = retries + 1
-                    delay = min(60 * (2 ** retries), 3600)  # 60s, 120s, 240s... max 1h
-                    _reschedule_auto_search(context, user_id, delay)
+                await _schedule_auto_search_retry(context, user_id, reason='job_exception')
         except Exception as e:
             logger.warning(f"[AUTO] Не удалось перезапустить auto_search_job после ошибки: {e}")
 
@@ -20730,48 +20822,18 @@ def main():
         ordinary_plantation.schedule_jobs(application)
 
         # --- Восстановление задач автопоиска VIP после рестарта ---
-        try:
-            players = db.get_players_with_auto_search_enabled()
-        except Exception as e:
-            players = []
-            logger.warning(f"[AUTO] Не удалось получить список игроков для восстановления автопоиска: {e}")
+        restored = _restore_auto_search_jobs(application)
+        if restored:
+            logger.info(f"[AUTO] Восстановлено задач автопоиска: {restored}")
 
-        if players:
-            restored = 0
-            for idx, p in enumerate(players):
-                try:
-                    user_id = p.get('user_id')
-                    if not user_id:
-                        continue
-                    access = db.get_access_profile(int(user_id), username=p.get('username'))
-                    if not access.get('acts_like_vip'):
-                        try:
-                            db.update_player(user_id, auto_search_enabled=False)
-                        except Exception:
-                            pass
-                        continue
-                    eff_search_cd = _effective_search_cooldown(access)
-                    last_search_ts = float(p.get('last_search', 0) or 0.0)
-                    time_since_last = max(0.0, time.time() - last_search_ts)
-                    delay = eff_search_cd - time_since_last
-                    # Линейный рассев по индексу для равномерного распределения нагрузки
-                    base_stagger = 5.0 + float(idx) * 2.0
-                    when_delay = max(base_stagger, delay, 1.0)
-                    try:
-                        application.job_queue.run_once(
-                            auto_search_job,
-                            when=when_delay,
-                            chat_id=user_id,
-                            name=f"auto_search_{user_id}",
-                        )
-                        restored += 1
-                    except Exception as e:
-                        logger.warning(f"[AUTO] Не удалось восстановить задачу автопоиска для {user_id}: {e}")
-                except Exception:
-                    logger.exception("[AUTO] Ошибка при попытке восстановить автопоиск пользователя")
-                    continue
-            if restored:
-                logger.info(f"[AUTO] Восстановлено задач автопоиска: {restored}")
+        auto_watchdog_interval = 5 * 60
+        auto_watchdog_delay = 90
+        application.job_queue.run_repeating(
+            auto_search_watchdog_job,
+            interval=auto_watchdog_interval,
+            first=auto_watchdog_delay,
+            name="auto_search_watchdog",
+        )
 
         # --- Восстановление задач автоудаления после рестарта ---
         async def restore_auto_delete_on_startup(context: ContextTypes.DEFAULT_TYPE):
