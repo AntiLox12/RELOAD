@@ -910,6 +910,40 @@ async def removeboost_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text("Пользователь не найден.")
         return
     target_user_id = int(res['player'].user_id)
+    player = db.get_or_create_player(target_user_id, res['player'].username)
+    boost_info_before = db.get_boost_info(target_user_id)
+    if not boost_info_before.get('is_active'):
+        user_info = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+        await msg.reply_text(f"РЈ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ {user_info} РЅРµС‚ Р°РєС‚РёРІРЅРѕРіРѕ Р±СѓСЃС‚Р° Р°РІС‚РѕРїРѕРёСЃРєР°.")
+        return
+
+    removed = db.remove_auto_search_boost(
+        target_user_id,
+        removed_by=user.id,
+        removed_by_username=user.username,
+        history_action='removed',
+    )
+    if not removed:
+        await msg.reply_text("РќРµ СѓРґР°Р»РѕСЃСЊ СѓР±СЂР°С‚СЊ Р±СѓСЃС‚.")
+        return
+
+    user_info = f"@{player.username}" if player.username else f"ID: {player.user_id}"
+    await msg.reply_text(f"вњ… Р‘СѓСЃС‚ Р°РІС‚РѕРїРѕРёСЃРєР° СѓР±СЂР°РЅ Сѓ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ {user_info}.")
+
+    try:
+        from datetime import datetime
+        boost_end_formatted = datetime.fromtimestamp(int(boost_info_before.get('boost_until', 0) or 0)).strftime('%d.%m.%Y %H:%M')
+        new_limit = db.get_auto_search_daily_limit(player.user_id)
+        user_notification = (
+            f"рџљ« Р’Р°С€ Р°РІС‚РѕРїРѕРёСЃРє Р±СѓСЃС‚ Р±С‹Р» РѕС‚РјРµРЅС‘РЅ Р°РґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂРѕРј.\n"
+            f"рџљЂ РћС‚РјРµРЅС‘РЅРЅС‹Р№ Р±СѓСЃС‚: +{int(boost_info_before.get('boost_count', 0) or 0)} РїРѕРёСЃРєРѕРІ\n"
+            f"рџ“… Р”РµР№СЃС‚РІРѕРІР°Р» РґРѕ: {boost_end_formatted}\n"
+            f"рџ“Љ РќРѕРІС‹Р№ РґРЅРµРІРЅРѕР№ Р»РёРјРёС‚: {new_limit}"
+        )
+        await context.bot.send_message(chat_id=player.user_id, text=user_notification)
+    except Exception as e:
+        logger.warning(f"[BOOST_NOTIFY] Failed to notify user {user_info} about boost removal: {e}")
+    return
     
     from database import SessionLocal, Player
     

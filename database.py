@@ -206,6 +206,7 @@ class InventoryItem(Base):
     drink = relationship("EnergyDrink")
 
     __table_args__ = (
+        Index('ux_inventory_player_drink_rarity', 'player_id', 'drink_id', 'rarity', unique=True),
         Index('idx_inventory_player', 'player_id'),
         Index('idx_inventory_drink', 'drink_id'),
         Index('idx_inventory_rarity', 'rarity'),
@@ -4521,6 +4522,8 @@ def increment_auto_search_count(user_id: int, delta: int = 1) -> int:
     """
     dbs = SessionLocal()
     try:
+        if engine.dialect.name == 'sqlite':
+            dbs.execute(text("BEGIN IMMEDIATE"))
         dbs.execute(
             text("UPDATE players SET auto_search_count = COALESCE(auto_search_count, 0) + :d WHERE user_id = :uid"),
             {"d": int(delta), "uid": int(user_id)},
@@ -5744,17 +5747,330 @@ def get_drink_by_name(name: str) -> EnergyDrink | None:
     finally:
         db.close()
 
+def _begin_write_transaction(dbs):
+    if engine.dialect.name == 'sqlite':
+        dbs.execute(text("BEGIN IMMEDIATE"))
+
+
+def _normalize_player_identity(username=None, display_name=None) -> tuple[str | None, str | None]:
+    new_uname = None
+    new_display = None
+    try:
+        if username:
+            uname = str(username).lstrip('@')
+            if re.fullmatch(r"[A-Za-z0-9_]{3,32}", uname or ""):
+                new_uname = uname
+        if display_name:
+            new_display = str(display_name).strip()
+        if (not new_display) and username and (new_uname is None):
+            new_display = str(username).strip()
+    except Exception:
+        new_uname = None
+        new_display = None
+    return new_uname, new_display
+
+
+def _get_or_create_player_in_session(dbs, user_id: int, username=None, display_name=None) -> Player:
+    player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+    new_uname, new_display = _normalize_player_identity(username=username, display_name=display_name)
+    if not player:
+        player = Player(user_id=int(user_id), username=new_uname, display_name=new_display)
+        dbs.add(player)
+        dbs.flush()
+        return player
+    if new_uname and new_uname != getattr(player, 'username', None):
+        player.username = new_uname
+    if new_display and new_display != getattr(player, 'display_name', None):
+        player.display_name = new_display
+    return player
+
+
+def _get_inventory_rows_in_session(dbs, user_id: int, drink_id: int, rarity: str) -> list[InventoryItem]:
+    return list(
+        dbs.query(InventoryItem)
+        .filter_by(player_id=int(user_id), drink_id=int(drink_id), rarity=str(rarity))
+        .order_by(InventoryItem.id.asc())
+        .all()
+    )
+
+
+def _merge_inventory_rows_in_session(dbs, user_id: int, drink_id: int, rarity: str, quantity: int = 1) -> int:
+    rows = _get_inventory_rows_in_session(dbs, user_id, drink_id, rarity)
+    add_qty = max(0, int(quantity or 0))
+    existing_qty = 0
+    for row in rows:
+        existing_qty += max(0, int(getattr(row, 'quantity', 0) or 0))
+
+    if rows:
+        keeper = rows[0]
+        keeper.quantity = int(existing_qty + add_qty)
+        for extra in rows[1:]:
+            dbs.delete(extra)
+    else:
+        dbs.add(
+            InventoryItem(
+                player_id=int(user_id),
+                drink_id=int(drink_id),
+                rarity=str(rarity),
+                quantity=int(add_qty),
+            )
+        )
+    return int(existing_qty)
+
+
+def _is_autosell_enabled_in_session(dbs, user_id: int, rarity: str) -> bool:
+    row = (
+        dbs.query(AutoSellSetting)
+        .filter(
+            AutoSellSetting.user_id == int(user_id),
+            AutoSellSetting.rarity == str(rarity),
+        )
+        .first()
+    )
+    return bool(getattr(row, 'enabled', False))
+
+
+def _record_drink_discovery_in_session(dbs, drink_id: int, current_time: int | None = None):
+    ts = int(current_time or time.time())
+    current_date = int(ts // 86400)
+    stats = dbs.query(DrinkDiscoveryStats).filter_by(drink_id=int(drink_id)).first()
+    if stats:
+        stats.total_discoveries = int(getattr(stats, 'total_discoveries', 0) or 0) + 1
+        stats.last_discovered_at = ts
+        if int(getattr(stats, 'last_reset_date', 0) or 0) != current_date:
+            stats.global_discoveries_today = 1
+            stats.last_reset_date = current_date
+        else:
+            stats.global_discoveries_today = int(getattr(stats, 'global_discoveries_today', 0) or 0) + 1
+        return
+
+    dbs.add(
+        DrinkDiscoveryStats(
+            drink_id=int(drink_id),
+            total_discoveries=1,
+            last_discovered_at=ts,
+            global_discoveries_today=1,
+            last_reset_date=current_date,
+        )
+    )
+
+
+def _upsert_swaga_cards_in_session(dbs, user_id: int, drop_counts: dict[str, int] | None):
+    for rarity_name, qty in (drop_counts or {}).items():
+        amount = max(0, int(qty or 0))
+        if amount <= 0:
+            continue
+        rec = dbs.query(SwagaCardInventory).filter_by(user_id=int(user_id), rarity=str(rarity_name)).first()
+        if rec:
+            rec.quantity = int(getattr(rec, 'quantity', 0) or 0) + amount
+        else:
+            dbs.add(SwagaCardInventory(user_id=int(user_id), rarity=str(rarity_name), quantity=amount))
+
+
+def _parse_json_stats(raw_value) -> dict:
+    try:
+        data = json.loads(raw_value or '{}')
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        return {}
+    rarities = data.get('rarities')
+    if not isinstance(rarities, dict):
+        data['rarities'] = {}
+    return data
+
+
+def append_auto_search_session_stats(user_id: int, found_count: int = 0, earned_coins: int = 0, rarities: list[str] | None = None) -> dict:
+    dbs = SessionLocal()
+    try:
+        _begin_write_transaction(dbs)
+        player = _get_or_create_player_in_session(dbs, int(user_id))
+        stats = _parse_json_stats(getattr(player, 'auto_search_session_stats', '{}') or '{}')
+        stats['total_found'] = int(stats.get('total_found', 0) or 0) + max(0, int(found_count or 0))
+        stats['total_coins'] = int(stats.get('total_coins', 0) or 0) + max(0, int(earned_coins or 0))
+        rarity_stats = stats.get('rarities') or {}
+        for rarity in (rarities or []):
+            if not rarity:
+                continue
+            rarity_key = str(rarity)
+            rarity_stats[rarity_key] = int(rarity_stats.get(rarity_key, 0) or 0) + 1
+        stats['rarities'] = rarity_stats
+        player.auto_search_session_stats = json.dumps(stats, ensure_ascii=False)
+        dbs.commit()
+        return stats
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {}
+    finally:
+        dbs.close()
+
+
+def consume_auto_search_session_stats(user_id: int) -> dict:
+    dbs = SessionLocal()
+    try:
+        _begin_write_transaction(dbs)
+        player = dbs.query(Player).filter(Player.user_id == int(user_id)).first()
+        if not player:
+            dbs.rollback()
+            return {}
+        raw = getattr(player, 'auto_search_session_stats', '{}') or '{}'
+        player.auto_search_session_stats = '{}'
+        dbs.commit()
+        return _parse_json_stats(raw)
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {}
+    finally:
+        dbs.close()
+
+
+def apply_energy_search_outcome_atomic(
+    *,
+    user_id: int,
+    username: str | None = None,
+    display_name: str | None = None,
+    search_ts: int,
+    effective_cooldown: float,
+    base_reward_coins: int,
+    rating_delta: int = 1,
+    max_rating: int = 1000,
+    consume_luck_charge: bool = False,
+    drops: list[dict] | None = None,
+    swaga_counts: dict[str, int] | None = None,
+    auto_search_mode: bool = False,
+    auto_search_daily_limit: int | None = None,
+) -> dict:
+    dbs = SessionLocal()
+    try:
+        _begin_write_transaction(dbs)
+        player = _get_or_create_player_in_session(
+            dbs,
+            int(user_id),
+            username=username,
+            display_name=display_name,
+        )
+
+        now_ts = int(search_ts or time.time())
+        last_search = int(getattr(player, 'last_search', 0) or 0)
+        cooldown = float(effective_cooldown or 0)
+        if cooldown > 0 and (float(now_ts) - float(last_search)) < cooldown:
+            time_left = max(0.0, cooldown - (float(now_ts) - float(last_search)))
+            try:
+                dbs.rollback()
+            except Exception:
+                pass
+            return {"ok": False, "reason": "cooldown", "time_left": float(time_left)}
+
+        auto_count = int(getattr(player, 'auto_search_count', 0) or 0)
+        if auto_search_mode:
+            if not bool(getattr(player, 'auto_search_enabled', False)):
+                try:
+                    dbs.rollback()
+                except Exception:
+                    pass
+                return {"ok": False, "reason": "disabled"}
+            reset_ts = int(getattr(player, 'auto_search_reset_ts', 0) or 0)
+            if reset_ts == 0 or now_ts >= reset_ts:
+                auto_count = 0
+                player.auto_search_count = 0
+                player.auto_search_reset_ts = int(now_ts + 24 * 60 * 60)
+            if auto_search_daily_limit is not None and auto_count >= int(auto_search_daily_limit):
+                try:
+                    dbs.rollback()
+                except Exception:
+                    pass
+                return {"ok": False, "reason": "limit", "auto_search_count": int(auto_count)}
+
+        rating_before = int(getattr(player, 'rating', 0) or 0)
+        coins_before = int(getattr(player, 'coins', 0) or 0)
+        luck_left = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+        if consume_luck_charge and luck_left > 0:
+            luck_left -= 1
+
+        total_autosell_payout = 0
+        applied_drops: list[dict] = []
+        for drop in (drops or []):
+            drink_id = int(drop.get('drink_id') or 0)
+            rarity = str(drop.get('rarity') or 'Basic')
+            if drink_id <= 0:
+                continue
+
+            existing_qty = _merge_inventory_rows_in_session(dbs, int(user_id), drink_id, rarity, quantity=0)
+            autosell_enabled = False
+            autosell_payout = 0
+            if existing_qty > 0 and _is_autosell_enabled_in_session(dbs, int(user_id), rarity):
+                try:
+                    autosell_payout = int(get_receiver_unit_payout_with_rating(rarity, rating_before) or 0)
+                except Exception:
+                    autosell_payout = 0
+                if autosell_payout > 0:
+                    autosell_enabled = True
+                    total_autosell_payout += autosell_payout
+
+            if (not autosell_enabled) or autosell_payout <= 0:
+                _merge_inventory_rows_in_session(dbs, int(user_id), drink_id, rarity, quantity=1)
+
+            _record_drink_discovery_in_session(dbs, drink_id, current_time=now_ts)
+            applied_drops.append(
+                {
+                    "drink_id": int(drink_id),
+                    "rarity": rarity,
+                    "autosell_enabled": bool(autosell_enabled),
+                    "autosell_payout": int(autosell_payout),
+                }
+            )
+
+        _upsert_swaga_cards_in_session(dbs, int(user_id), swaga_counts)
+
+        player.last_search = int(now_ts)
+        player.rating = min(int(max_rating), rating_before + int(rating_delta or 0))
+        player.coins = int(coins_before + int(base_reward_coins or 0) + int(total_autosell_payout))
+        player.luck_coupon_charges = max(0, int(luck_left))
+
+        if auto_search_mode:
+            auto_count += 1
+            player.auto_search_count = int(auto_count)
+
+        dbs.commit()
+        return {
+            "ok": True,
+            "coins_after": int(player.coins),
+            "new_rating": int(player.rating),
+            "total_autosell_payout": int(total_autosell_payout),
+            "drop_results": applied_drops,
+            "auto_search_count": int(auto_count),
+            "luck_charges_left": int(player.luck_coupon_charges or 0),
+        }
+    except Exception as e:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        logger.error(f"apply_energy_search_outcome_atomic failed for user {user_id}: {e}")
+        return {"ok": False, "reason": "exception"}
+    finally:
+        dbs.close()
+
+
 def add_drink_to_inventory(user_id, drink_id, rarity):
     """Добавляет энергетик в инвентарь игрока."""
     db = SessionLocal()
     try:
-        item = db.query(InventoryItem).filter_by(player_id=user_id, drink_id=drink_id, rarity=rarity).first()
-        if item:
-            item.quantity += 1
-        else:
-            new_item = InventoryItem(player_id=user_id, drink_id=drink_id, rarity=rarity, quantity=1)
-            db.add(new_item)
+        _begin_write_transaction(db)
+        _merge_inventory_rows_in_session(db, int(user_id), int(drink_id), str(rarity), quantity=1)
         db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         db.close()
 
@@ -5771,22 +6087,8 @@ def add_custom_drink_to_inventory(user_id: int, drink_id: int, rarity: str, quan
 
     db = SessionLocal()
     try:
-        item = (
-            db.query(InventoryItem)
-            .filter_by(player_id=int(user_id), drink_id=int(drink_id), rarity=str(rarity))
-            .first()
-        )
-        if item:
-            item.quantity = int(item.quantity or 0) + int(quantity)
-        else:
-            new_item = InventoryItem(
-                player_id=int(user_id),
-                drink_id=int(drink_id),
-                rarity=str(rarity),
-                quantity=int(quantity),
-            )
-            db.add(new_item)
-
+        _begin_write_transaction(db)
+        _merge_inventory_rows_in_session(db, int(user_id), int(drink_id), str(rarity), quantity=int(quantity))
         db.commit()
         return True
     except Exception:
@@ -6519,6 +6821,33 @@ def ensure_schema():
             # Если таблицы plantation_beds ещё нет — она будет создана выше через Base.metadata.create_all
             pass
 
+
+        # Инвентарь: схлопываем дубли и добавляем уникальность по player_id + drink_id + rarity
+        try:
+            dup_rows = list(
+                conn.exec_driver_sql(
+                    """
+                    SELECT player_id, drink_id, rarity, SUM(COALESCE(quantity, 0)) AS total_qty, MIN(id) AS keep_id
+                    FROM inventory_items
+                    GROUP BY player_id, drink_id, rarity
+                    HAVING COUNT(*) > 1
+                    """
+                )
+            )
+            for player_id, drink_id, rarity, total_qty, keep_id in dup_rows:
+                conn.exec_driver_sql(
+                    "UPDATE inventory_items SET quantity = ? WHERE id = ?",
+                    (int(total_qty or 0), int(keep_id)),
+                )
+                conn.exec_driver_sql(
+                    "DELETE FROM inventory_items WHERE player_id = ? AND drink_id = ? AND rarity = ? AND id <> ?",
+                    (player_id, drink_id, rarity, int(keep_id)),
+                )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_inventory_player_drink_rarity ON inventory_items(player_id, drink_id, rarity)"
+            )
+        except Exception:
+            pass
 
     try:
         _ensure_gift_autoblock_defaults()
@@ -8422,28 +8751,57 @@ def get_expiring_boosts(hours_ahead: int = 24) -> list[Player]:
     finally:
         dbs.close()
 
-def remove_auto_search_boost(user_id: int, removed_by: int | None = None, removed_by_username: str | None = None) -> bool:
+def get_expired_boosts() -> list[Player]:
+    """Р’РѕР·РІСЂР°С‰Р°РµС‚ СЃРїРёСЃРѕРє РёРіСЂРѕРєРѕРІ СЃ РёСЃС‚С‘РєС€РёРјРё Р±СѓСЃС‚Р°РјРё Р°РІС‚РѕРїРѕРёСЃРєР°."""
+    import time
+    dbs = SessionLocal()
+    try:
+        current_time = int(time.time())
+        return list(
+            dbs.query(Player)
+            .filter(
+                Player.auto_search_boost_until > 0,
+                Player.auto_search_boost_until <= current_time,
+                Player.auto_search_boost_count > 0,
+            )
+            .all()
+        )
+    finally:
+        dbs.close()
+
+def remove_auto_search_boost(
+    user_id: int,
+    removed_by: int | None = None,
+    removed_by_username: str | None = None,
+    history_action: str = 'removed',
+    history_details: str | None = None,
+) -> bool:
     """Убирает активный буст автопоиска у пользователя."""
     dbs = SessionLocal()
     try:
+        _begin_write_transaction(dbs)
         player = dbs.query(Player).filter(Player.user_id == user_id).first()
         if not player:
+            dbs.rollback()
             return False
         
         # Сохраняем информацию о бусте для истории
         boost_count = int(getattr(player, 'auto_search_boost_count', 0) or 0)
+        if boost_count <= 0:
+            dbs.rollback()
+            return False
         
         player.auto_search_boost_count = 0
         player.auto_search_boost_until = 0
         dbs.commit()
         
         # Добавляем запись в историю, если был активный буст
-        if boost_count > 0:
+        if boost_count > 0 and (removed_by is not None or str(history_action or 'removed') != 'removed'):
             try:
                 add_boost_history_record(
                     user_id=user_id,
                     username=player.username,
-                    action='removed',
+                    action=str(history_action or 'removed'),
                     boost_count=boost_count,
                     granted_by=removed_by,
                     granted_by_username=removed_by_username,

@@ -64,6 +64,16 @@ async def show_vip_plus_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
+    if False and not access.get('acts_like_vip'):
+        await query.answer("РђРІС‚РѕРїРѕРёСЃРє Р±РѕР»СЊС€Рµ РЅРµРґРѕСЃС‚СѓРїРµРЅ РґР»СЏ РІР°С€РµРіРѕ СЃС‚Р°С‚СѓСЃР°.", show_alert=True)
+        await show_vip_plus_menu(update, context)
+        return
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
+    if False and not access.get('acts_like_vip'):
+        await query.answer("РђРІС‚РѕРїРѕРёСЃРє Р±РѕР»СЊС€Рµ РЅРµРґРѕСЃС‚СѓРїРµРЅ РґР»СЏ РІР°С€РµРіРѕ СЃС‚Р°С‚СѓСЃР°.", show_alert=True)
+        await show_vip_plus_menu(update, context)
+        return
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
     lang = player.language
     if str(access.get('tier') or '') in ('admin', 'admin_plus'):
         tier = "Admin+" if str(access.get('tier') or '') == 'admin_plus' else "Admin"
@@ -455,6 +465,11 @@ async def toggle_auto_search_silent(update: Update, context: ContextTypes.DEFAUL
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     
     # Переключаем
+    access = db.get_access_profile(user.id, username=getattr(user, 'username', None), player=player)
+    if not access.get('acts_like_vip'):
+        await query.answer("РђРІС‚РѕРїРѕРёСЃРє Р±РѕР»СЊС€Рµ РЅРµРґРѕСЃС‚СѓРїРµРЅ РґР»СЏ РІР°С€РµРіРѕ СЃС‚Р°С‚СѓСЃР°.", show_alert=True)
+        await show_vip_plus_menu(update, context)
+        return
     current = getattr(player, 'auto_search_silent', False)
     db.update_player(user.id, auto_search_silent=not current)
     

@@ -5507,11 +5507,7 @@ async def snooze_reminder_handler(update: Update, context: ContextTypes.DEFAULT_
 async def _send_auto_search_summary(user_id: int, player: Player, context: ContextTypes.DEFAULT_TYPE, reason: str = 'limit'):
     """Отправляет сводный отчет по автопоиску (для тихого режима)."""
     try:
-        stats_json = getattr(player, 'auto_search_session_stats', '{}') or '{}'
-        try:
-            stats = json.loads(stats_json)
-        except:
-            stats = {}
+        stats = db.consume_auto_search_session_stats(user_id)
         
         total_found = stats.get('total_found', 0)
         if total_found == 0:
@@ -5538,7 +5534,6 @@ async def _send_auto_search_summary(user_id: int, player: Player, context: Conte
         await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
         
         # Сбрасываем статистику
-        db.update_player(user_id, auto_search_session_stats='{}')
         
     except Exception as e:
         logger.error(f"[AUTO] Failed to send summary for {user_id}: {e}")
@@ -5648,15 +5643,28 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         async with lock:
-            result = await _perform_energy_search(user_id, player.username or str(user_id), context)
+            player = db.get_or_create_player(user_id, player.username or str(user_id))
+            if not getattr(player, 'auto_search_enabled', False):
+                if getattr(player, 'auto_search_silent', False):
+                    await _send_auto_search_summary(user_id, player, context, reason='disabled')
+                context.bot_data.pop(retry_key, None)
+                return
+
+            access = db.get_access_profile(user_id, username=getattr(player, 'username', None), player=player)
+            daily_limit = db.get_auto_search_daily_limit(user_id, username=getattr(player, 'username', None))
+            result = await _perform_energy_search(
+                user_id,
+                player.username or str(user_id),
+                context,
+                auto_search=True,
+                auto_search_daily_limit=daily_limit,
+            )
 
             if result.get('status') == 'ok':
                 # Атомарный инкремент счётчика (SEC-01 fix)
-                new_count = db.increment_auto_search_count(user_id)
-                if new_count < 0:
+                count = int(result.get('auto_search_count', count) or count)
+                if False:
                     logger.warning(f"[AUTO] Не удалось инкрементировать auto_search_count для {user_id}")
-                    new_count = count + 1
-                count = new_count
 
         # Сбрасываем retry-счётчик при успехе
         context.bot_data.pop(retry_key, None)
@@ -5696,7 +5704,12 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                             continue
                         stats['rarities'][rarity] = stats['rarities'].get(rarity, 0) + 1
                     
-                    db.update_player(user_id, auto_search_session_stats=json.dumps(stats))
+                    db.append_auto_search_session_stats(
+                        user_id,
+                        found_count=found_count,
+                        earned_coins=earned_coins,
+                        rarities=rarities,
+                    )
                     logger.debug(f"[AUTO] Silent search stats updated for {user_id}")
                 except Exception as e:
                     logger.error(f"[AUTO] Failed to update silent stats: {e}")
@@ -5774,6 +5787,19 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
         elif result.get('status') == 'cooldown':
             delay = max(1.0, float(result.get('time_left', 5)))
             _reschedule_auto_search(context, user_id, delay)
+            return
+        elif result.get('status') == 'disabled':
+            if getattr(player, 'auto_search_silent', False):
+                await _send_auto_search_summary(user_id, player, context, reason='disabled')
+            return
+        elif result.get('status') == 'limit':
+            if getattr(player, 'auto_search_silent', False):
+                await _send_auto_search_summary(user_id, player, context, reason='limit')
+            db.update_player(user_id, auto_search_enabled=False)
+            try:
+                await context.bot.send_message(chat_id=user_id, text=t(player.language, 'auto_limit_reached'))
+            except Exception:
+                pass
             return
         elif result.get('status') == 'no_drinks':
             # Сообщим один раз и попробуем через 10 минут
@@ -5885,7 +5911,13 @@ async def send_silk_harvest_notification(context: ContextTypes.DEFAULT_TYPE, use
     except Exception as e:
         logger.warning(f"[SILK] Failed to send harvest notification to user {user_id}: {e}")
 
-async def _perform_energy_search(user_id: int, username: str, context: ContextTypes.DEFAULT_TYPE):
+async def _perform_energy_search(
+    user_id: int,
+    username: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    auto_search: bool = False,
+    auto_search_daily_limit: int | None = None,
+):
     """
     Ядро логики поиска энергетика. Проверяет кулдаун, ищет напиток,
     обновляет БД и возвращает результат в виде словаря.
@@ -5921,11 +5953,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         found_count = 2 if (random.random() < double_drop_chance) else 1
         if found_count == 2 and luck_charges > 0:
             used_luck_coupon = True
-            try:
-                db.update_player(user_id, luck_coupon_charges=max(0, luck_charges - 1))
-                luck_charges = max(0, luck_charges - 1)
-            except Exception:
-                pass
+            luck_charges = max(0, luck_charges - 1)
 
     drops: list[dict] = []
     rarities_found: list[str] = []
@@ -5954,7 +5982,6 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         drink_temp = db.get_drink_temperature(found_drink.id)
 
         # Записываем находку в статистику (ПОСЛЕ определения температуры)
-        db.record_drink_discovery(found_drink.id)
 
         # Определяем редкость
         if found_drink.is_special:
@@ -5970,7 +5997,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         autosell_payout = 0
         try:
             # Эксклюзивность: если в инвентаре ещё нет такого drink_id+rarity, НЕ автопродаём
-            already_have = db.has_inventory_item(user_id, found_drink.id, rarity)
+            already_have = False
             if already_have and db.is_autosell_enabled(user_id, rarity):
                 autosell_enabled = True
                 try:
@@ -5985,7 +6012,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             autosell_enabled = False
 
         # Если автопродажа не сработала (отключена или цена 0) — добавляем напиток в инвентарь
-        if (not autosell_enabled) or autosell_payout <= 0:
+        if False and ((not autosell_enabled) or autosell_payout <= 0):
             db.add_drink_to_inventory(user_id=user_id, drink_id=found_drink.id, rarity=rarity)
 
         drops.append({
@@ -5999,6 +6026,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     # Свага-карточки: 10 шт. за каждый найденный энергетик (джекпот x2 => 20)
     swaga_cards_total = 10 * int(found_count or 1)
     swaga_cards_found = []
+    drop_counts = {}
     try:
         from constants import SWAGA_RARITIES
         from database import SessionLocal, SwagaCardInventory
@@ -6010,23 +6038,7 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
             swaga_cards_found.append(sr)
             drop_counts[sr] = drop_counts.get(sr, 0) + 1
         
-        db_session = SessionLocal()
-        try:
-            for rarity_name, qty in drop_counts.items():
-                rec = db_session.query(SwagaCardInventory).filter_by(user_id=int(user_id), rarity=rarity_name).first()
-                if rec:
-                    rec.quantity += qty
-                else:
-                    db_session.add(SwagaCardInventory(user_id=int(user_id), rarity=rarity_name, quantity=qty))
-            db_session.commit()
-            logger.info(f"[SWAGA] Saved {len(swaga_drops)} swaga cards for user {user_id}")
-        except Exception as e:
-            db_session.rollback()
-            logger.error(f"[SWAGA] Error saving swaga cards for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            db_session.close()
+        pass
     except Exception as e:
         logger.error(f"[SWAGA] Error generating Swaga Cards for user {user_id}: {e}")
         import traceback
@@ -6035,10 +6047,38 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
     # Обновляем игрока: фиксируем время поиска и рейтинг.
     # Баланс обновляем атомарно через increment_coins, чтобы не перезаписать
     # параллельные изменения от других обработчиков (казино, подарки, админ).
-    new_rating = db.increment_rating(user_id, 1)
-    coins_after_result = db.increment_coins(user_id, total_reward)
-    coins_after = coins_after_result if coins_after_result is not None else (coins_before + total_reward)
-    db.update_player(user_id, last_search=current_time)
+    apply_result = db.apply_energy_search_outcome_atomic(
+        user_id=user_id,
+        username=username,
+        search_ts=int(current_time),
+        effective_cooldown=eff_search_cd,
+        base_reward_coins=septims_reward,
+        rating_delta=1,
+        consume_luck_charge=used_luck_coupon,
+        drops=[{"drink_id": int(d["drink"].id), "rarity": str(d["rarity"])} for d in drops],
+        swaga_counts=drop_counts,
+        auto_search_mode=bool(auto_search),
+        auto_search_daily_limit=auto_search_daily_limit,
+    )
+    if not apply_result.get('ok'):
+        reason = str(apply_result.get('reason') or 'exception')
+        if reason == 'cooldown':
+            return {"status": "cooldown", "time_left": float(apply_result.get('time_left', eff_search_cd) or eff_search_cd)}
+        if reason == 'disabled':
+            return {"status": "disabled"}
+        if reason == 'limit':
+            return {"status": "limit"}
+        return {"status": "error"}
+
+    new_rating = int(apply_result.get('new_rating', rating_value) or rating_value)
+    coins_after = int(apply_result.get('coins_after', coins_before + septims_reward) or (coins_before + septims_reward))
+    total_autosell_payout = int(apply_result.get('total_autosell_payout', 0) or 0)
+    luck_charges = int(apply_result.get('luck_charges_left', luck_charges) or luck_charges)
+    if auto_search:
+        auto_search_count_after = int(apply_result.get('auto_search_count', 0) or 0)
+    for drop, drop_result in zip(drops, apply_result.get('drop_results') or []):
+        drop['autosell_enabled'] = bool(drop_result.get('autosell_enabled', False))
+        drop['autosell_payout'] = int(drop_result.get('autosell_payout', 0) or 0)
     try:
         names = ", ".join([d['drink'].name for d in drops])
     except Exception:
@@ -6091,7 +6131,8 @@ async def _perform_energy_search(user_id: int, username: str, context: ContextTy
         "earned_coins": septims_reward + total_autosell_payout,
         "found_count": found_count,
         "rarities": rarities_found,
-        "rarity": (rarities_found[0] if rarities_found else 'Basic')
+        "rarity": (rarities_found[0] if rarities_found else 'Basic'),
+        "auto_search_count": int(apply_result.get('auto_search_count', 0) or 0) if auto_search else None,
     }
 
 
@@ -20544,6 +20585,12 @@ def main():
         """Проверяет истекающие бусты и уведомляет пользователей и админов."""
         try:
             # Проверяем бусты, истекающие в следующие 2 часа
+            warned = context.bot_data.setdefault("boost_expiry_warned", {})
+            now_warn_ts = int(time.time())
+            for warn_key, warn_ts in list(warned.items()):
+                if now_warn_ts - int(warn_ts or 0) > 24 * 3600:
+                    warned.pop(warn_key, None)
+
             expiring_boosts = db.get_expiring_boosts(hours_ahead=2)
             
             for player in expiring_boosts:
@@ -20551,6 +20598,10 @@ def main():
                     # Уведомляем пользователя
                     boost_info = db.get_boost_info(player.user_id)
                     if boost_info['is_active']:
+                        warn_key = f"{player.user_id}:{boost_info.get('boost_until', 0)}"
+                        if warned.get(warn_key):
+                            continue
+                        warned[warn_key] = now_warn_ts
                         remaining_time = boost_info['time_remaining_formatted']
                         username = f"@{esc(player.username)}" if player.username else f"ID: {player.user_id}"
                         
@@ -20592,7 +20643,7 @@ def main():
                     continue
             
             # Проверяем и убираем истёкшие бусты (с нулевой задержкой)
-            expired_boosts = db.get_expiring_boosts(hours_ahead=0)
+            expired_boosts = db.get_expired_boosts()
             for player in expired_boosts:
                 try:
                     # Проверяем, что буст действительно истёк
