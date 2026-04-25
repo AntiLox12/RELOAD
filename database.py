@@ -5807,14 +5807,27 @@ def _merge_inventory_rows_in_session(dbs, user_id: int, drink_id: int, rarity: s
         for extra in rows[1:]:
             dbs.delete(extra)
     else:
-        dbs.add(
-            InventoryItem(
-                player_id=int(user_id),
-                drink_id=int(drink_id),
-                rarity=str(rarity),
-                quantity=int(add_qty),
-            )
+        new_item = InventoryItem(
+            player_id=int(user_id),
+            drink_id=int(drink_id),
+            rarity=str(rarity),
+            quantity=int(add_qty),
         )
+        dbs.add(new_item)
+        try:
+            dbs.flush()
+        except IntegrityError:
+            dbs.rollback()
+            _begin_write_transaction(dbs)
+            # Строка уже существует (race condition) — найти и обновить
+            existing = dbs.query(InventoryItem).filter_by(
+                player_id=int(user_id), drink_id=int(drink_id), rarity=str(rarity)
+            ).first()
+            if existing:
+                existing_qty = int(getattr(existing, 'quantity', 0) or 0)
+                existing.quantity = existing_qty + int(add_qty)
+                dbs.flush()
+                return int(existing_qty)
     return int(existing_qty)
 
 
@@ -6001,7 +6014,9 @@ def apply_energy_search_outcome_atomic(
             if drink_id <= 0:
                 continue
 
-            existing_qty = _merge_inventory_rows_in_session(dbs, int(user_id), drink_id, rarity, quantity=0)
+            # Проверяем наличие в инвентаре без побочных эффектов (без insert)
+            inv_rows = _get_inventory_rows_in_session(dbs, int(user_id), drink_id, rarity)
+            existing_qty = sum(max(0, int(getattr(r, 'quantity', 0) or 0)) for r in inv_rows)
             autosell_enabled = False
             autosell_payout = 0
             if existing_qty > 0 and _is_autosell_enabled_in_session(dbs, int(user_id), rarity):

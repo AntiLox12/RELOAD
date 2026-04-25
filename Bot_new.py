@@ -288,6 +288,41 @@ def _search_temp_meta(drink_temp: str, lang: str) -> tuple[str, str]:
     return ('🌡️', 'Нейтральный' if lang != 'en' else 'Neutral')
 
 
+def _search_result_reply_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]])
+
+
+def _format_search_status_message(result: dict, lang: str = 'ru') -> str:
+    status = str((result or {}).get('status') or 'error')
+    if status == 'cooldown':
+        time_left = max(0, int(float((result or {}).get('time_left', 0) or 0)))
+        mm, ss = divmod(time_left, 60)
+        return (
+            f"⏳ Ещё не время. Подожди немного ({mm}:{ss:02d})."
+            if lang != 'en'
+            else f"⏳ Not yet. Wait a bit more ({mm}:{ss:02d})."
+        )
+    if status == 'no_drinks':
+        return "В базе данных пока нет энергетиков!" if lang != 'en' else "There are no energy drinks in the database yet!"
+    if status == 'disabled':
+        return (
+            "❌ Поиск сейчас недоступен. Попробуй позже."
+            if lang != 'en'
+            else "❌ Search is currently unavailable. Try again later."
+        )
+    if status == 'limit':
+        return (
+            "❌ Дневной лимит поиска исчерпан."
+            if lang != 'en'
+            else "❌ Daily search limit reached."
+        )
+    return (
+        "❌ Поиск завершился ошибкой. Попробуй ещё раз позже."
+        if lang != 'en'
+        else "❌ Search failed. Try again later."
+    )
+
+
 def _format_search_result_caption(
     *,
     lang: str,
@@ -6219,7 +6254,7 @@ async def _perform_energy_search(
         "caption": caption,
         "image_path": image_full_path,
         "image_paths": image_paths,
-        "reply_markup": InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]),
+        "reply_markup": _search_result_reply_markup(),
         "earned_coins": septims_reward + total_autosell_payout,
         "found_count": found_count,
         "rarities": rarities_found,
@@ -6255,15 +6290,14 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await _perform_energy_search(user.id, user.username or user.first_name, context)
 
         # Отображаем результат
-        if result["status"] == "no_drinks":
-            await query.edit_message_text("В базе данных пока нет энергетиков! Запустите скрипт добавления.",
-                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]]))
+        if result["status"] != "ok":
+            await query.edit_message_text(
+                _format_search_status_message(result, lang),
+                reply_markup=_search_result_reply_markup(),
+            )
             return
-        
-        # В случае успеха удаляем старое сообщение и отправляем новое
-        await query.message.delete()
-        
-        if result["status"] == "ok":
+
+        try:
             img_paths = result.get("image_paths") or []
             existing = [p for p in img_paths if p and os.path.exists(p)]
             found_count = int(result.get('found_count', 1) or 1)
@@ -6309,6 +6343,16 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=result["reply_markup"],
                     parse_mode='HTML'
                 )
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
+        except Exception:
+            logger.exception("[SEARCH] Failed to deliver callback search result to user %s", user.id)
+            await query.edit_message_text(
+                _format_search_status_message({"status": "error"}, lang),
+                reply_markup=_search_result_reply_markup(),
+            )
 
 
 async def show_roulette_animation(
@@ -20165,19 +20209,14 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         result = await _perform_energy_search(user.id, user.username or user.first_name, context)
 
-        if result["status"] == "no_drinks":
+        if result["status"] != "ok":
             try:
-                await search_message.edit_text("В базе данных пока нет энергетиков!")
+                await search_message.edit_text(_format_search_status_message(result, lang))
             except BadRequest:
-                await msg.reply_text("В базе данных пока нет энергетиков!")
+                await msg.reply_text(_format_search_status_message(result, lang))
             return
 
         try:
-            await search_message.delete()
-        except BadRequest:
-            pass
-
-        if result["status"] == 'ok':
             img_paths = result.get("image_paths") or []
             existing = [p for p in img_paths if p and os.path.exists(p)]
             found_count = int(result.get('found_count', 1) or 1)
@@ -20187,11 +20226,13 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 try:
                     f1 = open(existing[0], 'rb')
                     f2 = open(existing[1], 'rb')
-                    media = [
-                        InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
-                        InputMediaPhoto(media=f2),
-                    ]
-                    await _send_media_group_long(context.bot.send_media_group, chat_id=msg.chat_id, media=media)
+                    await _send_media_group_or_text_fallback(
+                        context.bot,
+                        chat_id=msg.chat_id,
+                        photos=[f1, f2],
+                        caption=result.get("caption"),
+                        parse_mode='HTML',
+                    )
                 finally:
                     try:
                         if f1:
@@ -20205,18 +20246,29 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         pass
             elif existing:
                 with open(existing[0], 'rb') as photo:
-                    await _send_photo_long(
-                        msg.reply_photo,
+                    await _send_photo_or_text_fallback(
+                        context.bot,
+                        chat_id=msg.chat_id,
                         photo=photo,
                         caption=result["caption"],
                         reply_markup=result["reply_markup"],
-                        parse_mode='HTML'
+                        parse_mode='HTML',
                     )
             else:
                 await msg.reply_html(
                     text=result["caption"],
                     reply_markup=result["reply_markup"]
                 )
+            try:
+                await search_message.delete()
+            except BadRequest:
+                pass
+        except Exception:
+            logger.exception("[SEARCH] Failed to deliver text-triggered search result to user %s", user.id)
+            try:
+                await search_message.edit_text(_format_search_status_message({"status": "error"}, lang))
+            except BadRequest:
+                await msg.reply_text(_format_search_status_message({"status": "error"}, lang))
 
 
 async def photo_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -20290,20 +20342,11 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         result = await _perform_energy_search(user.id, user.username or user.first_name, context)
 
-    if result['status'] == 'cooldown':
-        time_left = result["time_left"]
-        await reply_auto_delete_message(
-            msg, 
-            f"Ещё не время! Подожди немного (⏳ {int(time_left // 60)}:{int(time_left % 60):02d}).",
-            context=context
-        )
+    if result["status"] != "ok":
+        await reply_auto_delete_message(msg, _format_search_status_message(result), context=context)
         return
 
-    if result['status'] == 'no_drinks':
-        await reply_auto_delete_message(msg, "В базе данных пока нет энергетиков!", context=context)
-        return
-
-    if result["status"] == 'ok':
+    try:
         img_paths = result.get("image_paths") or []
         existing = [p for p in img_paths if p and os.path.exists(p)]
         found_count = int(result.get('found_count', 1) or 1)
@@ -20313,12 +20356,14 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 f1 = open(existing[0], 'rb')
                 f2 = open(existing[1], 'rb')
-                media = [
-                    InputMediaPhoto(media=f1, caption=result.get("caption"), parse_mode='HTML'),
-                    InputMediaPhoto(media=f2),
-                ]
-                sent_messages = await _send_media_group_long(context.bot.send_media_group, chat_id=chat.id, media=media)
-                for sm in sent_messages or []:
+                sent_messages = await _send_media_group_or_text_fallback(
+                    context.bot,
+                    chat_id=chat.id,
+                    photos=[f1, f2],
+                    caption=result.get("caption"),
+                    parse_mode='HTML',
+                )
+                for sm in (sent_messages if isinstance(sent_messages, (list, tuple)) else []) or []:
                     try:
                         await schedule_auto_delete_message(context, chat.id, sm.message_id)
                     except Exception:
@@ -20336,16 +20381,18 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
         elif existing:
             with open(existing[0], 'rb') as photo:
-                sent_msg = await _send_photo_long(
-                    msg.reply_photo,
+                sent_msg = await _send_photo_or_text_fallback(
+                    context.bot,
+                    chat_id=chat.id,
                     photo=photo,
                     caption=result["caption"],
                     reply_markup=result["reply_markup"],
-                    parse_mode='HTML'
+                    parse_mode='HTML',
                 )
             # Планируем автоудаление для фото-сообщения
             try:
-                await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
+                if sent_msg:
+                    await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
             except Exception:
                 pass
         else:
@@ -20358,6 +20405,9 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await schedule_auto_delete_message(context, chat.id, sent_msg.message_id)
             except Exception:
                 pass
+    except Exception:
+        logger.exception("[SEARCH] Failed to deliver /find result to user %s", user.id)
+        await reply_auto_delete_message(msg, _format_search_status_message({"status": "error"}), context=context)
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
