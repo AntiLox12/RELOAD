@@ -20,6 +20,8 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     PreCheckoutQueryHandler,
+    ApplicationHandlerStop,
+    TypeHandler,
     filters,
 )
 import database as db
@@ -20498,6 +20500,12 @@ async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return False
 
 
+async def global_ban_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop every update from users with an active bot ban."""
+    if await abort_if_banned(update, context):
+        raise ApplicationHandlerStop
+
+
 gift_feature = GiftFeature(
     logger=logger,
     abort_if_banned=abort_if_banned,
@@ -20568,6 +20576,7 @@ def main():
     application = ApplicationBuilder().token(config.TOKEN).request(request).build()
     BOT_RUNTIME = get_bot_runtime()
  
+    application.add_handler(TypeHandler(Update, global_ban_guard), group=-100)
     application.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, debug_log_commands), group=2)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("leaderboard", show_leaderboard))
