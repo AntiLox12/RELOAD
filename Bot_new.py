@@ -16057,6 +16057,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_menu(update, context)
     elif data == 'swaga_shop':
         await swagashop.show_swaga_shop(update, context)
+    elif data.startswith('swaga_admin_'):
+        await swaga_admin.handle_swaga_admin_callback(update, context)
     elif data == 'swaga_cards_inv':
         await swagashop.show_swaga_cards_inv(update, context)
     elif data == 'swaga_chests_inv':
@@ -20471,6 +20473,71 @@ BAN_NOTICE_COOLDOWN_SECONDS = 300
 BAN_NOTICE_CACHE_KEY = "ban_notice_cache"
 
 
+def _get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    try:
+        username = getattr(context.bot, 'username', None)
+        return str(username or '').lstrip('@').lower()
+    except Exception:
+        return ''
+
+
+def _message_text_and_entities(message) -> tuple[str, list]:
+    text = getattr(message, 'text', None) or getattr(message, 'caption', None) or ''
+    entities = list(getattr(message, 'entities', None) or [])
+    entities.extend(list(getattr(message, 'caption_entities', None) or []))
+    return text, entities
+
+
+def _is_update_addressed_to_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    if not chat or getattr(chat, 'type', None) == 'private':
+        return True
+    if getattr(update, 'callback_query', None):
+        return True
+
+    message = update.effective_message
+    if not message:
+        return False
+
+    bot_username = _get_bot_username(context)
+    reply_to = getattr(message, 'reply_to_message', None)
+    reply_user = getattr(reply_to, 'from_user', None) if reply_to else None
+    if reply_user:
+        try:
+            if getattr(reply_user, 'id', None) == getattr(context.bot, 'id', None):
+                return True
+            if bot_username and str(getattr(reply_user, 'username', '')).lower() == bot_username:
+                return True
+        except Exception:
+            pass
+
+    text, entities = _message_text_and_entities(message)
+    for entity in entities:
+        try:
+            if getattr(entity, 'type', None) != 'bot_command' or int(getattr(entity, 'offset', 0) or 0) != 0:
+                continue
+            command = text[entity.offset:entity.offset + entity.length]
+            if '@' not in command:
+                return True
+            target = command.rsplit('@', 1)[1].lower()
+            return bool(bot_username and target == bot_username)
+        except Exception:
+            continue
+
+    if bot_username:
+        for entity in entities:
+            try:
+                if getattr(entity, 'type', None) != 'mention':
+                    continue
+                mention = text[entity.offset:entity.offset + entity.length].lstrip('@').lower()
+                if mention == bot_username:
+                    return True
+            except Exception:
+                continue
+
+    return False
+
+
 def _should_send_ban_notice(context: ContextTypes.DEFAULT_TYPE, user_id: int, ban: dict) -> bool:
     """Rate-limit ban notices while still blocking every update."""
     try:
@@ -20512,7 +20579,7 @@ async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Причина: {html.escape(reason)}\n"
             f"Срок: {until_str}"
         )
-        should_notify = _should_send_ban_notice(context, user.id, ban)
+        should_notify = _is_update_addressed_to_bot(update, context) and _should_send_ban_notice(context, user.id, ban)
         q = getattr(update, 'callback_query', None)
         if q:
             try:
@@ -20719,7 +20786,9 @@ def main():
     application.add_handler(CommandHandler("swagainv", swagashop.show_swaga_shop))
     application.add_handler(swaga_admin.addswaga_conv_handler)
     application.add_handler(CommandHandler("giveswagacards", swaga_admin.giveswagacards_command))
-    application.add_handler(CommandHandler("swagaid", swaga_admin.swagaid_command))
+    application.add_handler(CommandHandler(["swagaid", "swagalist", "swagatracks"], swaga_admin.swagaid_command))
+    application.add_handler(CommandHandler(["swagaedit", "editswaga", "editswagatrack"], swaga_admin.swagaedit_command))
+    application.add_handler(CommandHandler(["swagadel", "delswaga", "delswagatrack"], swaga_admin.swagadel_command))
     
     # Логируем информацию о боте после старта (диагностика: верный ли бот запущен)
     async def _log_bot_info(context: ContextTypes.DEFAULT_TYPE):

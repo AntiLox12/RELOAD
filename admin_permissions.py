@@ -70,6 +70,7 @@ ADMIN_CALLBACK_PREFIX_LEVELS: list[tuple[str, int]] = [
     ("admin_settings_", 3),
     ("admin_econ_", 3),
     ("admin_event_", 3),
+    ("swaga_admin_", 2),
     ("promo_wiz_", 3),
     ("promo_deact:", 3),
     ("promo_deact_do:", 3),
