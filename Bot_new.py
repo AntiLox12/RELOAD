@@ -20467,6 +20467,34 @@ def get_rarity_emoji(rarity: str) -> str:
     return COLOR_EMOJIS.get(rarity, '⭐')
 
 
+BAN_NOTICE_COOLDOWN_SECONDS = 300
+BAN_NOTICE_CACHE_KEY = "ban_notice_cache"
+
+
+def _should_send_ban_notice(context: ContextTypes.DEFAULT_TYPE, user_id: int, ban: dict) -> bool:
+    """Rate-limit ban notices while still blocking every update."""
+    try:
+        cache = context.bot_data.setdefault(BAN_NOTICE_CACHE_KEY, {})
+        now_ts = int(time.time())
+        signature = (
+            int(ban.get('banned_at') or 0),
+            int(ban.get('banned_until') or 0),
+            str(ban.get('reason') or ''),
+        )
+        last_notice = cache.get(int(user_id))
+        if (
+            isinstance(last_notice, dict)
+            and last_notice.get('signature') == signature
+            and now_ts - int(last_notice.get('sent_at') or 0) < BAN_NOTICE_COOLDOWN_SECONDS
+        ):
+            return False
+
+        cache[int(user_id)] = {'sent_at': now_ts, 'signature': signature}
+        return True
+    except Exception:
+        return True
+
+
 async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Проверяет активный бан и мягко останавливает действие пользователя."""
     try:
@@ -20484,13 +20512,17 @@ async def abort_if_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Причина: {html.escape(reason)}\n"
             f"Срок: {until_str}"
         )
+        should_notify = _should_send_ban_notice(context, user.id, ban)
         q = getattr(update, 'callback_query', None)
         if q:
             try:
-                await q.answer(text, show_alert=True)
+                if should_notify:
+                    await q.answer(text, show_alert=True)
+                else:
+                    await q.answer()
             except Exception:
                 pass
-        else:
+        elif should_notify:
             try:
                 await reply_auto_delete_message(update.effective_message, text, context=context)
             except Exception:
