@@ -458,6 +458,14 @@ RECEIVER_PRICES = {
     'Plant': 400,
 }
 
+# Предметы игрока, которые можно сдать в Приёмник.
+RECEIVER_ITEM_PRICES = {
+    'luck_coupon': 500,
+}
+RECEIVER_ROTATION_PERIOD_SEC = 86400
+RECEIVER_ROTATION_RARITY_BONUS_PERCENT = 30
+RECEIVER_ROTATION_ITEM_BONUS_PERCENT = 20
+
 # --- Магазин (покупка энергетиков) ---
 # Множитель цены покупки относительно базовой цены приёмника.
 # Например, при множителе 3: Basic продаётся игроку за 30 монет, если базовая цена 10.

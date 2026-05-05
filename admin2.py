@@ -39,6 +39,227 @@ def _parse_yes_no(value: str | None, default: bool = False) -> bool:
     val = value.strip().lower()
     return val in ('y', 'yes', 'true', '1', 'да', 'д', 'on')
 
+
+def _iter_registered_handlers(application):
+    handlers = getattr(application, 'handlers', None)
+    if not handlers:
+        return
+    if isinstance(handlers, dict):
+        for group_handlers in handlers.values():
+            for handler in group_handlers:
+                yield handler
+    else:
+        for item in handlers:
+            if isinstance(item, tuple) and len(item) >= 2:
+                yield item[1]
+            else:
+                yield item
+
+
+def _collect_handler_commands(handler) -> set[str]:
+    commands: set[str] = set()
+
+    for cmd in getattr(handler, 'commands', []) or []:
+        if isinstance(cmd, bytes):
+            cmd = cmd.decode('utf-8', errors='ignore')
+        cmd = str(cmd).lstrip('/').strip().lower()
+        if cmd:
+            commands.add(cmd)
+
+    nested = []
+    nested.extend(getattr(handler, 'entry_points', None) or getattr(handler, '_entry_points', []) or [])
+    nested.extend(getattr(handler, 'fallbacks', None) or getattr(handler, '_fallbacks', []) or [])
+    states = getattr(handler, 'states', None) or getattr(handler, '_states', {}) or {}
+    if isinstance(states, dict):
+        for state_handlers in states.values():
+            nested.extend(state_handlers or [])
+    for sub_handler in nested:
+        commands.update(_collect_handler_commands(sub_handler))
+    return commands
+
+
+def _collect_registered_commands(application) -> list[str]:
+    commands: set[str] = set()
+    for handler in _iter_registered_handlers(application) or []:
+        commands.update(_collect_handler_commands(handler))
+    return sorted(commands)
+
+
+def _format_command_line(command: str, description: str) -> str:
+    return f"• /{command} — {description}"
+
+
+def _format_command_group(title: str, items: list[tuple[str, str]]) -> str:
+    lines = [title]
+    for command, description in items:
+        lines.append(_format_command_line(command, description))
+    return "\n".join(lines)
+
+
+def _message_parts_from_sections(sections: list[str], limit: int = 3900) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        candidate = section if not current else f"{current}\n\n{section}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+        if len(section) <= limit:
+            current = section
+            continue
+        lines = section.splitlines()
+        current = ""
+        for line in lines:
+            candidate = line if not current else f"{current}\n{line}"
+            if len(candidate) > limit and current:
+                parts.append(current)
+                current = line
+            else:
+                current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _admin2_help_sections(registered_commands: list[str]) -> list[str]:
+    described_commands: set[str] = set()
+
+    def group(title: str, items: list[tuple[str, str]]) -> str:
+        for command, _ in items:
+            for alias in command.split(', '):
+                described_commands.add(alias.strip().lstrip('/').lower())
+        return _format_command_group(title, items)
+
+    sections = [
+        (
+            "🛡️ Команды бота\n\n"
+            "Справка для Создателя и Главного админа (ур.3). "
+            "Ниже перечислены пользовательские, модераторские и служебные slash-команды, "
+            "которые зарегистрированы в боте."
+        ),
+        group(
+            "— Пользовательские и игровые:",
+            [
+                ("start", "открыть главное меню."),
+                ("help", "краткая справка."),
+                ("fullhelp", "полная справка по механикам и админ-инструментам."),
+                ("leaderboard", "таблица лидеров по энергетикам."),
+                ("moneyleaderboard", "таблица лидеров по септимам."),
+                ("find", "быстрый поиск энергетика, работает и в группах."),
+                ("myboosts", "история автопоиск-бустов игрока."),
+                ("myreceipts", "чеки покупок игрока."),
+                ("promo", "ввод промокода."),
+                ("yt, ytmp3, ytmusic", "скачать MP3 из YouTube / YouTube Music в личке."),
+                ("swagashop", "открыть Свага-магазин."),
+                ("swagainv", "открыть Свага-инвентарь."),
+            ],
+        ),
+        group(
+            "— Группы и подарки:",
+            [
+                ("gift", "подарить предмет игроку из группы."),
+                ("giftstats", "статистика подарков пользователя."),
+                ("groupsettings", "настройки группы, доступны создателю группы."),
+                ("register", "зарегистрировать группу/чат в базе."),
+            ],
+        ),
+        group(
+            "— Заявки, модерация и справочники:",
+            [
+                ("add", "создать заявку на добавление энергетика."),
+                ("addp", "добавить плантационный энергетик, только админы."),
+                ("requests", "просмотр заявок на модерацию."),
+                ("editdrink", "создать заявку на редактирование энергетика."),
+                ("delrequest", "создать заявку на удаление энергетика."),
+                ("id", "список ID обычных энергетиков, только админы в личке."),
+                ("pid", "список P-ID плантационных энергетиков, только админы в личке."),
+                ("check", "посмотреть энергетик по ID, только админы."),
+            ],
+        ),
+        group(
+            "— Управление админами и экономикой:",
+            [
+                ("admin", "управление администраторами: list/add/remove/level."),
+                ("admin2", "эта расширенная справка."),
+                ("addcoins", "начислить септимы пользователю, только Создатель."),
+                ("delmoney", "списать септимы у пользователя, только Создатель."),
+                ("addvip", "добавить VIP пользователю или всем."),
+                ("addautosearch", "выдать автопоиск-буст пользователю или всем."),
+                ("listboosts", "список активных автопоиск-бустов."),
+                ("removeboost", "убрать автопоиск-буст у пользователя."),
+                ("booststats", "статистика автопоиск-бустов."),
+                ("boosthistory", "история автопоиск-бустов пользователя."),
+            ],
+        ),
+        group(
+            "— Склад, чеки и бонусы:",
+            [
+                ("stock", "показать остаток склада по виду бонуса."),
+                ("stockadd", "изменить склад бонуса на delta."),
+                ("stockset", "установить склад бонуса."),
+                ("tgstock", "показать остаток TG Premium."),
+                ("tgadd", "изменить склад TG Premium на delta."),
+                ("tgset", "установить склад TG Premium."),
+                ("receipt", "показать детали чека покупки."),
+                ("verifyreceipt", "отметить чек как проверенный."),
+            ],
+        ),
+        group(
+            "— Эксклюзивы и редкости:",
+            [
+                ("addexdrink", "создать/обновить эксклюзивный энергетик с фиксированным ID."),
+                ("giveexdrink", "выдать эксклюзивный энергетик пользователю."),
+                ("setrareemoji", "задать эмодзи для редкости."),
+                ("listrareemoji", "показать кастомные эмодзи редкостей."),
+            ],
+        ),
+        group(
+            "— Свага-администрирование:",
+            [
+                ("addswagatrack", "диалог добавления Свага-трека."),
+                ("giveswagacards", "выдать Свага-карточки пользователю."),
+                ("swagaid, swagalist, swagatracks", "список Свага-треков."),
+                ("swagaedit, editswaga, editswagatrack", "редактировать Свага-трек."),
+                ("swagadel, delswaga, delswagatrack", "удалить Свага-трек."),
+            ],
+        ),
+        group(
+            "— Тестовые команды Создателя:",
+            [
+                ("incadd", "создать обычную заявку на добавление без админ-пометок."),
+                ("inceditdrink", "создать обычную заявку на редактирование."),
+                ("incdelrequest", "создать обычную заявку на удаление."),
+            ],
+        ),
+        group(
+            "— Служебные команды диалогов:",
+            [
+                ("skip", "пропустить фото в диалогах добавления."),
+                ("cancel", "отменить активный диалог."),
+            ],
+        ),
+    ]
+
+    registered_set = set(registered_commands or [])
+    missing_descriptions = sorted(registered_set - described_commands)
+    if missing_descriptions:
+        sections.append(
+            "— Зарегистрированы, но без отдельного описания:\n"
+            + "\n".join(f"• /{cmd}" for cmd in missing_descriptions)
+        )
+
+    if registered_commands:
+        sections.append(
+            "— Фактический список CommandHandler:\n"
+            + ", ".join(f"/{cmd}" for cmd in registered_commands)
+        )
+    return sections
+
 async def receipt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/receipt <id> — показать детали чека покупки (только Создатель и ур.3)."""
     msg = update.message
@@ -122,45 +343,17 @@ async def verifyreceipt_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def admin2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/admin2 — показать команды, доступные только Создателю и Главному админу (ур.3)."""
+    """/admin2 — показать все зарегистрированные команды бота."""
     user = update.effective_user
     is_creator = (user.username in ADMIN_USERNAMES)
     lvl = db.get_admin_level(user.id)
     if not is_creator and lvl != 3:
         await update.message.reply_text("Нет прав: команда доступна только Создателю и ур.3.")
         return
-    text = (
-        "🛡️ Команды для привилегированных ролей\n\n"
-        "— Создатель и Главный админ (ур.3):\n"
-        "• /admin add <user_id> [username] [level 1-3] — добавить админа.\n"
-        "• /admin remove <user_id> — удалить админа.\n"
-        "• /admin level <user_id> <1-3> — изменить уровень админа.\n"
-        "• /stock <kind> — показать текущий остаток склада по виду бонуса.\n"
-        "• /stockadd <kind> <число> — изменить склад указанного бонуса на delta (может быть отрицательным).\n"
-        "• /stockset <kind> <число> — установить склад указанного бонуса в значение.\n"
-        "• /tgstock — показать текущий остаток TG Premium на складе.\n"
-        "• /tgadd <число> — изменить склад TG Premium на указанное значение (может быть отрицательным).\n"
-        "• /tgset <число> — установить склад TG Premium в указанное значение.\n"
-        "• /receipt <id> — показать детали чека покупки.\n"
-        "• /verifyreceipt <id> — отметить чек как проверенный.\n"
-        "• /addexdrink <id> | <name> | <description> | [special=yes/no] — создать/обновить энергетик с фиксированным ID (для эксклюзивов).\n"
-        "• /giveexdrink <user_id|@username> <drink_id> <rarity> [qty=1] — выдать пользователю эксклюзивный энергетик с нужной редкостью.\n"
-        "• /addvip <@username|all> <дни> — добавить VIP статус пользователю или всем.\n"
-        "• /addautosearch <@username|all> <count> <days> — добавить автопоиск буст (дополнительные поиски в день) пользователю или всем.\n"
-        "• /listboosts — показать всех пользователей с активными бустами автопоиска.\n"
-        "• /removeboost <@username|user_id> — убрать буст автопоиска у пользователя.\n"
-        "• /booststats — показать статистику по бустам автопоиска.\n"
-        "• /boosthistory <@username|user_id> — показать историю бустов пользователя.\n\n"
-        "— Только Создатель:\n"
-        "• /incadd Название | Описание | [да/нет] — создать обычную заявку на добавление без пометок (для проверки модерации).\n"
-        "• /inceditdrink <id> <name|description> <new_value> — создать обычную заявку на редактирование.\n"
-        "• /incdelrequest <drink_id> [причина] — создать обычную заявку на удаление.\n\n"
-        "• /addcoins <amount> <user_id|@username> — начислить монеты пользователю (только Создатель). Можно ответом: /addcoins <amount>\n"
-        "• /delmoney <amount> <user_id|@username> — списать монеты у пользователя (только Создатель). Можно ответом: /delmoney <amount>\n\n"
-        "— Прочее:\n"
-        "• /fullhelp — полная справка по боту.\n"
-    )
-    await update.message.reply_text(text)
+    registered_commands = _collect_registered_commands(getattr(context, 'application', None))
+    sections = _admin2_help_sections(registered_commands)
+    for part in _message_parts_from_sections(sections):
+        await update.message.reply_text(part)
 
 
 async def tgstock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

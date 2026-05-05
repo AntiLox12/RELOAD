@@ -14,7 +14,11 @@ import traceback
 from constants import (
     RARITIES,
     RECEIVER_PRICES,
+    RECEIVER_ITEM_PRICES,
     RECEIVER_COMMISSION,
+    RECEIVER_ROTATION_PERIOD_SEC,
+    RECEIVER_ROTATION_RARITY_BONUS_PERCENT,
+    RECEIVER_ROTATION_ITEM_BONUS_PERCENT,
     SHOP_PRICES,
     ADMIN_USERNAMES,
     AUTO_SEARCH_DAILY_LIMIT,
@@ -110,6 +114,7 @@ class Player(Base):
     casino_achievements = Column(String, default='')  # разблокированные достижения (через запятую)
     selyuk_fragments = Column(Integer, default=0)  # Фрагменты Селюка
     luck_coupon_charges = Column(Integer, default=0)  # Купон удачи: оставшиеся попытки повышенного шанса на двойной дроп
+    luck_coupon_auto_use = Column(Boolean, default=True)
     seed_coupon_count = Column(Integer, default=0)
     quick_access_target = Column(String, default='')
     favorite_drink_1 = Column(Integer, default=0)
@@ -6676,6 +6681,8 @@ def ensure_schema():
 
         if 'luck_coupon_charges' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN luck_coupon_charges INTEGER DEFAULT 0")
+        if 'luck_coupon_auto_use' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN luck_coupon_auto_use INTEGER DEFAULT 1")
         if 'seed_coupon_count' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN seed_coupon_count INTEGER DEFAULT 0")
         if 'quick_access_target' not in cols:
@@ -7163,8 +7170,9 @@ def get_access_profile(user_id: int, username: str | None = None, player: Player
         'acts_like_vip': tier in ('vip', 'vip_plus', 'admin', 'admin_plus'),
         'acts_like_vip_plus': tier in ('vip_plus', 'admin', 'admin_plus'),
         'quick_access_eligible': tier in ('vip', 'vip_plus', 'admin', 'admin_plus'),
-        'guaranteed_search_count': 2 if tier in ('admin', 'admin_plus') else 0,
-        'fixed_search_reward': 400 if tier == 'admin_plus' else (200 if tier == 'admin' else 0),
+        'guaranteed_search_count': 0,
+        'fixed_search_reward': 200 if tier == 'admin_plus' else (100 if tier == 'admin' else 0),
+        'double_drop_bonus_chance': 0.25 if tier in ('admin', 'admin_plus') else 0.0,
     }
 
     if tier == 'admin_plus':
@@ -8382,6 +8390,74 @@ def decrement_inventory_item(item_id: int) -> bool:
     finally:
         db.close()
 
+
+def get_receiver_rotation_offer(ts: int | None = None) -> dict:
+    """Возвращает дневной бонус Приёмника без хранения состояния в БД."""
+    try:
+        period = max(1, int(RECEIVER_ROTATION_PERIOD_SEC or 86400))
+    except Exception:
+        period = 86400
+    now_ts = int(ts or time.time())
+    try:
+        local_now = time.localtime(now_ts)
+        day_start_ts = int(time.mktime((
+            local_now.tm_year,
+            local_now.tm_mon,
+            local_now.tm_mday,
+            0,
+            0,
+            0,
+            local_now.tm_wday,
+            local_now.tm_yday,
+            local_now.tm_isdst,
+        )))
+    except Exception:
+        day_start_ts = now_ts - (now_ts % period)
+    day_index = max(0, day_start_ts // period)
+    rarity_options = [str(k) for k, v in RECEIVER_PRICES.items() if int(v or 0) > 0]
+    item_options = [str(k) for k, v in RECEIVER_ITEM_PRICES.items() if int(v or 0) > 0]
+
+    rarity = None
+    if rarity_options:
+        rarity = rarity_options[random.Random(day_index + 731).randrange(len(rarity_options))]
+
+    item_key = None
+    if item_options and day_index % 3 == 0:
+        item_key = item_options[random.Random(day_index + 1741).randrange(len(item_options))]
+
+    return {
+        "day_index": int(day_index),
+        "until_ts": int(day_start_ts + period),
+        "rarity": rarity,
+        "rarity_bonus_percent": int(RECEIVER_ROTATION_RARITY_BONUS_PERCENT or 0) if rarity else 0,
+        "item_key": item_key,
+        "item_bonus_percent": int(RECEIVER_ROTATION_ITEM_BONUS_PERCENT or 0) if item_key else 0,
+    }
+
+
+def _receiver_rotation_bonus_percent(kind: str, key: str, ts: int | None = None) -> int:
+    rotation = get_receiver_rotation_offer(ts)
+    if kind == 'rarity' and key and key == rotation.get('rarity'):
+        return max(0, int(rotation.get('rarity_bonus_percent', 0) or 0))
+    if kind == 'item' and key and key == rotation.get('item_key'):
+        return max(0, int(rotation.get('item_bonus_percent', 0) or 0))
+    return 0
+
+
+def _apply_percent_bonus(value: int, bonus_percent: int) -> int:
+    base = max(0, int(value or 0))
+    bonus = max(0, int(bonus_percent or 0))
+    if base <= 0 or bonus <= 0:
+        return base
+    return int(base * (100 + bonus) // 100)
+
+
+def get_receiver_item_unit_payout(item_key: str) -> int:
+    key = str(item_key or '').strip()
+    unit_payout = int(RECEIVER_ITEM_PRICES.get(key, 0) or 0)
+    return _apply_percent_bonus(unit_payout, _receiver_rotation_bonus_percent('item', key))
+
+
 def get_receiver_unit_payout(rarity: str) -> int:
     """Возвращает выплату за 1 шт. указанной редкости с учётом комиссии (int(base * (1 - commission)))."""
     try:
@@ -8421,6 +8497,7 @@ def get_receiver_unit_payout_with_rating(rarity: str, rating: int) -> int:
     if base <= 0:
         return 0
     payout = int(base * get_rating_bonus_multiplier(rating))
+    payout = _apply_percent_bonus(payout, _receiver_rotation_bonus_percent('rarity', str(rarity)))
     return max(0, payout)
 
 def get_receiver_unit_payout_for_user(user_id: int, rarity: str) -> int:
@@ -8429,6 +8506,63 @@ def get_receiver_unit_payout_for_user(user_id: int, rarity: str) -> int:
         player = dbs.query(Player).filter(Player.user_id == user_id).first()
         rating = int(getattr(player, 'rating', 0) or 0) if player else 0
         return get_receiver_unit_payout_with_rating(rarity, rating)
+    finally:
+        dbs.close()
+
+
+def sell_receiver_player_item(user_id: int, item_key: str, quantity: int) -> dict:
+    """Продажа не-инвентарных предметов игрока через Приёмник."""
+    dbs = SessionLocal()
+    try:
+        key = str(item_key or '').strip()
+        unit_payout = get_receiver_item_unit_payout(key)
+        if unit_payout <= 0:
+            return {"ok": False, "reason": "unsupported_item"}
+
+        qty_req = int(quantity or 0)
+        if qty_req < 1:
+            return {"ok": False, "reason": "bad_quantity"}
+
+        player = (
+            dbs.query(Player)
+            .filter(Player.user_id == user_id)
+            .with_for_update(read=False)
+            .first()
+        )
+        if not player:
+            player = Player(user_id=user_id, username=None)
+            dbs.add(player)
+
+        if key == 'luck_coupon':
+            field_name = 'luck_coupon_charges'
+        else:
+            return {"ok": False, "reason": "unsupported_item"}
+
+        qty_available = int(getattr(player, field_name, 0) or 0)
+        if qty_available <= 0:
+            return {"ok": False, "reason": "no_items"}
+
+        qty_to_sell = min(qty_req, qty_available)
+        total_payout = int(unit_payout) * int(qty_to_sell)
+        setattr(player, field_name, qty_available - qty_to_sell)
+        player.coins = int(player.coins or 0) + int(total_payout)
+
+        dbs.commit()
+        return {
+            "ok": True,
+            "item_key": key,
+            "unit_payout": int(unit_payout),
+            "quantity_sold": int(qty_to_sell),
+            "total_payout": int(total_payout),
+            "coins_after": int(player.coins),
+            "item_left_qty": int(getattr(player, field_name, 0) or 0),
+        }
+    except Exception:
+        try:
+            dbs.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "exception"}
     finally:
         dbs.close()
 

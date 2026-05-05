@@ -340,8 +340,7 @@ def _format_search_result_caption(
     used_luck_coupon: bool,
     luck_charges_left: int,
 ) -> str:
-    tier = str(access.get('tier') or 'ordinary')
-    guaranteed = tier in ('admin', 'admin_plus')
+    double_drop_bonus = float(access.get('double_drop_bonus_chance', 0) or 0)
     status_line = _status_text_from_access(access, lang)
     header = (
         "🎉 <b>Поиск завершён</b>"
@@ -397,16 +396,19 @@ def _format_search_result_caption(
             extras.append(f"{access.get('emoji', '🛡️')} {access.get('label_en', 'Admin')} bonus: fixed +{fixed_reward} septims")
     elif access.get('acts_like_vip'):
         extras.append("👑 VIP бонус: x2 к награде за поиск" if lang != 'en' else "👑 VIP bonus: x2 search coins")
-    if guaranteed:
-        extras.append("🛡 Гарант админа: всегда 2 энергетика" if lang != 'en' else "🛡 Admin guarantee: always 2 drinks")
+    if double_drop_bonus > 0:
+        bonus_percent = int(double_drop_bonus * 100)
+        extras.append(
+            f"🛡 Админ-бонус: +{bonus_percent}% к шансу двойной находки"
+            if lang != 'en'
+            else f"🛡 Admin bonus: +{bonus_percent}% double-drop chance"
+        )
     if used_luck_coupon:
         extras.append(
             f"🎲 Купон удачи израсходован, осталось: {luck_charges_left}"
             if lang != 'en'
             else f"🎲 Luck coupon used, charges left: {luck_charges_left}"
         )
-    elif guaranteed and int(access.get('guaranteed_search_count', 0) or 0) >= 2:
-        extras.append("🎲 Купон удачи не тратился: двойной дроп уже гарантирован" if lang != 'en' else "🎲 Luck coupon was not consumed: double drop is already guaranteed")
     if swaga_cards_found:
         swaga_counts: dict[str, int] = {}
         for rarity_name in swaga_cards_found:
@@ -706,6 +708,25 @@ def create_progress_bar(percent: float, length: int = 10, filled: str = '█', e
     empty_length = length - filled_length
     
     return filled * filled_length + empty * empty_length
+
+
+def _next_progress_target(current: int, targets: list[int]) -> int | None:
+    value = max(0, int(current or 0))
+    for target in sorted({max(1, int(t or 0)) for t in targets}):
+        if value < target:
+            return int(target)
+    return None
+
+
+def _achievement_progress_line(label: str, current: int, target: int | None, lang: str = 'ru') -> str:
+    value = max(0, int(current or 0))
+    if not target:
+        done = "готово" if lang == 'ru' else "done"
+        return f"• ✅ {label}: <b>{value}</b> ({done})"
+    target_value = max(1, int(target or 1))
+    percent = min(100.0, (value / target_value) * 100.0)
+    progress_bar = create_progress_bar(percent, length=8)
+    return f"• {label}: {progress_bar} <b>{min(value, target_value)}/{target_value}</b>"
 
 # --- Константы ---
 # см. constants.py
@@ -6074,15 +6095,15 @@ async def _perform_energy_search(
         favorite_drink_ids = set()
 
     luck_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+    luck_coupon_auto_use = bool(getattr(player, 'luck_coupon_auto_use', True))
     used_luck_coupon = False
-    if str(access.get('tier') or '') in ('admin', 'admin_plus'):
-        found_count = 2
-    else:
-        double_drop_chance = 0.50 if luck_charges > 0 else 0.10
-        found_count = 2 if (random.random() < double_drop_chance) else 1
-        if found_count == 2 and luck_charges > 0:
-            used_luck_coupon = True
-            luck_charges = max(0, luck_charges - 1)
+    base_double_drop_chance = 0.50 if (luck_charges > 0 and luck_coupon_auto_use) else 0.10
+    double_drop_bonus = float(access.get('double_drop_bonus_chance', 0) or 0)
+    double_drop_chance = min(1.0, max(0.0, base_double_drop_chance + double_drop_bonus))
+    found_count = 2 if (random.random() < double_drop_chance) else 1
+    if found_count == 2 and luck_charges > 0 and luck_coupon_auto_use:
+        used_luck_coupon = True
+        luck_charges = max(0, luck_charges - 1)
 
     drops: list[dict] = []
     rarities_found: list[str] = []
@@ -7138,8 +7159,9 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats_text += f"• Уникальных видов: <b>{unique_drinks}</b> 🔑\n"
     
     # Прогресс коллекции (процент от всех напитков)
+    total_points = 0
     try:
-        total_points = db.get_total_collection_points()
+        total_points = int(db.get_total_collection_points() or 0)
         if total_points > 0:
             # unique_drinks - это количество записей в inventory_items, 
             # что соответствует уникальным парам (напиток, редкость).
@@ -7284,6 +7306,32 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats_text += f"<b>🏅 Достижения:</b>\n"
         for achievement in achievements:
             stats_text += f"• {achievement}\n"
+        stats_text += "\n"
+
+    # === ПРОГРЕСС ДОСТИЖЕНИЙ ===
+    majestic_count = int(rarity_counter.get('Majestic', 0) or 0)
+    casino_wins = int(player.casino_wins or 0)
+    daily_streak = int(bonus_status.get('streak', 0) or 0) if bonus_status.get('ok') else int(getattr(player, 'daily_bonus_streak', 0) or 0)
+    next_daily_target = int(bonus_status.get('next_milestone_target', 0) or 0) if bonus_status.get('ok') else 0
+    collection_targets = [target for target in [25, 50, 100] if total_points <= 0 or target <= total_points]
+    if total_points > 0 and total_points not in collection_targets:
+        collection_targets.append(total_points)
+    daily_targets = [3, 7, 14, 30]
+    if next_daily_target > 0:
+        daily_targets.append(next_daily_target)
+
+    progress_lines = [
+        _achievement_progress_line("Коллекция", unique_drinks, _next_progress_target(unique_drinks, collection_targets), lang),
+        _achievement_progress_line("Рейтинг", rating_value, _next_progress_target(rating_value, [50, 100, 250, 500, 1000]), lang),
+        _achievement_progress_line("Запас энергетиков", total_drinks, _next_progress_target(total_drinks, [50, 100, 250, 500, 1000]), lang),
+        _achievement_progress_line("Majestic-находки", majestic_count, _next_progress_target(majestic_count, [1, 5, 10]), lang),
+        _achievement_progress_line("Баланс", int(player.coins or 0), _next_progress_target(int(player.coins or 0), [100000, 1000000]), lang),
+        _achievement_progress_line("Победы казино", casino_wins, _next_progress_target(casino_wins, [50, 100]), lang),
+        _achievement_progress_line("Серия daily", daily_streak, _next_progress_target(daily_streak, daily_targets), lang),
+    ]
+    stats_text += "<b>📈 Прогресс достижений:</b>\n"
+    for line in progress_lines:
+        stats_text += f"{line}\n"
     
     stats_text += f"\n━━━━━━━━━━━━━━━━━━━"
 
@@ -8354,11 +8402,17 @@ async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE
         text_lines.append("ℹ️ Активных бустов нет" if lang == 'ru' else "ℹ️ No active boosts")
 
     luck_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+    luck_coupon_auto_use = bool(getattr(player, 'luck_coupon_auto_use', True))
+    if lang == 'ru':
+        luck_auto_text = "включена ✅" if luck_coupon_auto_use else "выключена ❌"
+    else:
+        luck_auto_text = "enabled ✅" if luck_coupon_auto_use else "disabled ❌"
     seed_coupons = int(getattr(player, 'seed_coupon_count', 0) or 0)
     text_lines.extend([
         "",
         "<b>Купоны:</b>" if lang == 'ru' else "<b>Coupons:</b>",
         (f"🎲 Купон удачи: <b>{luck_charges}</b> зарядов" if lang == 'ru' else f"🎲 Luck coupon: <b>{luck_charges}</b> charges"),
+        (f"⚙️ Автотрата купона: <b>{luck_auto_text}</b>" if lang == 'ru' else f"⚙️ Auto-use luck coupon: <b>{luck_auto_text}</b>"),
         (f"🎟 Купон семян: <b>{seed_coupons}</b>" if lang == 'ru' else f"🎟 Seed coupon: <b>{seed_coupons}</b>"),
     ])
     if seed_coupons > 0:
@@ -8384,6 +8438,11 @@ async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = "\n".join(text_lines)
     back_label = "🔙 Назад" if lang == 'ru' else "🔙 Back"
     keyboard = []
+    if lang == 'ru':
+        toggle_label = "🎲 Выключить автотрату купона" if luck_coupon_auto_use else "🎲 Включить автотрату купона"
+    else:
+        toggle_label = "🎲 Disable luck auto-use" if luck_coupon_auto_use else "🎲 Enable luck auto-use"
+    keyboard.append([InlineKeyboardButton(toggle_label, callback_data='luck_coupon_auto_toggle')])
     if seed_coupons > 0:
         keyboard.append([InlineKeyboardButton("🎟 Использовать купон семян" if lang == 'ru' else "🎟 Use seed coupon", callback_data='seed_coupon_shop_open:boosts')])
     keyboard.append([InlineKeyboardButton(back_label, callback_data='my_profile')])
@@ -8400,6 +8459,15 @@ async def show_profile_boosts(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
         except BadRequest:
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+
+async def toggle_luck_coupon_auto_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    current = bool(getattr(player, 'luck_coupon_auto_use', True))
+    db.update_player(user.id, luck_coupon_auto_use=(not current))
+    await show_profile_boosts(update, context)
 
 
 async def show_inventory_by_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9311,6 +9379,79 @@ async def handle_sell_all_inventory(update: Update, context: ContextTypes.DEFAUL
             f"Пропущено (нет цены): {skipped_items}\n"
             f"Заработано: +{total_earned} монет\n"
             f"Баланс: {coins_after} монет"
+        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text=success_text)
+        except Exception:
+            pass
+
+
+def _receiver_item_display_name(item_key: str, lang: str = 'ru') -> str:
+    if item_key == 'luck_coupon':
+        return "купон удачи" if lang == 'ru' else "luck coupon"
+    return item_key
+
+
+async def handle_receiver_item_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, item_key: str, quantity_token: str):
+    """Обрабатывает продажу предметов игрока, которые не лежат в обычном инвентаре."""
+    query = update.callback_query
+    user = query.from_user
+    user_id = user.id
+
+    try:
+        quantity = 10**9 if quantity_token == 'all' else int(quantity_token)
+    except Exception:
+        await query.answer("Ошибка количества", show_alert=True)
+        return
+
+    lock = _get_lock(f"receiver_item_sell:{user_id}:{item_key}")
+    async with lock:
+        try:
+            result = db.sell_receiver_player_item(user_id, item_key, quantity)
+        except Exception:
+            await query.answer("Ошибка при продаже. Попробуйте позже.", show_alert=True)
+            return
+
+        if not result or not result.get('ok'):
+            reason = (result or {}).get('reason')
+            reason_map = {
+                'unsupported_item': 'Этот предмет пока не принимается',
+                'bad_quantity': 'Некорректное количество',
+                'no_items': 'У вас нет такого предмета',
+                'exception': 'Произошла ошибка. Повторите попытку',
+            }
+            await query.answer(reason_map.get(reason, 'Не удалось выполнить продажу.'), show_alert=True)
+            return
+
+        sold = int(result.get('quantity_sold', 0) or 0)
+        unit = int(result.get('unit_payout', 0) or 0)
+        total = int(result.get('total_payout', 0) or 0)
+        coins_after = int(result.get('coins_after', 0) or 0)
+        left = int(result.get('item_left_qty', 0) or 0)
+        player = db.get_or_create_player(user_id, user.username or user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+        item_name = _receiver_item_display_name(item_key, lang)
+
+        try:
+            db.log_action(
+                user_id=user_id,
+                username=user.username or user.first_name,
+                action_type='transaction',
+                action_details=f'Приёмник: продан предмет {item_key} x{sold} по {unit} монет за шт.',
+                amount=total,
+                success=True
+            )
+        except Exception:
+            pass
+
+        await show_market_receiver(update, context)
+
+        success_text = (
+            f"♻️ Продажа успешна: {item_name} x{sold} × {unit} = +{total} септимов.\n"
+            f"Баланс: {coins_after}. Осталось: {left}."
+            if lang == 'ru'
+            else f"♻️ Sale complete: {item_name} x{sold} × {unit} = +{total} septims.\n"
+                 f"Balance: {coins_after}. Left: {left}."
         )
         try:
             await context.bot.send_message(chat_id=user_id, text=success_text)
@@ -13695,7 +13836,7 @@ async def show_rostov_elite_items(update: Update, context: ContextTypes.DEFAULT_
         f"🎁 Пропуск кулдауна бонуса — <b>{ROSTOV_ELITE_ITEM_PRICES['bonus_skip']:,}</b> 💎",
         f"🚀 Автопоиск-буст +10 на 24ч — <b>{ROSTOV_ELITE_ITEM_PRICES['auto_boost_10_24h']:,}</b> 💎",
         f"🧩 Фрагменты Селюка +3 — <b>{ROSTOV_ELITE_ITEM_PRICES['fragments_pack_3']:,}</b> 💎",
-        f"🎲 Купон удачи (+3 заряда, 50% на 2 дропа) — <b>{ROSTOV_ELITE_ITEM_PRICES['luck_coupon_3']:,}</b> 💎",
+        f"🎲 Купон удачи (+3 заряда, 50% на 2 дропа; админам +25%) — <b>{ROSTOV_ELITE_ITEM_PRICES['luck_coupon_3']:,}</b> 💎",
     ]
 
     text = "\n".join(text_lines)
@@ -15144,6 +15285,12 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
     # Собираем прайс-лист (выплата за 1 шт. с учётом комиссии и рейтинга)
     rating_value = int(getattr(player, 'rating', 0) or 0)
     rating_bonus = db.get_rating_bonus_percent(rating_value)
+    receiver_rotation = db.get_receiver_rotation_offer()
+    featured_rarity = str(receiver_rotation.get('rarity') or '')
+    featured_rarity_bonus = int(receiver_rotation.get('rarity_bonus_percent', 0) or 0)
+    featured_item_key = str(receiver_rotation.get('item_key') or '')
+    featured_item_bonus = int(receiver_rotation.get('item_bonus_percent', 0) or 0)
+    rotation_until = safe_format_timestamp(int(receiver_rotation.get('until_ts', 0) or 0), '%d.%m %H:%M')
     lines = [
         "<b>♻️ Приёмник</b>",
         "Сдавайте лишние энергетики и получайте монеты.",
@@ -15162,6 +15309,26 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
             "50 → +5%, 100 → +7.5%, 150 → +10%, 200 → +12.5%, 250 → +13%",
             "Then increases smoothly to +25% at rating 1000.",
         ])
+    if featured_rarity and featured_rarity_bonus > 0:
+        rarity_emoji = COLOR_EMOJIS.get(featured_rarity, '⚫')
+        item_line = ""
+        if featured_item_key and featured_item_bonus > 0:
+            item_name = _receiver_item_display_name(featured_item_key, lang)
+            item_line = (
+                f"\n• 🎲 {item_name}: +{featured_item_bonus}%"
+                if lang == 'ru'
+                else f"\n• 🎲 {item_name}: +{featured_item_bonus}%"
+            )
+        lines.extend([
+            "",
+            "<b>🔥 Ротация дня</b>" if lang == 'ru' else "<b>🔥 Daily receiver rotation</b>",
+            (
+                f"• {rarity_emoji} {featured_rarity}: +{featured_rarity_bonus}% к выплате{item_line}"
+                if lang == 'ru'
+                else f"• {rarity_emoji} {featured_rarity}: +{featured_rarity_bonus}% payout{item_line}"
+            ),
+            f"До сброса: {rotation_until}" if lang == 'ru' else f"Resets: {rotation_until}",
+        ])
     lines.extend([
         "",
         "<b>Прайс-лист (за 1 шт.)</b>",
@@ -15170,16 +15337,50 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
         if r in RECEIVER_PRICES:
             payout = int(db.get_receiver_unit_payout_with_rating(r, rating_value) or 0)
             emoji = COLOR_EMOJIS.get(r, '⚫')
-            lines.append(f"{emoji} {r}: {payout} монет")
+            bonus_suffix = f" 🔥 +{featured_rarity_bonus}%" if r == featured_rarity and featured_rarity_bonus > 0 else ""
+            lines.append(f"{emoji} {r}: {payout} монет{bonus_suffix}")
+    luck_charges = int(getattr(player, 'luck_coupon_charges', 0) or 0)
+    luck_coupon_payout = int(db.get_receiver_item_unit_payout('luck_coupon') or 0)
+    if luck_coupon_payout > 0:
+        item_bonus_suffix = f" 🔥 +{featured_item_bonus}%" if featured_item_key == 'luck_coupon' and featured_item_bonus > 0 else ""
+        lines.extend([
+            "",
+            "<b>Предметы</b>" if lang == 'ru' else "<b>Items</b>",
+            (
+                f"🎲 Купон удачи: {luck_coupon_payout} септимов за заряд{item_bonus_suffix} (у тебя: {luck_charges})"
+                if lang == 'ru'
+                else f"🎲 Luck coupon: {luck_coupon_payout} septims per charge{item_bonus_suffix} (you have: {luck_charges})"
+            ),
+        ])
     text = "\n".join(lines)
 
     keyboard = [
         [InlineKeyboardButton("📦 Открыть инвентарь", callback_data='inventory')],
         [InlineKeyboardButton("📊 По количеству", callback_data='receiver_by_quantity')],
         [InlineKeyboardButton("🗑️ Продать все", callback_data='sell_all_confirm_1')],
+    ]
+    if luck_charges > 0 and luck_coupon_payout > 0:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🎲 Продать купон удачи (+{luck_coupon_payout})" if lang == 'ru' else f"🎲 Sell luck coupon (+{luck_coupon_payout})",
+                callback_data='receiver_item_sell:luck_coupon:1',
+            )
+        ])
+        if luck_charges > 1:
+            keyboard.append([
+                InlineKeyboardButton(
+                    (
+                        f"🎲 Продать все купоны удачи (+{luck_coupon_payout * luck_charges})"
+                        if lang == 'ru'
+                        else f"🎲 Sell all luck coupons (+{luck_coupon_payout * luck_charges})"
+                    ),
+                    callback_data='receiver_item_sell:luck_coupon:all',
+                )
+            ])
+    keyboard.extend([
         [InlineKeyboardButton("🔙 Назад", callback_data='city_hightown')],
         [InlineKeyboardButton("🔙 В меню", callback_data='menu')],
-    ]
+    ])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     message = query.message
@@ -16020,7 +16221,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'claim_bonus', 'daily_bonus', 'receiver_', 'fav_', 'favtrack_',
         'friends_', 'casino_game_', 'casino_custom', 'casino_achievements',
         'casino_rules', 'city_', 'toggle_', 'autosell_', 'silk_',
-        'language_', 'settings_', 'snooze_remind',
+        'language_', 'settings_', 'snooze_remind', 'luck_coupon_',
     )
     if (query.message
         and query.message.chat
@@ -16663,6 +16864,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await friends_open_menu(update, context, uid)
     elif data == 'profile_boosts':
         await show_profile_boosts(update, context)
+    elif data == 'luck_coupon_auto_toggle':
+        await toggle_luck_coupon_auto_use(update, context)
     elif data == 'stats':
         await show_stats(update, context)
     elif data == 'extra_bonuses':
@@ -16945,6 +17148,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_market_receiver(update, context)
     elif data == 'receiver_by_quantity':
         await show_inventory_by_quantity(update, context)
+    elif data.startswith('receiver_item_sell:'):
+        try:
+            _, item_key, quantity_token = data.split(':', 2)
+            await handle_receiver_item_sell(update, context, item_key, quantity_token)
+        except Exception:
+            await update.callback_query.answer('Ошибка', show_alert=True)
     elif data == 'market_plantation':
         await show_market_plantation(update, context)
     elif data.startswith('shop_p_'):
