@@ -121,6 +121,8 @@ class Player(Base):
     favorite_drink_2 = Column(Integer, default=0)
     favorite_drink_3 = Column(Integer, default=0)
     favorite_swaga_track_id = Column(Integer, default=0)
+    power_shards = Column(Integer, default=0)
+    last_sematori_game = Column(Integer, default=0)
     inventory = relationship("InventoryItem", back_populates="owner", cascade="all, delete-orphan")
 
 
@@ -6731,6 +6733,10 @@ def ensure_schema():
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_seed_priority TEXT DEFAULT '[]'")
         if 'farmer_session_stats' not in cols:
             conn.exec_driver_sql("ALTER TABLE players ADD COLUMN farmer_session_stats TEXT DEFAULT '{}'")
+        if 'power_shards' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN power_shards INTEGER DEFAULT 0")
+        if 'last_sematori_game' not in cols:
+            conn.exec_driver_sql("ALTER TABLE players ADD COLUMN last_sematori_game INTEGER DEFAULT 0")
 
         # Обновления для energy_drinks (плантационные энергетики)
         res_drinks = conn.exec_driver_sql("PRAGMA table_info(energy_drinks)")

@@ -130,11 +130,11 @@ from constants import (
     PLANTATION_NEG_EVENT_CHANCE,
     PLANTATION_NEG_EVENT_MAX_ACTIVE,
     PLANTATION_NEG_EVENT_DURATION_SEC,
+    SEARCH_EVENTS,
+    SEARCH_EVENT_ROTATION_PERIOD_SEC,
 )
 import silk_ui
 import ordinary_plantation
-import swagashop
-import swaga_admin
 from youtube_downloader import (
     FfmpegNotFoundError,
     UnsupportedYoutubeUrlError,
@@ -155,8 +155,14 @@ from admin_permissions import (
 from reload_bot.modules import admin_settings as admin_settings_module
 from reload_bot.modules import admin_logs as admin_logs_module
 from reload_bot.modules import admin_moderation as admin_moderation_module
+from reload_bot.modules import casino as casino_module
 from reload_bot.modules import donate as donate_module
+from reload_bot.modules import inventory as inventory_module
+from reload_bot.modules import premium_shop as premium_shop_module
 from reload_bot.modules import promo as promo_module
+from reload_bot.modules import receiver as receiver_module
+from reload_bot.modules import swaga as swaga_module
+from reload_bot.modules import user_settings as user_settings_module
 from reload_bot.runtime import BotRuntime
 from utils import (
     _parse_duration_to_seconds,
@@ -294,6 +300,122 @@ def _search_result_reply_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]])
 
 
+def _active_search_event(now_ts: float | None = None) -> dict | None:
+    events = [dict(e) for e in (SEARCH_EVENTS or []) if isinstance(e, dict)]
+    if not events:
+        return None
+    
+    # Проверяем наличие переопределения (override) в базе данных
+    try:
+        override_key = db.get_setting_str('search_event_override')
+        if override_key:
+            now = int(now_ts or time.time())
+            override_until = db.get_setting_int('search_event_override_until', 0)
+            if override_until > 0 and now >= override_until:
+                # Срок действия переопределения истек, удаляем настройки
+                db.set_setting_str('search_event_override', '')
+                db.set_setting_int('search_event_override_until', 0)
+            else:
+                for e in events:
+                    if e.get('key') == override_key:
+                        event = dict(e)
+                        event['until_ts'] = override_until
+                        event['is_override'] = True
+                        return event
+    except Exception as e:
+        logger.error(f"Error checking search event override: {e}")
+
+    try:
+        period = int(SEARCH_EVENT_ROTATION_PERIOD_SEC or 0)
+    except Exception:
+        period = 0
+    period = max(3600, period)
+    now = int(now_ts or time.time())
+    local_now = time.localtime(now)
+    day_start = int(time.mktime((local_now.tm_year, local_now.tm_mon, local_now.tm_mday, 0, 0, 0, 0, 0, -1)))
+    elapsed = max(0, now - day_start)
+    slot = max(0, int(elapsed // period))
+    slots_per_day = max(1, (86400 + period - 1) // period)
+    day_seed = int(local_now.tm_year * 400 + local_now.tm_yday)
+    event = events[(day_seed * slots_per_day + slot) % len(events)]
+    event['until_ts'] = int(min(day_start + ((slot + 1) * period), day_start + 86400))
+    return event
+
+
+def _search_event_title(event: dict | None, lang: str) -> str:
+    if not event:
+        return ""
+    key = 'title_en' if lang == 'en' else 'title_ru'
+    return str(event.get(key) or event.get('title_ru') or event.get('key') or '').strip()
+
+
+def _search_event_description(event: dict | None, lang: str) -> str:
+    if not event:
+        return ""
+    key = 'desc_en' if lang == 'en' else 'desc_ru'
+    return str(event.get(key) or event.get('desc_ru') or '').strip()
+
+
+def _format_search_event_line(event: dict | None, lang: str, *, menu: bool = False) -> str:
+    if not event:
+        return ""
+    emoji = html.escape(str(event.get('emoji') or '🔭'))
+    title = html.escape(_search_event_title(event, lang))
+    desc = html.escape(_search_event_description(event, lang))
+    
+    until_ts = int(event.get('until_ts', 0) or 0)
+    if until_ts == 0:
+        until = "♾" if lang == 'en' else "бессрочно"
+    else:
+        now = time.time()
+        local_until = time.localtime(until_ts)
+        local_now = time.localtime(now)
+        if local_until.tm_yday != local_now.tm_yday or local_until.tm_year != local_now.tm_year:
+            until = safe_format_timestamp(until_ts, '%d.%m %H:%M') or ''
+        else:
+            until = safe_format_timestamp(until_ts, '%H:%M') or ''
+
+    if menu:
+        if lang == 'en':
+            return f"🔭 <b>Search event:</b> {emoji} <b>{title}</b>\n<i>{desc}</i>\n⏳ Until {until}"
+        return f"🔭 <b>Событие поиска:</b> {emoji} <b>{title}</b>\n<i>{desc}</i>\n⏳ До {until}"
+    if lang == 'en':
+        return f"{emoji} Search event: <b>{title}</b> — {desc} Until {until}"
+    return f"{emoji} Событие поиска: <b>{title}</b> — {desc} До {until}"
+
+
+def _apply_search_event_coin_bonus(coins: int, event: dict | None) -> int:
+    try:
+        base = int(coins or 0)
+        percent = int(float((event or {}).get('coin_bonus_percent', 0) or 0))
+    except Exception:
+        return int(coins or 0)
+    if base <= 0 or percent <= 0:
+        return base
+    return base + max(1, int(base * percent / 100))
+
+
+def _rarity_weights_with_search_event(weights: dict, event: dict | None) -> dict:
+    try:
+        bonus_percent = float((event or {}).get('rarity_weight_bonus_percent', 0) or 0)
+    except Exception:
+        bonus_percent = 0.0
+    out = {}
+    for k, v in (weights or {}).items():
+        try:
+            out[str(k)] = max(0.0, float(v))
+        except Exception:
+            out[str(k)] = 0.0
+    if bonus_percent > 0:
+        multiplier = 1.0 + (bonus_percent / 100.0)
+        for rarity_name in list(out.keys()):
+            if rarity_name != 'Basic':
+                out[rarity_name] = max(0.0, out[rarity_name] * multiplier)
+    if sum(v for v in out.values() if v > 0) <= 0:
+        out = {'Basic': 1.0}
+    return out
+
+
 def _format_search_status_message(result: dict, lang: str = 'ru') -> str:
     status = str((result or {}).get('status') or 'error')
     if status == 'cooldown':
@@ -306,6 +428,17 @@ def _format_search_status_message(result: dict, lang: str = 'ru') -> str:
         )
     if status == 'no_drinks':
         return "В базе данных пока нет энергетиков!" if lang != 'en' else "There are no energy drinks in the database yet!"
+    if status == 'nothing_found':
+        event = result.get('search_event')
+        event_line = _format_search_event_line(event, lang)
+        msg = (
+            "🔎 Ничего не удалось найти. Попробуй снова после кулдауна."
+            if lang != 'en'
+            else "🔎 Nothing was found. Try again after the cooldown."
+        )
+        if event_line:
+            msg += f"\n\n🔭 <i>{event_line}</i>"
+        return msg
     if status == 'disabled':
         return (
             "❌ Поиск сейчас недоступен. Попробуй позже."
@@ -1282,6 +1415,77 @@ def get_bot_runtime() -> BotRuntime:
             'handle_promo_wiz_max_uses': handle_promo_wiz_max_uses,
             'handle_promo_wiz_per_user': handle_promo_wiz_per_user,
             'handle_promo_wiz_expires': handle_promo_wiz_expires,
+            'show_city_casino': show_city_casino,
+            'show_casino_rules': show_casino_rules,
+            'show_casino_achievements_page': show_casino_achievements_page,
+            'show_casino_game': show_casino_game,
+            'show_bet_selection_screen': show_bet_selection_screen,
+            'play_casino_game': play_casino_game,
+            'show_blackjack_bet_screen': show_blackjack_bet_screen,
+            'start_blackjack_game': start_blackjack_game,
+            'handle_blackjack_hit': handle_blackjack_hit,
+            'handle_blackjack_stand': handle_blackjack_stand,
+            'handle_blackjack_double': handle_blackjack_double,
+            'handle_blackjack_surrender': handle_blackjack_surrender,
+            'show_mines_settings': show_mines_settings,
+            'show_mines_bet_screen': show_mines_bet_screen,
+            'start_mines_game': start_mines_game,
+            'handle_mines_click': handle_mines_click,
+            'handle_mines_cashout': handle_mines_cashout,
+            'handle_mines_forfeit': handle_mines_forfeit,
+            'show_crash_bet_screen': show_crash_bet_screen,
+            'start_crash_game': start_crash_game,
+            'handle_crash_cashout': handle_crash_cashout,
+            'show_bonus_tg_premium': show_bonus_tg_premium,
+            'buy_tg_premium': buy_tg_premium,
+            'show_bonus_steam_game': show_bonus_steam_game,
+            'buy_stars_500': buy_stars_500,
+            'buy_steam_game': buy_steam_game,
+            'show_vip_menu': show_vip_menu,
+            'show_vip_plus_menu': show_vip_plus_menu,
+            'show_vip_1d': show_vip_1d,
+            'show_vip_7d': show_vip_7d,
+            'show_vip_30d': show_vip_30d,
+            'show_vip_plus_1d': show_vip_plus_1d,
+            'show_vip_plus_7d': show_vip_plus_7d,
+            'show_vip_plus_30d': show_vip_plus_30d,
+            'buy_vip': buy_vip,
+            'confirm_vip_plus_purchase': confirm_vip_plus_purchase,
+            'buy_vip_plus': buy_vip_plus,
+            'show_stars_menu': show_stars_menu,
+            'show_stars_500': show_stars_500,
+            'show_market_receiver': show_market_receiver,
+            'show_inventory_by_quantity': show_inventory_by_quantity,
+            'handle_receiver_item_sell': handle_receiver_item_sell,
+            'my_receipts_handler': my_receipts_handler,
+            'receiver_sell_all_confirm_1': receiver_sell_all_confirm_1,
+            'receiver_sell_all_confirm_2': receiver_sell_all_confirm_2,
+            'handle_sell_all_inventory': handle_sell_all_inventory,
+            'handle_sell_action': handle_sell_action,
+            'handle_sell_all_but_one': handle_sell_all_but_one,
+            'handle_sell_absolutely_all_but_one': handle_sell_absolutely_all_but_one,
+            'view_receipt_handler': view_receipt_handler,
+            'view_inventory_item': view_inventory_item,
+            'show_settings': show_settings,
+            'settings_lang_menu': settings_lang_menu,
+            'show_settings_quick_access': show_settings_quick_access,
+            'set_quick_access_target': set_quick_access_target,
+            'toggle_reminder': toggle_reminder,
+            'toggle_auto_search': toggle_auto_search,
+            'show_autosell_menu': show_autosell_menu,
+            'toggle_autosell_rarity': toggle_autosell_rarity,
+            'reset_prompt': reset_prompt,
+            'set_language': set_language,
+            'reset_confirm': reset_confirm,
+            'toggle_group_notifications': toggle_group_notifications,
+            'toggle_group_auto_delete': toggle_group_auto_delete,
+            'find_energy': find_energy,
+            'claim_daily_bonus': claim_daily_bonus,
+            'show_daily_bonus_info': show_daily_bonus_info,
+            'show_inventory': show_inventory,
+            'start_inventory_search': start_inventory_search,
+            'inventory_search_cancel': inventory_search_cancel,
+            'show_inventory_search_results': show_inventory_search_results,
         })
     return BOT_RUNTIME
 
@@ -5179,6 +5383,7 @@ async def show_admin_events_menu(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton("✏️ Редактировать", callback_data='admin_event_edit')],
         [InlineKeyboardButton("❌ Завершить событие", callback_data='admin_event_end')],
         [InlineKeyboardButton("📊 Статистика", callback_data='admin_event_stats')],
+        [InlineKeyboardButton("🔭 События поиска", callback_data='admin_event_list')],
         [InlineKeyboardButton("🔙 Админ панель", callback_data='creator_panel')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -13766,29 +13971,377 @@ async def show_city_powerlines(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
+def generate_sematori_puzzle():
+    types = [
+        'ohm_u', 'ohm_i', 'ohm_r',
+        'power_p', 'power_u', 'power_i',
+        'charge_q', 'charge_i', 'charge_t',
+        'cap_c', 'cap_q', 'cap_u'
+    ]
+    ptype = random.choice(types)
+    
+    if ptype == 'ohm_u':
+        i = random.randint(2, 10)
+        r = random.randint(2, 15)
+        ans = i * r
+        text = f"Найдите напряжение U (В), если сила тока I = {i} А, а сопротивление R = {r} Ом."
+    elif ptype == 'ohm_i':
+        r = random.randint(2, 10)
+        i = random.randint(2, 12)
+        u = i * r
+        ans = i
+        text = f"Найдите силу тока I (А), если напряжение U = {u} В, а сопротивление R = {r} Ом."
+    elif ptype == 'ohm_r':
+        r = random.randint(2, 12)
+        i = random.randint(2, 10)
+        u = i * r
+        ans = r
+        text = f"Найдите сопротивление R (Ом), если напряжение U = {u} В, а сила тока I = {i} А."
+    elif ptype == 'power_p':
+        u = random.choice([12, 24, 110, 220])
+        i = random.randint(1, 5)
+        ans = u * i
+        text = f"Найдите мощность P (Вт) постоянного тока, если напряжение U = {u} В, а сила тока I = {i} А."
+    elif ptype == 'power_u':
+        i = random.randint(2, 10)
+        u = random.choice([12, 24, 36, 110, 220])
+        p = u * i
+        ans = u
+        text = f"Найдите напряжение U (В), если мощность P = {p} Вт, а сила тока I = {i} А."
+    elif ptype == 'power_i':
+        u = random.choice([12, 24, 110, 220])
+        i = random.randint(1, 10)
+        p = u * i
+        ans = i
+        text = f"Найдите силу тока I (А), если мощность P = {p} Вт, а напряжение U = {u} В."
+    elif ptype == 'charge_q':
+        i = random.randint(2, 10)
+        t = random.randint(5, 30)
+        ans = i * t
+        text = f"Найдите прошедший электрический заряд Q (Кл), если сила тока I = {i} А, а время t = {t} с."
+    elif ptype == 'charge_i':
+        t = random.randint(5, 20)
+        i = random.randint(2, 10)
+        q = i * t
+        ans = i
+        text = f"Найдите силу тока I (А), если через проводник прошел заряд Q = {q} Кл за время t = {t} с."
+    elif ptype == 'charge_t':
+        i = random.randint(2, 10)
+        t = random.randint(5, 30)
+        q = i * t
+        ans = t
+        text = f"Найдите время t (с), за которое через поперечное сечение проводника проходит заряд Q = {q} Кл при силе тока I = {i} А."
+    elif ptype == 'cap_c':
+        u = random.randint(2, 20)
+        c = random.randint(5, 50)
+        q = c * u
+        ans = c
+        text = f"Найдите емкость конденсатора C (мкФ), если его заряд Q = {q} мкКл, а напряжение на обкладках U = {u} В."
+    elif ptype == 'cap_q':
+        c = random.randint(5, 50)
+        u = random.randint(2, 12)
+        ans = c * u
+        text = f"Найдите заряд конденсатора Q (мкКл), если его емкость C = {c} мкФ, а напряжение U = {u} В."
+    else:
+        c = random.randint(5, 50)
+        u = random.randint(2, 12)
+        q = c * u
+        ans = u
+        text = f"Найдите напряжение U (В) на обкладках конденсатора емкостью C = {c} мкФ, если его заряд Q = {q} мкКл."
+
+    options = [ans]
+    offsets = [-3, -2, -1, 1, 2, 3, 5, 10, -5, -10]
+    random.shuffle(offsets)
+    for offset in offsets:
+        cand = ans + offset
+        if cand > 0 and cand not in options:
+            options.append(cand)
+        if len(options) == 4:
+            break
+    
+    while len(options) < 4:
+        cand = ans + random.randint(1, 20)
+        if cand not in options:
+            options.append(cand)
+            
+    random.shuffle(options)
+    return text, ans, options
+
+
 async def show_power_sematori(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    
+    is_vip_plus = db.is_vip_plus(user.id)
+    is_vip_status = db.is_vip(user.id)
+    
+    if is_vip_plus:
+        cooldown = 300
+        status_text = "✨ <b>VIP+ статус активен</b>"
+    elif is_vip_status:
+        cooldown = 420
+        status_text = "⭐ <b>VIP статус активен</b>"
+    else:
+        cooldown = 600
+        status_text = "👤 <b>Обычный статус</b>"
+        
+    last_game = int(getattr(player, 'last_sematori_game', 0) or 0)
+    now = int(time.time())
+    elapsed = now - last_game
+    
+    if is_vip_plus:
+        if elapsed >= 3600:
+            price_text = "🆓 <b>БЕСПЛАТНО</b> (доступна бесплатная игра раз в час)"
+        else:
+            price_text = "🪙 <b>300 монет</b> (бесплатная игра на кулдауне)"
+    else:
+        price_text = "🪙 <b>300 монет</b>"
+        
+    cooldown_ready = elapsed >= cooldown
+    if cooldown_ready:
+        cooldown_status = "✅ <b>Доступна для входа</b>"
+    else:
+        rem_sec = cooldown - elapsed
+        m, s = divmod(rem_sec, 60)
+        cooldown_status = f"⏳ <b>Кулдаун: {m} мин. {s} сек.</b>"
+        
+    shards = int(getattr(player, 'power_shards', 0) or 0)
+    
     text = (
         "🌀 <b>СЕМАТОРИ</b> 🌀\n\n"
-        "🌪️ <i>Место, где ветер шепчет формулы</i>\n\n"
+        "🌪️ <i>Вы стоите на границе колеблющегося пространства. Воздух здесь гудит от высокого напряжения, а ветер словно шепчет обрывки математических формул...</i>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
-        "⏳ <i>Скоро здесь появятся события и активити.</i>"
+        f"📊 <b>Ваш статус:</b> {status_text}\n"
+        f"🔋 <b>Заряженные осколки:</b> <code>{shards}</code> 🌀\n"
+        f"🪙 <b>Баланс монет:</b> <code>{player.coins:,}</code> 💎\n"
+        f"💰 <b>Стоимость входа:</b> {price_text}\n"
+        f"⚡ <b>Состояние зоны:</b> {cooldown_status}\n\n"
+        "📝 <b>Правила зоны:</b>\n"
+        "1. Вход стоит <b>300 монет</b> (для VIP+ — первая игра в час бесплатно).\n"
+        "2. У вас будет ровно <b>15 секунд</b> на решение случайного уравнения по электрофизике.\n"
+        "3. Выберите один из 4 вариантов ответа на клавиатуре.\n"
+        "4. В случае победы вы получите <b>2–4 Заряженных осколка</b> (VIP получает +25%, VIP+ получает +50%) и <b>+3 к рейтингу</b> 🏆.\n\n"
+        "<i>Готовы войти в резонанс?</i>"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
-        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
-    ]
+    keyboard = []
+    if cooldown_ready:
+        keyboard.append([InlineKeyboardButton("⚡ Войти в резонанс", callback_data='power_sematori_play')])
+    keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data='power_sematori')])
+    keyboard.append([InlineKeyboardButton("🔙 Назад в город", callback_data='city_powerlines')])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest:
         await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def handle_power_sematori_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    user_id = user.id
+    
+    lock = _get_lock(f"user:{user_id}:sematori_play")
+    async with lock:
+        player = db.get_or_create_player(user_id, user.username or user.first_name)
+        
+        is_vip_plus = db.is_vip_plus(user_id)
+        is_vip_status = db.is_vip(user_id)
+        
+        if is_vip_plus:
+            cooldown = 300
+        elif is_vip_status:
+            cooldown = 420
+        else:
+            cooldown = 600
+            
+        last_game = int(getattr(player, 'last_sematori_game', 0) or 0)
+        now = int(time.time())
+        elapsed = now - last_game
+        
+        if elapsed < cooldown:
+            rem_sec = cooldown - elapsed
+            m, s = divmod(rem_sec, 60)
+            await query.answer(f"⏳ Зона нестабильна! Доступ появится через {m} мин. {s} сек.", show_alert=True)
+            return
+            
+        is_free = is_vip_plus and (elapsed >= 3600)
+        price = 0 if is_free else 300
+        
+        if not is_free and player.coins < price:
+            await query.answer("❌ Недостаточно монет для входа в резонанс! Требуется 300 монет.", show_alert=True)
+            return
+            
+        if price > 0:
+            db.update_player(user_id, coins=player.coins - price)
+            
+        db.update_player(user_id, last_sematori_game=now)
+        
+        puzzle_text, ans, options = generate_sematori_puzzle()
+        
+        await query.answer("⚡ Вы входите в резонанс!")
+        
+        keyboard = []
+        row1 = [
+            InlineKeyboardButton(str(options[0]), callback_data=f"sematori_ans:{options[0]}"),
+            InlineKeyboardButton(str(options[1]), callback_data=f"sematori_ans:{options[1]}")
+        ]
+        row2 = [
+            InlineKeyboardButton(str(options[2]), callback_data=f"sematori_ans:{options[2]}"),
+            InlineKeyboardButton(str(options[3]), callback_data=f"sematori_ans:{options[3]}")
+        ]
+        keyboard.append(row1)
+        keyboard.append(row2)
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        text = (
+            "🌀 <b>СЕМАТОРИ — РЕЗОНАНС АКТИВИРОВАН!</b> 🌀\n\n"
+            "⚠️ <b>ВНИМАНИЕ:</b> У вас есть ровно <b>15 секунд</b>, чтобы выбрать правильный ответ!\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"❓ <b>Задача:</b>\n"
+            f"<i>{puzzle_text}</i>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "⏱️ <i>Время пошло! Поторопитесь...</i>"
+        )
+        
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+            
+        context.user_data['sematori'] = {
+            'ans': ans,
+            'start_time': now,
+            'message_id': query.message.message_id
+        }
+
+
+async def handle_sematori_ans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    user_id = user.id
+    
+    lock = _get_lock(f"user:{user_id}:sematori_ans")
+    async with lock:
+        session = context.user_data.get('sematori')
+        if not session:
+            await query.answer("❌ Сессия игры не найдена или уже завершена.", show_alert=True)
+            await show_power_sematori(update, context)
+            return
+            
+        if session.get('message_id') != query.message.message_id:
+            await query.answer("❌ Этот сеанс игры устарел.", show_alert=True)
+            return
+            
+        correct_ans = session['ans']
+        start_time = session['start_time']
+        
+        context.user_data.pop('sematori', None)
+        
+        now = time.time()
+        elapsed = now - start_time
+        
+        if elapsed > 15.5:
+            await query.answer("⏰ Время вышло!", show_alert=True)
+            
+            text = (
+                "🌀 <b>СЕМАТОРИ — РЕЗОНАНС ПОТЕРЯН!</b> 🌀\n\n"
+                "⏰ <b>Время вышло!</b>\n"
+                "<i>Вы не успели дать ответ в отведенные 15 секунд. Вихрь энергии Сематори рассеялся в пространстве...</i>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "⌛ В следующий раз постарайтесь считать быстрее!"
+            )
+            keyboard = [
+                [InlineKeyboardButton("🔄 В меню Сематори", callback_data='power_sematori')],
+                [InlineKeyboardButton("🔙 В город", callback_data='city_powerlines')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+            return
+            
+        data = query.data
+        try:
+            chosen_ans = int(data.split(':')[1])
+        except Exception:
+            chosen_ans = None
+            
+        player = db.get_or_create_player(user_id, user.username or user.first_name)
+        
+        if chosen_ans != correct_ans:
+            await query.answer("❌ Неверно!", show_alert=True)
+            
+            text = (
+                "🌀 <b>СЕМАТОРИ — РЕЗОНАНС НАРУШЕН!</b> 🌀\n\n"
+                "❌ <b>Вы допустили ошибку в расчетах!</b>\n"
+                f"Правильный ответ был: <b>{correct_ans}</b>\n\n"
+                "<i>Энергетический баланс нарушился, и сильный электрический импульс выбросил вас из центра аномалии...</i>\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 Не расстраивайтесь, физика — точная наука!"
+            )
+            keyboard = [
+                [InlineKeyboardButton("🔄 В меню Сематори", callback_data='power_sematori')],
+                [InlineKeyboardButton("🔙 В город", callback_data='city_powerlines')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+            except BadRequest:
+                await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+            return
+            
+        await query.answer("✅ Отлично! Правильный ответ!", show_alert=True)
+        
+        base_shards = random.randint(2, 4)
+        is_vip_plus = db.is_vip_plus(user_id)
+        is_vip_status = db.is_vip(user_id)
+        
+        import math
+        if is_vip_plus:
+            shards_won = math.ceil(base_shards * 1.5)
+            bonus_text = " (<b>+50% VIP+ бонус</b>)"
+        elif is_vip_status:
+            shards_won = math.ceil(base_shards * 1.25)
+            bonus_text = " (<b>+25% VIP бонус</b>)"
+        else:
+            shards_won = base_shards
+            bonus_text = ""
+            
+        current_shards = int(getattr(player, 'power_shards', 0) or 0)
+        current_rating = int(getattr(player, 'rating', 0) or 0)
+        
+        db.update_player(user_id, 
+                         power_shards=current_shards + shards_won,
+                         rating=current_rating + 3)
+                         
+        text = (
+            "🌀 <b>СЕМАТОРИ — РЕЗОНАНС УСПЕШЕН!</b> 🌀\n\n"
+            "✅ <b>Отличная работа! Уравнение решено абсолютно верно!</b>\n"
+            "<i>Вы вошли в идеальный математический резонанс с аномальными волнами Сематори. Энергетический вихрь стабилизируется и оставляет вам ценные трофеи...</i>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌀 <b>Заряженные осколки:</b> +{shards_won}{bonus_text}\n"
+            f"🏆 <b>Рейтинг:</b> +3\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔋 <i>Ваш новый баланс осколков: {current_shards + shards_won} 🌀</i>"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 В меню Сематори", callback_data='power_sematori')],
+            [InlineKeyboardButton("🔙 В город", callback_data='city_powerlines')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
+        except BadRequest:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
 
 
 ROSTOV_ELITE_ITEM_PRICES = {
@@ -16238,9 +16791,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔ Это не ваша кнопка!", show_alert=True)
             return
 
-    if await gift_feature.handle_callback(update, context):
-        return
-
     if ordinary_plantation.can_handle_callback(data):
         await ordinary_plantation.handle_callback(update, context, data)
         return
@@ -16256,42 +16806,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == 'menu':
         await show_menu(update, context)
-    elif data == 'swaga_shop':
-        await swagashop.show_swaga_shop(update, context)
-    elif data.startswith('swaga_admin_'):
-        await swaga_admin.handle_swaga_admin_callback(update, context)
-    elif data == 'swaga_cards_inv':
-        await swagashop.show_swaga_cards_inv(update, context)
-    elif data == 'swaga_chests_inv':
-        await swagashop.show_swaga_chests_inv(update, context)
-    elif data == 'swaga_tracks_inv':
-        await swagashop.show_swaga_tracks_inv(update, context, page=1)
-    elif data == 'swaga_recent_tracks':
-        await swagashop.show_recent_swaga_tracks(update, context, page=1)
-    elif data.startswith('swaga_exchange_'):
-        rarity = data.split('swaga_exchange_')[1]
-        await swagashop.handle_swaga_exchange(update, context, rarity)
-    elif data.startswith('swaga_upgrade_'):
-        payload = data.split('swaga_upgrade_')[1]
-        parts = payload.rsplit('_', 2)
-        if len(parts) == 3:
-            rarity, cost, reward_qty = parts
-            await swagashop.handle_swaga_upgrade(update, context, rarity, cost=int(cost), reward_qty=int(reward_qty))
-        else:
-            rarity = payload
-            await swagashop.handle_swaga_upgrade(update, context, rarity)
-    elif data.startswith('swaga_open_'):
-        rarity = data.split('swaga_open_')[1]
-        await swagashop.handle_swaga_open_chest(update, context, rarity)
-    elif data.startswith('swaga_tracks_page_'):
-        page = int(data.split('swaga_tracks_page_')[1])
-        await swagashop.show_swaga_tracks_inv(update, context, page=page)
-    elif data.startswith('swaga_recent_tracks_page_'):
-        page = int(data.split('swaga_recent_tracks_page_')[1])
-        await swagashop.show_recent_swaga_tracks(update, context, page=page)
-    elif data.startswith('swaga_play_'):
-        track_id = int(data.split('swaga_play_')[1])
-        await swagashop.handle_swaga_play_track(update, context, track_id)
+    elif swaga_module.can_handle_callback(data):
+        await swaga_module.handle_callback(update, context, data)
     elif data == 'creator_panel':
         await show_creator_panel(update, context)
     elif data == 'admin_grants_menu':
@@ -16507,37 +17023,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   'admin_event_list_active', 'admin_event_list_all', 'admin_event_edit', 'admin_event_end',
                   'admin_event_stats']:
         await query.answer("⚙️ Функция в разработке!", show_alert=True)
-    elif data == 'find_energy':
-        await find_energy(update, context)
-    elif data == 'claim_bonus':
-        await claim_daily_bonus(update, context)
-    elif data == 'daily_bonus_info':
-        await show_daily_bonus_info(update, context)
-    elif data == 'inventory':
-        await show_inventory(update, context)
-    elif data.startswith('inventory_p'):
-        # Пагинация инвентаря
-        await show_inventory(update, context)
-    elif data == 'inventory_search_start':
-        # Начало поиска по инвентарю
-        await start_inventory_search(update, context)
-    elif data == 'inventory_search_cancel':
-        # Отмена поиска и возврат к инвентарю
-        await inventory_search_cancel(update, context)
-    elif data.startswith('inventory_search_p'):
-        # Пагинация результатов поиска
-        try:
-            page = int(data.removeprefix('inventory_search_p'))
-            search_query = context.user_data.get('last_inventory_search', '')
-            if search_query:
-                await show_inventory_search_results(update, context, search_query, page)
-            else:
-                await query.answer("Поисковый запрос не найден. Начните новый поиск.", show_alert=True)
-        except Exception:
-            await query.answer("Ошибка пагинации", show_alert=True)
-    elif data.startswith('receiver_qty_p'):
-        # Пагинация инвентаря по количеству для Приёмника
-        await show_inventory_by_quantity(update, context)
+    elif inventory_module.can_handle_callback(data):
+        await inventory_module.handle_callback(update, context, data, get_bot_runtime())
     elif data == 'my_profile':
         await show_my_profile(update, context)
     elif data == 'profile_stats':
@@ -16884,6 +17371,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_rostov_hub(update, context)
     elif data == 'power_sematori':
         await show_power_sematori(update, context)
+    elif data == 'power_sematori_play':
+        await handle_power_sematori_play(update, context)
+    elif data.startswith('sematori_ans:'):
+        await handle_sematori_ans(update, context)
     elif data == 'power_red_cores':
         await show_power_red_cores(update, context)
     elif data == 'power_glasswool_field':
@@ -17140,22 +17631,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await silk_ui.handle_silk_instant_grow(update, context, plantation_id)
             except Exception:
                 await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'city_casino':
-        await show_city_casino(update, context)
+    elif casino_module.can_handle_callback(data):
+        await casino_module.handle_callback(update, context, data, get_bot_runtime())
     elif data == 'market_shop':
         await show_market_shop(update, context)
-    elif data == 'market_receiver':
-        await show_market_receiver(update, context)
-    elif data == 'receiver_by_quantity':
-        await show_inventory_by_quantity(update, context)
-    elif data.startswith('receiver_item_sell:'):
-        try:
-            _, item_key, quantity_token = data.split(':', 2)
-            await handle_receiver_item_sell(update, context, item_key, quantity_token)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'market_plantation':
-        await show_market_plantation(update, context)
+    elif receiver_module.can_handle_callback(data):
+        await receiver_module.handle_callback(update, context, data, get_bot_runtime())
     elif data.startswith('shop_p_'):
         await show_market_shop(update, context)
     elif data.startswith('shop_buy_'):
@@ -17166,10 +17647,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_shop_buy(update, context, int(idx), int(page))
         except Exception:
             await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'plantation_my_beds':
-        await show_plantation_my_beds(update, context)
-    elif data == 'plantation_shop':
-        await show_plantation_shop(update, context)
     elif data.startswith('seed_coupon_shop_open:'):
         if data == 'seed_coupon_shop_open:boosts':
             await open_seed_coupon_shop(update, context, origin='profile_boosts')
@@ -17193,330 +17670,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_seed_coupon_shop(update, context, page=0, search_query='')
     elif data == 'seed_coupon_shop_close':
         await close_seed_coupon_shop(update, context)
-    elif data == 'plantation_fertilizers_shop':
-        await show_plantation_fertilizers_shop(update, context)
-    elif data == 'plantation_fertilizers_inv':
-        await show_plantation_fertilizers_inventory(update, context)
-    elif data == 'plantation_harvest':
-        await show_plantation_harvest(update, context)
-    elif data == 'plantation_harvest_all':
-        await handle_plantation_harvest_all(update, context)
-    elif data == 'plantation_water':
-        await show_plantation_water(update, context)
-    elif data == 'plantation_stats':
-        await show_plantation_stats(update, context)
-    elif data == 'plantation_bed_prices':
-        await show_plantation_bed_prices(update, context)
-    elif data == 'plantation_buy_bed':
-        await handle_plantation_buy_bed(update, context)
-    elif data == 'plantation_join_project':
-        await show_plantation_join_project(update, context)
-    elif data == 'plantation_my_contribution':
-        await show_plantation_my_contribution(update, context)
-    elif data == 'plantation_water_all':
-        await show_plantation_water_all(update, context)
-    elif data == 'plantation_leaderboard':
-        await show_plantation_leaderboard(update, context)
-    elif data == 'casino_rules':
-        await show_casino_rules(update, context)
-    elif data == 'casino_achievements':
-        await show_casino_achievements_page(update, context)
-    elif data.startswith('casino_game_'):
-        # casino_game_{game_type}
-        try:
-            game_type = data.replace('casino_game_', '')
-            # Специальные игры обрабатываются отдельно
-            if game_type == 'blackjack':
-                await show_blackjack_bet_screen(update, context)
-            elif game_type == 'mines':
-                await show_mines_settings(update, context)
-            elif game_type == 'crash':
-                await show_crash_bet_screen(update, context)
-            else:
-                await show_casino_game(update, context, game_type)
-        except Exception as e:
-            logger.error(f"Error in casino_game: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('casino_choice_'):
-        # casino_choice_{game_type}_{choice}
-        try:
-            payload = data.replace('casino_choice_', '', 1)
-            game_type, choice = _parse_casino_game_choice(payload)
-            if not game_type or choice is None:
-                raise ValueError("bad casino_choice payload")
-            # Показываем экран выбора ставки
-            player = db.get_or_create_player(update.callback_query.from_user.id, 
-                                            update.callback_query.from_user.username or update.callback_query.from_user.first_name)
-            coins = int(getattr(player, 'coins', 0) or 0)
-            game_info = CASINO_GAMES.get(game_type, CASINO_GAMES['coin_flip'])
-            await show_bet_selection_screen(update, context, game_type, game_info, coins, choice)
-        except Exception as e:
-            logger.error(f"Error in casino_choice: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('casino_bet_'):
-        # casino_bet_{game_type}_{choice}_{amount}
-        try:
-            parts = data.replace('casino_bet_', '').rsplit('_', 1)
-            amount = int(parts[1])
-            game_type, choice = _parse_casino_game_choice(parts[0])
-            if not game_type:
-                raise ValueError("bad casino_bet payload")
-            if choice == 'none':
-                choice = None
-            await play_casino_game(update, context, game_type, choice, amount)
-        except Exception as e:
-            logger.error(f"Error in casino_bet: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('casino_repeat|'):
-        try:
-            _, game_type, raw_choice, raw_amount = data.split('|', 3)
-            amount = int(raw_amount)
-            choice = None if raw_choice == '-' else raw_choice
-            await play_casino_game(update, context, game_type, choice, amount)
-        except Exception as e:
-            logger.error(f"Error in casino_repeat: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('casino_play_'):
-        # casino_play_{game_type}_{amount} - старый формат для слотов
-        try:
-            parts = data.replace('casino_play_', '').rsplit('_', 1)
-            game_type = parts[0]
-            amount = int(parts[1])
-            await play_casino_game(update, context, game_type, None, amount)
-        except Exception as e:
-            logger.error(f"Error in casino_play: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    # --- Блэкджек ---
-    elif data == 'casino_game_blackjack':
-        await show_blackjack_bet_screen(update, context)
-    elif data.startswith('blackjack_bet_'):
-        # blackjack_bet_{amount}
-        try:
-            amount = int(data.replace('blackjack_bet_', ''))
-            await start_blackjack_game(update, context, amount)
-        except Exception as e:
-            logger.error(f"Error in blackjack_bet: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'blackjack_hit':
-        await handle_blackjack_hit(update, context)
-    elif data == 'blackjack_stand':
-        await handle_blackjack_stand(update, context)
-    elif data == 'blackjack_double':
-        await handle_blackjack_double(update, context)
-    elif data == 'blackjack_surrender':
-        await handle_blackjack_surrender(update, context)
-    # --- Мины ---
-    elif data == 'casino_game_mines':
-        await show_mines_settings(update, context)
-    elif data.startswith('mines_count_'):
-        try:
-            mines_count = int(data.replace('mines_count_', ''))
-            await show_mines_bet_screen(update, context, mines_count)
-        except Exception as e:
-            logger.error(f"Error in mines_count: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('mines_bet_'):
-        # mines_bet_{mines_count}_{amount}
-        try:
-            parts = data.replace('mines_bet_', '').split('_')
-            mines_count = int(parts[0])
-            amount = int(parts[1])
-            await start_mines_game(update, context, mines_count, amount)
-        except Exception as e:
-            logger.error(f"Error in mines_bet: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('mines_click_'):
-        try:
-            cell_idx = int(data.replace('mines_click_', ''))
-            await handle_mines_click(update, context, cell_idx)
-        except Exception as e:
-            logger.error(f"Error in mines_click: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'mines_cashout':
-        await handle_mines_cashout(update, context)
-    elif data == 'mines_forfeit':
-        await handle_mines_forfeit(update, context)
-    elif data == 'mines_noop':
-        await update.callback_query.answer()
-    # --- Краш ---
-    elif data == 'casino_game_crash':
-        await show_crash_bet_screen(update, context)
-    elif data.startswith('crash_bet_'):
-        try:
-            amount = int(data.replace('crash_bet_', ''))
-            await start_crash_game(update, context, amount)
-        except Exception as e:
-            logger.error(f"Error in crash_bet: {e}")
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'crash_cashout':
-        await handle_crash_cashout(update, context)
-    elif data.startswith('plantation_buy_'):
-        # plantation_buy_{seed_id}_{qty}
-        try:
-            _, _, sid, qty = data.split('_')
-            await handle_plantation_buy(update, context, int(sid), int(qty))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_filter_'):
-        # fert_filter_{category}
-        try:
-            category = data.split('_')[-1]
-            await show_plantation_fertilizers_shop(update, context, filter_category=category)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_buy_'):
-        # fert_buy_{fert_id}_{qty}
-        try:
-            _, _, fid, qty = data.split('_')
-            await handle_fertilizer_buy(update, context, int(fid), int(qty))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_apply_pick_'):
-        # fert_apply_pick_{fert_id}
-        try:
-            fid = int(data.split('_')[-1])
-            await show_fertilizer_apply_pick_bed(update, context, fid)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_apply_mode_'):
-        # fert_apply_mode_{bed}_{fert}
-        try:
-            _, _, _, bed, fid = data.split('_')
-            await show_fertilizer_apply_mode(update, context, int(bed), int(fid))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_apply_do_'):
-        # fert_apply_do_{bed}_{fert}
-        try:
-            _, _, _, bed, fid = data.split('_')
-            await handle_fertilizer_apply(update, context, int(bed), int(fid))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_apply_max_'):
-        # fert_apply_max_{bed}_{fert}
-        try:
-            _, _, _, bed, fid = data.split('_')
-            await handle_fertilizer_apply_max(update, context, int(bed), int(fid))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('fert_pick_for_bed_'):
-        # fert_pick_for_bed_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await show_fertilizer_pick_for_bed(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_choose_'):
-        # plantation_choose_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await show_plantation_choose_seed(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_plant_'):
-        # plantation_plant_{bed}_{seed}
-        try:
-            _, _, bed, seed = data.split('_')
-            await handle_plantation_plant(update, context, int(bed), int(seed))
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_water_'):
-        # plantation_water_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await handle_plantation_water(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('plantation_harvest_bed_'):
-        # plantation_harvest_bed_{bed}
-        try:
-            bed_idx = int(data.split('_')[-1])
-            await handle_plantation_harvest(update, context, bed_idx)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'bonus_tg_premium':
-        await show_bonus_tg_premium(update, context)
-    elif data == 'buy_tg_premium':
-        await buy_tg_premium(update, context)
-    elif data == 'bonus_steam_game':
-        await show_bonus_steam_game(update, context)
-    elif data == 'buy_stars_500':
-        await buy_stars_500(update, context)
-    elif data == 'buy_steam_game':
-        await buy_steam_game(update, context)
-    elif data == 'vip_menu':
-        await show_vip_menu(update, context)
-    elif data == 'vip_plus_menu':
-        await show_vip_plus_menu(update, context)
-    elif data == 'vip_1d':
-        await show_vip_1d(update, context)
-    elif data == 'vip_7d':
-        await show_vip_7d(update, context)
-    elif data == 'vip_30d':
-        await show_vip_30d(update, context)
-    elif data == 'vip_plus_1d':
-        await show_vip_plus_1d(update, context)
-    elif data == 'vip_plus_7d':
-        await show_vip_plus_7d(update, context)
-    elif data == 'vip_plus_30d':
-        await show_vip_plus_30d(update, context)
-    elif data == 'buy_vip_1d':
-        await buy_vip(update, context, '1d')
-    elif data == 'buy_vip_7d':
-        await buy_vip(update, context, '7d')
-    elif data == 'buy_vip_30d':
-        await buy_vip(update, context, '30d')
-    elif data == 'confirm_vip_plus_1d':
-        await confirm_vip_plus_purchase(update, context, '1d')
-    elif data == 'confirm_vip_plus_7d':
-        await confirm_vip_plus_purchase(update, context, '7d')
-    elif data == 'confirm_vip_plus_30d':
-        await confirm_vip_plus_purchase(update, context, '30d')
-    elif data == 'buy_vip_plus_1d':
-        await buy_vip_plus(update, context, '1d')
-    elif data == 'buy_vip_plus_7d':
-        await buy_vip_plus(update, context, '7d')
-    elif data == 'buy_vip_plus_30d':
-        await buy_vip_plus(update, context, '30d')
-    elif data == 'stars_menu':
-        await show_stars_menu(update, context)
-    elif data == 'stars_500':
-        await show_stars_500(update, context)
+    elif premium_shop_module.can_handle_callback(data):
+        await premium_shop_module.handle_callback(update, context, data, get_bot_runtime())
     elif data == 'noop':
         # Заглушка для неактивных кнопок (например, пагинации на крайних страницах)
         await query.answer()
-    elif data == 'my_receipts':
-        await my_receipts_handler(update, context)
-    elif data == 'sell_all_confirm_1':
-        await receiver_sell_all_confirm_1(update, context)
-    elif data == 'sell_all_confirm_2':
-        await receiver_sell_all_confirm_2(update, context)
-    elif data == 'sell_all_execute':
-        await handle_sell_all_inventory(update, context)
-    elif data.startswith('sellall_'):
-        try:
-            item_id = int(data.split('_')[1])
-            await handle_sell_action(update, context, item_id, sell_all=True)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('sellallbutone_'):
-        try:
-            item_id = int(data.split('_')[1])
-            await handle_sell_all_but_one(update, context, item_id)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data == 'sell_absolutely_all_but_one':
-        await handle_sell_absolutely_all_but_one(update, context)
-    elif data.startswith('sell_'):
-        try:
-            item_id = int(data.split('_')[1])
-            await handle_sell_action(update, context, item_id, sell_all=False)
-        except Exception:
-            await update.callback_query.answer('Ошибка', show_alert=True)
-    elif data.startswith('view_receipt_'):
-        await view_receipt_handler(update, context)
-    elif data.startswith('view_'):
-        await view_inventory_item(update, context)
     elif data.startswith('approve_'):
         await approve_pending(update, context)
     elif data.startswith('reject_'):
@@ -17529,39 +17687,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approve_pending_edit(update, context)
     elif data.startswith('editreject_'):
         await reject_pending_edit(update, context)
-    elif data == 'settings':
-        await show_settings(update, context)
-    elif data == 'settings_lang':
-        await settings_lang_menu(update, context)
-    elif data == 'settings_quick_access':
-        await show_settings_quick_access(update, context)
-    elif data.startswith('quick_access_set:'):
-        await set_quick_access_target(update, context, data.split(':', 1)[1])
-    elif data == 'settings_reminder':
-        await toggle_reminder(update, context)
-    elif data == 'settings_plantation_reminder':
-        await toggle_plantation_reminder(update, context)
-    elif data == 'settings_auto':
-        await toggle_auto_search(update, context)
-    elif data == 'settings_autosell':
-        await show_autosell_menu(update, context)
-    elif data.startswith('autosell_toggle_'):
-        rarity = data.removeprefix('autosell_toggle_')
-        await toggle_autosell_rarity(update, context, rarity)
-    elif data == 'settings_reset':
-        await reset_prompt(update, context)
-    elif data == 'lang_ru':
-        await set_language(update, context, 'ru')
-    elif data == 'lang_en':
-        await set_language(update, context, 'en')
-    elif data == 'reset_yes':
-        await reset_confirm(update, context, True)
-    elif data == 'reset_no':
-        await reset_confirm(update, context, False)
-    elif data == 'group_toggle_notify':
-        await toggle_group_notifications(update, context)
-    elif data == 'group_toggle_delete':
-        await toggle_group_auto_delete(update, context)
+    elif user_settings_module.can_handle_callback(data):
+        await user_settings_module.handle_callback(update, context, data, get_bot_runtime())
 async def group_register_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Регистрирует группу при любом групповом сообщении/команде."""
     try:
@@ -20825,6 +20952,417 @@ gift_feature = GiftFeature(
 )
 
 
+# ==========================================
+# РАЗДЕЛ: СОБЫТИЯ ПОИСКА (SEARCH EVENTS)
+# ==========================================
+
+async def event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /event для вывода информации об активном событии."""
+    if await abort_if_banned(update, context):
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    player = None
+    try:
+        player = db.get_or_create_player(
+            user.id,
+            username=getattr(user, 'username', None),
+            display_name=(getattr(user, 'full_name', None) or getattr(user, 'first_name', None))
+        )
+    except Exception:
+        pass
+
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    event = _active_search_event()
+
+    if not event:
+        text = (
+            "🔭 <b>Активных событий поиска нет.</b>"
+            if lang == 'ru'
+            else "🔭 <b>There are no active search events.</b>"
+        )
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]])
+        await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
+        return
+
+    emoji = html.escape(str(event.get('emoji') or '🔭'))
+    title = html.escape(_search_event_title(event, lang))
+    desc = html.escape(_search_event_description(event, lang))
+
+    # Вытаскиваем бонусы
+    coin_bonus = int(event.get('coin_bonus_percent', 0) or 0)
+    rarity_bonus = int(event.get('rarity_weight_bonus_percent', 0) or 0)
+    double_drop = int((event.get('double_drop_bonus', 0) or 0) * 100)
+    swaga_cards = int(event.get('swaga_bonus_cards', 0) or 0)
+
+    bonuses_lines = []
+    if lang == 'ru':
+        if coin_bonus > 0:
+            bonuses_lines.append(f"• 🪙 Монеты за находки: <b>+{coin_bonus}%</b>")
+        if rarity_bonus > 0:
+            bonuses_lines.append(f"• 💎 Шанс найти редкие энергетики: <b>+{rarity_bonus}%</b>")
+        if double_drop > 0:
+            bonuses_lines.append(f"• ♊ Шанс двойной находки: <b>+{double_drop}%</b>")
+        if swaga_cards > 0:
+            bonuses_lines.append(f"• 🃏 Бонусные свага-карты за поиск: <b>+{swaga_cards} шт.</b>")
+        if not bonuses_lines:
+            bonuses_lines.append("• <i>Особых бонусов нет.</i>")
+    else:
+        if coin_bonus > 0:
+            bonuses_lines.append(f"• 🪙 Find coins bonus: <b>+{coin_bonus}%</b>")
+        if rarity_bonus > 0:
+            bonuses_lines.append(f"• 💎 Rare energy drink chance: <b>+{rarity_bonus}%</b>")
+        if double_drop > 0:
+            bonuses_lines.append(f"• ♊ Double find chance: <b>+{double_drop}%</b>")
+        if swaga_cards > 0:
+            bonuses_lines.append(f"• 🃏 Swaga cards search bonus: <b>+{swaga_cards} pcs.</b>")
+        if not bonuses_lines:
+            bonuses_lines.append("• <i>No special bonuses active.</i>")
+
+    bonuses_text = "\n".join(bonuses_lines)
+
+    until_ts = int(event.get('until_ts', 0) or 0)
+    now = time.time()
+
+    progress_line = ""
+    if until_ts == 0:
+        progress_line = "бессрочно ♾" if lang == 'ru' else "infinite ♾"
+    elif until_ts > now:
+        # Пытаемся рассчитать процент оставшегося времени
+        try:
+            # Для переопределенного события пытаемся взять start_ts
+            is_override = bool(event.get('is_override', False))
+            if is_override:
+                start_ts = db.get_setting_int('search_event_override_start', 0)
+                if start_ts <= 0 or start_ts >= until_ts:
+                    start_ts = int(now - 3600)  # Заглушка, если нет в БД
+                total_duration = until_ts - start_ts
+            else:
+                period = int(SEARCH_EVENT_ROTATION_PERIOD_SEC or 21600)
+                total_duration = period
+            
+            elapsed = now - (until_ts - total_duration)
+            remaining = until_ts - now
+            percent = max(0, min(100, int((remaining / total_duration) * 100)))
+        except Exception:
+            percent = 100
+            remaining = until_ts - now
+
+        # Формируем прогресс-бар
+        filled = int(percent // 10)
+        empty = 10 - filled
+        bar = "█" * filled + "░" * empty
+
+        # Форматируем оставшееся время
+        rem_hours = int(remaining // 3600)
+        rem_mins = int((remaining % 3600) // 60)
+        if lang == 'ru':
+            time_left_str = f"{rem_hours}ч {rem_mins}м" if rem_hours > 0 else f"{rem_mins}м"
+            progress_line = f"<code>[{bar}]</code> {percent}% (осталось {time_left_str})"
+        else:
+            time_left_str = f"{rem_hours}h {rem_mins}m" if rem_hours > 0 else f"{rem_mins}m"
+            progress_line = f"<code>[{bar}]</code> {percent}% ({time_left_str} remaining)"
+    else:
+        progress_line = "завершено" if lang == 'ru' else "ended"
+
+    if lang == 'ru':
+        text = (
+            f"🔭 <b>Активное событие поиска</b>\n\n"
+            f"{emoji} <b>{title}</b>\n"
+            f"<i>{desc}</i>\n\n"
+            f"🎁 <b>Бонусы события:</b>\n"
+            f"{bonuses_text}\n\n"
+            f"⏳ <b>Длительность:</b>\n"
+            f"{progress_line}"
+        )
+    else:
+        text = (
+            f"🔭 <b>Active Search Event</b>\n\n"
+            f"{emoji} <b>{title}</b>\n"
+            f"<i>{desc}</i>\n\n"
+            f"🎁 <b>Event Bonuses:</b>\n"
+            f"{bonuses_text}\n\n"
+            f"⏳ <b>Duration:</b>\n"
+            f"{progress_line}"
+        )
+
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='menu')]])
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
+
+
+async def admin_set_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ-команда для установки/переопределения событий поиска."""
+    if await abort_if_banned(update, context):
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    # Проверка прав уровня 3+
+    if not has_admin_level(user.id, user.username, 3):
+        await update.message.reply_text("⛔ У вас нет прав уровня 3+ для управления событиями поиска.")
+        return
+
+    args = context.args
+    # Сценарий 1: Текстовые аргументы
+    if args:
+        event_key = str(args[0]).strip().lower()
+        # Ищем событие
+        matched_event = None
+        for e in SEARCH_EVENTS:
+            if str(e.get('key')).strip().lower() == event_key:
+                matched_event = e
+                break
+
+        if not matched_event:
+            available_keys = ", ".join(f"<code>{e.get('key')}</code>" for e in SEARCH_EVENTS)
+            await update.message.reply_text(
+                f"❌ Событие с ключом <code>{html.escape(event_key)}</code> не найдено.\n"
+                f"Доступные ключи:\n{available_keys}",
+                parse_mode='HTML'
+            )
+            return
+
+        # Парсим часы
+        hours = 0
+        if len(args) > 1:
+            try:
+                hours = int(args[1])
+                if hours < 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Количество часов должно быть неотрицательным целым числом (0 для бессрочно).")
+                return
+
+        now = int(time.time())
+        until_ts = 0 if hours == 0 else int(now + hours * 3600)
+
+        try:
+            db.set_setting_str('search_event_override', matched_event['key'])
+            db.set_setting_int('search_event_override_until', until_ts)
+            db.set_setting_int('search_event_override_start', now)
+
+            emoji = matched_event.get('emoji') or '🔭'
+            title = matched_event.get('title_ru') or matched_event['key']
+            duration_text = "бессрочно" if hours == 0 else f"на {hours} ч."
+            await update.message.reply_text(
+                f"✅ Событие {emoji} <b>{html.escape(title)}</b> успешно переопределено {duration_text}!",
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"Error in admin_set_event_command save: {e}")
+            await update.message.reply_text("❌ Произошла ошибка базы данных при сохранении переопределения.")
+        return
+
+    # Сценарий 2: Интерактивный режим (без аргументов)
+    await _send_admin_event_list(update.message, user)
+
+
+async def _send_admin_event_list(message, user, edit: bool = False):
+    """Вспомогательная функция для генерации списка событий в админке."""
+    # Получаем текущее состояние
+    event = _active_search_event()
+    override_key = ""
+    try:
+        override_key = db.get_setting_str('search_event_override')
+    except Exception:
+        pass
+
+    state_text = ""
+    if override_key:
+        emoji = event.get('emoji') or '🔭'
+        title = event.get('title_ru') or event.get('key')
+        until_ts = event.get('until_ts', 0)
+        if until_ts == 0:
+            until_str = "бессрочно"
+        else:
+            until_str = safe_format_timestamp(until_ts, '%d.%m %H:%M') or '—'
+        state_text = f"⚠️ <b>Вручную установлено:</b> {emoji} {title} (до {until_str})"
+    else:
+        if event:
+            emoji = event.get('emoji') or '🔭'
+            title = event.get('title_ru') or event.get('key')
+            state_text = f"🔄 <b>Авто-ротация:</b> {emoji} {title}"
+        else:
+            state_text = "🔭 Нет активного события."
+
+    text = (
+        f"🛠 <b>Панель управления событиями поиска</b>\n\n"
+        f"Текущее состояние:\n"
+        f"{state_text}\n\n"
+        f"Выберите событие для принудительной установки:"
+    )
+
+    # Строим клавиатуру
+    keyboard = []
+    # По 2 события в строке
+    row = []
+    for e in SEARCH_EVENTS:
+        emoji = e.get('emoji') or '🔭'
+        title = e.get('title_ru') or e.get('key')
+        row.append(InlineKeyboardButton(f"{emoji} {title}", callback_data=f"admin_event_select:{e['key']}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    # Кнопка сброса (если есть активный оверрайд)
+    if override_key:
+        keyboard.append([InlineKeyboardButton("❌ Сбросить переопределение", callback_data="admin_event_reset")])
+
+    # Кнопка закрытия
+    keyboard.append([
+        InlineKeyboardButton("🔙 Назад", callback_data="admin_events_menu"),
+        InlineKeyboardButton("❌ Закрыть панель", callback_data="admin_event_close")
+    ])
+
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode='HTML', reply_markup=markup)
+        except Exception:
+            await message.reply_text(text, parse_mode='HTML', reply_markup=markup)
+    else:
+        await message.reply_text(text, parse_mode='HTML', reply_markup=markup)
+
+
+async def admin_event_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик inline-кнопок панели управления событиями."""
+    query = update.callback_query
+    if not query:
+        return
+
+    user = query.from_user
+    if not has_admin_level(user.id, user.username, 3):
+        await query.answer("⛔ У вас нет прав уровня 3+ для управления событиями поиска.", show_alert=True)
+        return
+
+    data = query.data
+    if not data:
+        return
+
+    if data == "admin_events_menu":
+        await query.answer()
+        await show_admin_events_menu(update, context)
+        return
+
+    if data == "admin_event_list":
+        await query.answer()
+        await _send_admin_event_list(query.message, user, edit=True)
+        return
+
+    elif data == "admin_event_close":
+        await query.answer("Панель закрыта")
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    elif data == "admin_event_reset":
+        try:
+            db.set_setting_str('search_event_override', '')
+            db.set_setting_int('search_event_override_until', 0)
+            db.set_setting_int('search_event_override_start', 0)
+            await query.answer("🔄 Переопределение сброшено к авто-ротации!", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error resetting event: {e}")
+            await query.answer("❌ Ошибка при сбросе настроек в БД", show_alert=True)
+        await _send_admin_event_list(query.message, user, edit=True)
+        return
+
+    elif data.startswith("admin_event_select:"):
+        await query.answer()
+        event_key = data.split(":", 1)[1]
+        matched_event = None
+        for e in SEARCH_EVENTS:
+            if e['key'] == event_key:
+                matched_event = e
+                break
+
+        if not matched_event:
+            await query.answer("❌ Событие не найдено!", show_alert=True)
+            return
+
+        emoji = matched_event.get('emoji') or '🔭'
+        title = matched_event.get('title_ru') or matched_event['key']
+        desc = matched_event.get('desc_ru') or ''
+
+        text = (
+            f"⚙️ <b>Настройка переопределения</b>\n\n"
+            f"Выбрано событие: {emoji} <b>{html.escape(title)}</b>\n"
+            f"<i>{html.escape(desc)}</i>\n\n"
+            f"Выберите длительность действия события:"
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton("1 час", callback_data=f"admin_event_confirm:{event_key}:1"),
+                InlineKeyboardButton("3 часа", callback_data=f"admin_event_confirm:{event_key}:3"),
+                InlineKeyboardButton("6 часов", callback_data=f"admin_event_confirm:{event_key}:6"),
+            ],
+            [
+                InlineKeyboardButton("12 часов", callback_data=f"admin_event_confirm:{event_key}:12"),
+                InlineKeyboardButton("24 часа", callback_data=f"admin_event_confirm:{event_key}:24"),
+                InlineKeyboardButton("♾ Бессрочно", callback_data=f"admin_event_confirm:{event_key}:0"),
+            ],
+            [
+                InlineKeyboardButton("🔙 К списку событий", callback_data="admin_event_list")
+            ]
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.message.edit_text(text, parse_mode='HTML', reply_markup=markup)
+        except Exception:
+            await query.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
+
+    elif data.startswith("admin_event_confirm:"):
+        parts = data.split(":")
+        if len(parts) < 3:
+            await query.answer("❌ Ошибка аргументов!", show_alert=True)
+            return
+
+        event_key = parts[1]
+        try:
+            hours = int(parts[2])
+        except ValueError:
+            await query.answer("❌ Неверное число часов!", show_alert=True)
+            return
+
+        matched_event = None
+        for e in SEARCH_EVENTS:
+            if e['key'] == event_key:
+                matched_event = e
+                break
+
+        if not matched_event:
+            await query.answer("❌ Событие не найдено!", show_alert=True)
+            return
+
+        now = int(time.time())
+        until_ts = 0 if hours == 0 else int(now + hours * 3600)
+
+        try:
+            db.set_setting_str('search_event_override', matched_event['key'])
+            db.set_setting_int('search_event_override_until', until_ts)
+            db.set_setting_int('search_event_override_start', now)
+
+            emoji = matched_event.get('emoji') or '🔭'
+            title = matched_event.get('title_ru') or matched_event['key']
+            hours_text = "бессрочно" if hours == 0 else f"на {hours} ч."
+
+            await query.answer(f"✅ Событие {title} установлено {hours_text}!", show_alert=True)
+        except Exception as e:
+            logger.error(f"Error confirming event: {e}")
+            await query.answer("❌ Произошла ошибка базы данных", show_alert=True)
+
+        await _send_admin_event_list(query.message, user, edit=True)
+
+
 def _load_rarity_emoji_overrides_into_constants() -> None:
     try:
         rows = db.list_rarity_emoji_overrides()
@@ -20894,6 +21432,8 @@ def main():
     application.add_handler(CommandHandler("fullhelp", fullhelp_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("admin2", admin2_command))
+    application.add_handler(CommandHandler(["event", "searchevent", "search_event"], event_command))
+    application.add_handler(CommandHandler("set_event", admin_set_event_command))
     application.add_handler(CommandHandler("requests", requests_command))
     application.add_handler(CommandHandler("delrequest", delrequest_command))
     application.add_handler(CommandHandler("editdrink", editdrink_command))
@@ -20974,6 +21514,8 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_selyuk_farmer_upgrade_action, pattern='^selyuk_farmer_upgrade_action$'))
     application.add_handler(CallbackQueryHandler(admin_player_selyuki_show, pattern='^admin_player_selyuki:'))
     register_modular_handlers(application, BOT_RUNTIME)
+    application.add_handler(CallbackQueryHandler(admin_event_callback_handler, pattern='^admin_event_'))
+    gift_feature.register_handlers(application)
     application.add_handler(CallbackQueryHandler(button_handler))
     # ВАЖНО: перехватываем ответы на ForceReply с причиной отклонения до общего текстового обработчика
     application.add_handler(MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, handle_reject_reason_reply), group=0)
@@ -20981,9 +21523,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler), group=1)
     application.add_handler(MessageHandler(filters.PHOTO, photo_message_handler), group=1)
     application.add_handler(MessageHandler(filters.AUDIO, audio_message_handler), group=1)
-    # Регистрируем /gift раньше, чтобы исключить перехват другими обработчиками
-    application.add_handler(CommandHandler("gift", gift_feature.gift_command))
-    application.add_handler(CommandHandler("giftstats", gift_feature.giftstats_command))
     # Тихая регистрация групп по любым групповым сообщениям/командам
     application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler(["yt", "ytmp3", "ytmusic"], youtube_download_command))
@@ -20991,13 +21530,7 @@ def main():
     application.add_handler(CommandHandler("groupsettings", groupsettings_command))
 
     # Свага Команды
-    application.add_handler(CommandHandler("swagashop", swagashop.show_swaga_shop))
-    application.add_handler(CommandHandler("swagainv", swagashop.show_swaga_shop))
-    application.add_handler(swaga_admin.addswaga_conv_handler)
-    application.add_handler(CommandHandler("giveswagacards", swaga_admin.giveswagacards_command))
-    application.add_handler(CommandHandler(["swagaid", "swagalist", "swagatracks"], swaga_admin.swagaid_command))
-    application.add_handler(CommandHandler(["swagaedit", "editswaga", "editswagatrack"], swaga_admin.swagaedit_command))
-    application.add_handler(CommandHandler(["swagadel", "delswaga", "delswagatrack"], swaga_admin.swagadel_command))
+    swaga_module.register_handlers(application)
     
     # Логируем информацию о боте после старта (диагностика: верный ли бот запущен)
     async def _log_bot_info(context: ContextTypes.DEFAULT_TYPE):

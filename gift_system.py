@@ -7,12 +7,13 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden
-from telegram.ext import ContextTypes
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 import database as db
 
 
 class GiftFeature:
+    CALLBACK_PATTERN = r"^(gift_|giftresp_)"
     MAX_BUNDLE_SIZE = 10
     DAILY_LIMIT = 20
     COOLDOWN_SECONDS = 40
@@ -408,12 +409,16 @@ class GiftFeature:
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         query = update.callback_query
+        if not query:
+            return False
         data = query.data or ""
         if not self._is_gift_callback(data):
             return False
 
         try:
-            if data.startswith("gift_page_"):
+            if data == "gift_page_info":
+                await query.answer("Текущая страница")
+            elif data.startswith("gift_page_"):
                 page = int(data.split("_")[-1])
                 await self.send_gift_selection_menu(
                     context,
@@ -422,8 +427,6 @@ class GiftFeature:
                     message_id=query.message.message_id,
                 )
                 await query.answer()
-            elif data == "gift_page_info":
-                await query.answer("Текущая страница")
             elif data == "gift_search":
                 await self._start_search(query)
             elif data == "gift_cancel_search":
@@ -471,6 +474,30 @@ class GiftFeature:
             except Exception:
                 pass
         return True
+
+    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self.abort_if_banned(update, context):
+            return
+        try:
+            await self.register_group_if_needed(update)
+        except Exception:
+            pass
+        try:
+            user = update.effective_user
+            if user:
+                db.get_or_create_player(
+                    user.id,
+                    username=getattr(user, "username", None),
+                    display_name=(getattr(user, "full_name", None) or getattr(user, "first_name", None)),
+                )
+        except Exception:
+            pass
+        await self.handle_callback(update, context)
+
+    def register_handlers(self, application) -> None:
+        application.add_handler(CommandHandler("gift", self.gift_command))
+        application.add_handler(CommandHandler("giftstats", self.giftstats_command))
+        application.add_handler(CallbackQueryHandler(self.callback_handler, pattern=self.CALLBACK_PATTERN))
 
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         if not update.effective_user:
