@@ -1,14 +1,16 @@
 # Файл конфигурации с токеном
 .env
-config.py
-
+core/config.py
 
 # База данных
-bot_data.db
+data/*.db
+data/*.csv
 *.db
 
 # Кэш Python
 __pycache__/
+*/__pycache__/
 
 # IDE settings
-.qoder 
+.qoder
+.windsurf

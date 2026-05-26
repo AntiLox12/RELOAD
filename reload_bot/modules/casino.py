@@ -3,8 +3,8 @@ from __future__ import annotations
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from casino_logic import parse_casino_game_choice
-from constants import CASINO_GAMES
+from modules.casino.casino_logic import parse_casino_game_choice
+from core.constants import CASINO_GAMES
 from reload_bot.runtime import BotRuntime
 
 

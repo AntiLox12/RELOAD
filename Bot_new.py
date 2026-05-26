@@ -24,24 +24,24 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
-import database as db
-from database import SessionLocal, Player
+import core.database as db
+from core.database import SessionLocal, Player
 from sqlalchemy import func
 from collections import defaultdict, OrderedDict
-import config
+import core.config as config
 from typing import Any, Dict
-from casino_logic import (
+from modules.casino.casino_logic import (
     casino_adjusted_prob,
     casino_extra_win_chance,
     casino_roll_win,
     parse_casino_game_choice,
 )
-import casino_handlers
-import casino_gameplay
-from gift_system import GiftFeature
-from fullhelp import fullhelp_command
-from admin import admin_command
-from admin2 import (
+import modules.casino.casino_handlers as casino_handlers
+import modules.casino.casino_gameplay as casino_gameplay
+from modules.gift.gift_system import GiftFeature
+from modules.help.fullhelp import fullhelp_command
+from modules.admin.admin import admin_command
+from modules.admin.admin2 import (
     admin2_command,
     receipt_command,
     verifyreceipt_command,
@@ -65,7 +65,7 @@ from admin2 import (
     addexdrink_cancel,
     giveexdrink_command,
 )
-from vip_plus_handlers import (
+from modules.admin.vip_plus_handlers import (
     show_vip_plus_menu,
     show_vip_plus_1d,
     show_vip_plus_7d,
@@ -74,7 +74,7 @@ from vip_plus_handlers import (
     confirm_vip_plus_purchase,
     toggle_auto_search_silent,
 )
-from constants import (
+from core.constants import (
     SEARCH_COOLDOWN,
     DAILY_BONUS_COOLDOWN,
     ENERGY_IMAGES_DIR,
@@ -133,9 +133,9 @@ from constants import (
     SEARCH_EVENTS,
     SEARCH_EVENT_ROTATION_PERIOD_SEC,
 )
-import silk_ui
-import ordinary_plantation
-from youtube_downloader import (
+import modules.plantation.silk_ui as silk_ui
+import modules.plantation.ordinary_plantation as ordinary_plantation
+from modules.youtube.youtube_downloader import (
     FfmpegNotFoundError,
     UnsupportedYoutubeUrlError,
     YoutubeAudioDownloadError,
@@ -143,7 +143,7 @@ from youtube_downloader import (
     download_youtube_audio_async,
     extract_first_youtube_url,
 )
-from admin_permissions import (
+from modules.admin.admin_permissions import (
     get_effective_admin_level,
     has_admin_level,
     has_admin_panel_access,
@@ -164,7 +164,7 @@ from reload_bot.modules import receiver as receiver_module
 from reload_bot.modules import swaga as swaga_module
 from reload_bot.modules import user_settings as user_settings_module
 from reload_bot.runtime import BotRuntime
-from utils import (
+from core.utils import (
     _parse_duration_to_seconds,
     _resolve_user_identifier,
     _format_duration_compact,
@@ -1466,6 +1466,9 @@ def get_bot_runtime() -> BotRuntime:
             'handle_sell_absolutely_all_but_one': handle_sell_absolutely_all_but_one,
             'view_receipt_handler': view_receipt_handler,
             'view_inventory_item': view_inventory_item,
+            'show_receiver_sell_by_rarity': show_receiver_sell_by_rarity,
+            'confirm_receiver_sell_rarity': confirm_receiver_sell_rarity,
+            'execute_receiver_sell_rarity': execute_receiver_sell_rarity,
             'show_settings': show_settings,
             'settings_lang_menu': settings_lang_menu,
             'show_settings_quick_access': show_settings_quick_access,
@@ -6085,7 +6088,7 @@ async def auto_search_job(context: ContextTypes.DEFAULT_TYPE):
                 # Отправим пользователю уведомление с найденным предметом (как раньше)
                 try:
                     img_paths = result.get("image_paths") or []
-                    existing = [p for p in img_paths if p and os.path.exists(p)]
+                    existing = [p for p in img_paths if p and os.path.exists(p) and os.path.getsize(p) > 0]
                     found_count = int(result.get('found_count', 1) or 1)
                     caption = result.get("caption")
                     if found_count >= 2 and len(existing) >= 2:
@@ -6527,7 +6530,7 @@ async def find_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             img_paths = result.get("image_paths") or []
-            existing = [p for p in img_paths if p and os.path.exists(p)]
+            existing = [p for p in img_paths if p and os.path.exists(p) and os.path.getsize(p) > 0]
             found_count = int(result.get('found_count', 1) or 1)
             caption = result.get("caption")
             if found_count >= 2 and len(existing) >= 2:
@@ -8870,6 +8873,39 @@ async def view_inventory_item(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             ])
     
+    # Интеграция Избранного и Дарения
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    is_favorite = False
+    for i in (1, 2, 3):
+        slot_item_id = int(getattr(player, f'favorite_drink_{i}', 0) or 0)
+        if slot_item_id == inventory_item.id:
+            is_favorite = True
+            break
+
+    fav_gift_row = []
+    if is_favorite:
+        fav_gift_row.append(
+            InlineKeyboardButton(
+                "❌ Из избранного" if player.language == 'ru' else "❌ Unfavorite",
+                callback_data=f"fav_remove_{inventory_item.id}_p{page}_{inventory_type}"
+            )
+        )
+    else:
+        fav_gift_row.append(
+            InlineKeyboardButton(
+                "⭐️ В избранное" if player.language == 'ru' else "⭐️ Favorite",
+                callback_data=f"fav_add_{inventory_item.id}_p{page}_{inventory_type}"
+            )
+        )
+
+    fav_gift_row.append(
+        InlineKeyboardButton(
+            "🎁 Подарить" if player.language == 'ru' else "🎁 Gift",
+            callback_data=f"gift_inv_{inventory_item.id}_p{page}_{inventory_type}"
+        )
+    )
+    rows.append(fav_gift_row)
+
     # Кнопка возврата с сохранением страницы
     if inventory_type == 'receiver':
         back_callback = f'receiver_qty_p{page}'
@@ -9531,6 +9567,178 @@ async def receiver_sell_all_confirm_2(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest:
         await context.bot.send_message(chat_id=query.from_user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def show_receiver_sell_by_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список доступных для массовой продажи редкостей с подсчетом количества и суммы."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    rating_value = int(getattr(player, 'rating', 0) or 0)
+
+    # Получаем инвентарь игрока
+    inventory_items = db.get_player_inventory_with_details(user_id)
+    
+    # Группируем по редкости
+    rarity_counts = defaultdict(int)
+    for item in inventory_items:
+        rarity_counts[item.rarity] += item.quantity
+
+    text = (
+        "<b>♻️ Массовая продажа по редкостям</b>\n\n"
+        "Здесь вы можете продать все энергетики конкретной редкости за один раз.\n"
+        "Сумма выплаты рассчитана с учетом вашего текущего рейтинга."
+        if lang == 'ru' else
+        "<b>♻️ Mass Sell by Rarities</b>\n\n"
+        "Here you can sell all energy drinks of a specific rarity at once.\n"
+        "The payout sum is calculated based on your current rating."
+    )
+
+    rows = []
+    has_items = False
+    for r in RARITY_ORDER:
+        count = rarity_counts.get(r, 0)
+        if count > 0:
+            unit_payout = int(db.get_receiver_unit_payout_with_rating(r, rating_value) or 0)
+            if unit_payout > 0:
+                has_items = True
+                total_payout = unit_payout * count
+                emoji = COLOR_EMOJIS.get(r, '⚫')
+                btn_text = f"{emoji} {r} ({count} шт.) — +{total_payout} 🪙" if lang == 'ru' else f"{emoji} {r} ({count} pcs) — +{total_payout} 🪙"
+                rows.append([InlineKeyboardButton(btn_text, callback_data=f"rec_sell_rar_conf_{r}")])
+
+    if not has_items:
+        text += (
+            "\n\n❌ <b>У вас нет подходящих предметов для продажи в инвентаре.</b>"
+            if lang == 'ru' else
+            "\n\n❌ <b>You have no suitable items to sell in your inventory.</b>"
+        )
+
+    rows.append([InlineKeyboardButton("🔙 Назад к Приёмнику" if lang == 'ru' else "🔙 Back to Receiver", callback_data='market_receiver')])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode='HTML')
+
+
+async def confirm_receiver_sell_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран подтверждения массовой продажи редкости."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    try:
+        rarity = data.removeprefix("rec_sell_rar_conf_")
+    except Exception:
+        await query.answer("Ошибка редкости", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+    lang = getattr(player, 'language', 'ru') or 'ru'
+    rating_value = int(getattr(player, 'rating', 0) or 0)
+
+    inventory_items = db.get_player_inventory_with_details(user_id)
+    count = sum(item.quantity for item in inventory_items if item.rarity == rarity)
+
+    if count <= 0:
+        await query.answer("У вас нет предметов этой редкости" if lang == 'ru' else "You have no items of this rarity", show_alert=True)
+        await show_receiver_sell_by_rarity(update, context)
+        return
+
+    unit_payout = int(db.get_receiver_unit_payout_with_rating(rarity, rating_value) or 0)
+    total_payout = unit_payout * count
+
+    emoji = COLOR_EMOJIS.get(rarity, '⚫')
+    text = (
+        f"<b>⚠️ Подтверждение продажи</b>\n\n"
+        f"Вы собираетесь продать все напитки редкости {emoji} <b>{rarity}</b> ({count} шт.) через Приёмник.\n"
+        f"Вы получите: <b>+{total_payout}</b> монет 🪙\n\n"
+        f"Это действие <b>нельзя отменить</b>. Вы уверены?"
+        if lang == 'ru' else
+        f"<b>⚠️ Confirmation of Sale</b>\n\n"
+        f"You are about to sell all drinks of rarity {emoji} <b>{rarity}</b> ({count} pcs) via Receiver.\n"
+        f"You will get: <b>+{total_payout}</b> coins 🪙\n\n"
+        f"This action <b>cannot be undone</b>. Are you sure?"
+    )
+
+    rows = [
+        [
+            InlineKeyboardButton("✅ Да, продать" if lang == 'ru' else "✅ Yes, sell", callback_data=f"rec_sell_rar_exec_{rarity}"),
+            InlineKeyboardButton("❌ Отмена" if lang == 'ru' else "❌ Cancel", callback_data='receiver_sell_by_rarity')
+        ]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode='HTML')
+
+
+async def execute_receiver_sell_rarity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполнение массовой продажи редкости."""
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    data = query.data
+    try:
+        rarity = data.removeprefix("rec_sell_rar_exec_")
+    except Exception:
+        await query.answer("Ошибка редкости", show_alert=True)
+        return
+
+    lock = _get_lock(f"sell_rarity:{user_id}:{rarity}")
+    async with lock:
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+
+        try:
+            result = db.sell_all_drinks_of_rarity(user_id, rarity)
+        except Exception:
+            await query.answer("Ошибка при массовой продаже. Попробуйте позже.", show_alert=True)
+            return
+
+        if not result or not result.get("ok"):
+            reason = (result or {}).get("reason")
+            reason_map = {
+                "no_items": "У вас нет предметов этой редкости",
+                "nothing_to_sell": "Нет предметов для продажи",
+                "unsupported_rarity": "Эта редкость пока не принимается",
+                "exception": "Произошла ошибка. Попробуйте повторить попытку",
+            }
+            msg = reason_map.get(reason, "Не удалось выполнить массовую продажу. Повторите попытку позже.")
+            await query.answer(msg, show_alert=True)
+            await show_receiver_sell_by_rarity(update, context)
+            return
+
+        total_sold = int(result.get("total_items_sold", 0))
+        total_earned = int(result.get("total_earned", 0))
+        coins_after = int(result.get("coins_after", 0))
+
+        db.log_action(
+            user_id=user_id,
+            username=query.from_user.username or query.from_user.first_name,
+            action_type='transaction',
+            action_details=f'Приёмник: массовая продажа редкости {rarity} ({total_sold} шт.)',
+            amount=total_earned,
+            success=True
+        )
+
+        success_text = (
+            f"♻️ Массовая продажа успешна!\n"
+            f"Продано редкости {rarity}: {total_sold} шт.\n"
+            f"Заработано: +{total_earned} монет\n"
+            f"Баланс: {coins_after} монет"
+            if lang == 'ru' else
+            f"♻️ Mass sale successful!\n"
+            f"Sold rarity {rarity}: {total_sold} pcs.\n"
+            f"Earned: +{total_earned} coins\n"
+            f"Balance: {coins_after} coins"
+        )
+        await query.answer("Продано успешно!" if lang == 'ru' else "Sold successfully!")
+        
+        await show_receiver_sell_by_rarity(update, context)
+        
+        try:
+            await context.bot.send_message(chat_id=user_id, text=success_text)
+        except Exception:
+            pass
 
 
 async def handle_sell_all_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13937,7 +14145,7 @@ async def show_city_powerlines(update: Update, context: ContextTypes.DEFAULT_TYP
         "🌀 <b>Сематори</b>\n"
         "   └ <i>Таинственные вихри и аномалии</i>\n\n"
         "🔥 <b>Красные ядра земли</b>\n"
-        "   └ <i>Живое тепло под ногами</i>\n\n"
+        "   └ <i>Добыча ядер и обмен наград</i>\n\n"
         "🧪 <b>Поле стекловаты</b>\n"
         "   └ <i>Хрупкая тишина и резкие грани</i>\n\n"
         "🍊 <b>Хурма?</b>\n"
@@ -14068,6 +14276,11 @@ def generate_sematori_puzzle():
     return text, ans, options
 
 
+def _get_powerlines_access_flags(user, player=None) -> tuple[bool, bool]:
+    access = _get_access_profile(user, player=player)
+    return bool(access.get('acts_like_vip_plus')), bool(access.get('acts_like_vip'))
+
+
 async def show_power_sematori(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -14075,8 +14288,7 @@ async def show_power_sematori(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = query.from_user
     player = db.get_or_create_player(user.id, user.username or user.first_name)
     
-    is_vip_plus = db.is_vip_plus(user.id)
-    is_vip_status = db.is_vip(user.id)
+    is_vip_plus, is_vip_status = _get_powerlines_access_flags(user, player=player)
     
     if is_vip_plus:
         cooldown = 300
@@ -14150,8 +14362,7 @@ async def handle_power_sematori_play(update: Update, context: ContextTypes.DEFAU
     async with lock:
         player = db.get_or_create_player(user_id, user.username or user.first_name)
         
-        is_vip_plus = db.is_vip_plus(user_id)
-        is_vip_status = db.is_vip(user_id)
+        is_vip_plus, is_vip_status = _get_powerlines_access_flags(user, player=player)
         
         if is_vip_plus:
             cooldown = 300
@@ -14301,8 +14512,7 @@ async def handle_sematori_ans(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("✅ Отлично! Правильный ответ!", show_alert=True)
         
         base_shards = random.randint(2, 4)
-        is_vip_plus = db.is_vip_plus(user_id)
-        is_vip_status = db.is_vip(user_id)
+        is_vip_plus, is_vip_status = _get_powerlines_access_flags(user, player=player)
         
         import math
         if is_vip_plus:
@@ -14736,29 +14946,249 @@ async def show_selyuk_farmer_seed_priority(update: Update, context: ContextTypes
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 
-async def show_power_red_cores(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    text = (
-        "🔥 <b>КРАСНЫЕ ЯДРА ЗЕМЛИ</b> 🔥\n\n"
-        "🌋 <i>Пульсирующее сердце пустошей</i>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🚧 <b>ЛОКАЦИЯ В РАЗРАБОТКЕ</b> 🚧\n\n"
-        "⏳ <i>Следите за обновлениями — скоро здесь будет активность.</i>"
+def _red_core_mode_status(player, mode: str, is_vip: bool, is_vip_plus: bool, now_ts: int) -> str:
+    cfg = db.RED_CORE_MINE_CONFIG[mode]
+    cooldown = db.get_red_core_cooldown(mode, is_vip=is_vip, is_vip_plus=is_vip_plus)
+    last_run = int(getattr(player, 'last_red_core_run', 0) or 0)
+    elapsed = now_ts - last_run
+    remaining = max(0, cooldown - elapsed) if last_run else 0
+    status = "✅ готово" if remaining <= 0 else f"⏳ {_fmt_time(remaining)}"
+    chance = int(float(cfg['success_chance']) * 100)
+    return (
+        f"• <b>{cfg['title']}</b> — {cfg['shard_cost']} оск. + {cfg['coin_cost']:,} монет, "
+        f"шанс {chance}%, {status}"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
-        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
+async def _edit_or_send_power_red_cores(query, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, reply_markup: InlineKeyboardMarkup):
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='HTML')
     except BadRequest:
-        await context.bot.send_message(chat_id=user.id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def _render_power_red_cores_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    now_ts = int(time.time())
+    is_vip_plus, is_vip_status = _get_powerlines_access_flags(user, player=player)
+
+    shards = int(getattr(player, 'power_shards', 0) or 0)
+    cores = int(getattr(player, 'red_cores', 0) or 0)
+    runs = int(getattr(player, 'red_core_runs', 0) or 0)
+    successes = int(getattr(player, 'red_core_successes', 0) or 0)
+    success_rate = int((successes / runs) * 100) if runs > 0 else 0
+    mode_lines = "\n".join(
+        _red_core_mode_status(player, mode, is_vip_status, is_vip_plus, now_ts)
+        for mode in ("warm", "deep", "heart")
+    )
+
+    text = (
+        "🔥 <b>КРАСНЫЕ ЯДРА ЗЕМЛИ</b> 🔥\n\n"
+        "🌋 <i>Под линиями гудит горячий пласт. Заряженные осколки Сематори можно вдавить в породу "
+        "и вытащить красное ядро, пока разлом не схлопнулся.</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📊 <b>ВАШИ РЕСУРСЫ:</b>\n"
+        f"🔋 Заряженные осколки: <b>{shards}</b>\n"
+        f"🔥 Красные ядра: <b>{cores}</b>\n"
+        f"💰 Баланс: <b>{int(getattr(player, 'coins', 0) or 0):,}</b> 💎\n"
+        f"⛏️ Попытки: <b>{runs}</b>, успехи: <b>{successes}</b> ({success_rate}%)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⛏️ <b>ГЛУБИНЫ ДОБЫЧИ:</b>\n"
+        f"{mode_lines}\n\n"
+        "<i>Выберите глубину добычи или обменяйте готовые ядра.</i>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("⛏️ Тёплый разлом", callback_data='power_red_cores_mine:warm')],
+        [InlineKeyboardButton("🌋 Глубинная жила", callback_data='power_red_cores_mine:deep')],
+        [InlineKeyboardButton("🔥 Сердце пласта", callback_data='power_red_cores_mine:heart')],
+        [InlineKeyboardButton("♻️ Обменник ядер", callback_data='power_red_cores_shop')],
+        [InlineKeyboardButton("🔄 Обновить", callback_data='power_red_cores')],
+        [InlineKeyboardButton("🔙 Вернуться в Линии Электропередач", callback_data='city_powerlines')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    await _edit_or_send_power_red_cores(query, context, user.id, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_power_red_cores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await _render_power_red_cores_menu(update, context)
+
+
+async def handle_power_red_cores_mine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data or ""
+    mode = data.split(":", 1)[1] if ":" in data else ""
+    if mode not in db.RED_CORE_MINE_CONFIG:
+        await query.answer("❌ Неизвестная глубина добычи.", show_alert=True)
+        return
+
+    lock = _get_lock(f"user:{user.id}:red_cores")
+    async with lock:
+        player = db.get_or_create_player(user.id, user.username or user.first_name)
+        is_vip_plus, is_vip_status = _get_powerlines_access_flags(user, player=player)
+        result = db.apply_red_core_mine_atomic(
+            user.id,
+            mode,
+            int(time.time()),
+            is_vip_status,
+            is_vip_plus,
+        )
+
+    if not result.get("ok"):
+        reason = result.get("reason")
+        if reason == "cooldown":
+            await query.answer(f"⏳ Пласт ещё нестабилен. Осталось: {_fmt_time(int(result.get('time_left') or 0))}.", show_alert=True)
+        elif reason == "not_enough_shards":
+            await query.answer(f"❌ Недостаточно осколков. Нужно {result.get('need')}, у вас {result.get('have')}.", show_alert=True)
+        elif reason == "not_enough_coins":
+            await query.answer(f"❌ Недостаточно монет. Нужно {result.get('need'):,}, у вас {result.get('have'):,}.", show_alert=True)
+        elif reason == "bad_mode":
+            await query.answer("❌ Неизвестная глубина добычи.", show_alert=True)
+        else:
+            await query.answer("❌ Добыча не удалась из-за ошибки. Попробуйте позже.", show_alert=True)
+        await _render_power_red_cores_menu(update, context)
+        return
+
+    if result.get("success"):
+        await query.answer("✅ Ядро стабилизировано!", show_alert=True)
+        extra = ""
+        if int(result.get("luck_coupon_delta") or 0) > 0:
+            extra = "\n🍀 Купон удачи: <b>+1</b>"
+        text = (
+            "🔥 <b>ЯДРО СТАБИЛИЗИРОВАНО</b> 🔥\n\n"
+            f"⛏️ <b>Глубина:</b> {result.get('mode_title')}\n"
+            "Пласт выдержал нагрузку. Красный сгусток остыл в ладони и стал пригоден для обмена.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Получено:\n"
+            f"🔥 Красные ядра: <b>+{int(result.get('cores_delta') or 0)}</b>\n"
+            f"💰 Монеты: <b>+{int(result.get('coins_delta') or 0):,}</b>\n"
+            f"🏆 Рейтинг: <b>+{int(result.get('rating_delta') or 0)}</b>"
+            f"{extra}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔋 Осколки: <b>{int(result.get('power_shards_after') or 0)}</b>\n"
+            f"🔥 Ядра: <b>{int(result.get('red_cores_after') or 0)}</b>\n"
+            f"💰 Баланс: <b>{int(result.get('coins_after') or 0):,}</b>"
+        )
+    else:
+        await query.answer("🌋 Разлом сорвался.", show_alert=True)
+        text = (
+            "🌋 <b>РАЗЛОМ СОРВАЛСЯ</b> 🌋\n\n"
+            f"⛏️ <b>Глубина:</b> {result.get('mode_title')}\n"
+            "Порода перегрелась, и заряд ушёл в землю. Часть осколков удалось подобрать у края пласта.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Возврат:\n"
+            f"🔋 Осколки: <b>+{int(result.get('shard_refund') or 0)}</b>\n"
+            f"🏆 Рейтинг: <b>+{int(result.get('rating_delta') or 0)}</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔋 Осколки: <b>{int(result.get('power_shards_after') or 0)}</b>\n"
+            f"🔥 Ядра: <b>{int(result.get('red_cores_after') or 0)}</b>\n"
+            f"💰 Баланс: <b>{int(result.get('coins_after') or 0):,}</b>"
+        )
+
+    keyboard = [
+        [InlineKeyboardButton("🔄 В меню Красных ядер", callback_data='power_red_cores')],
+        [InlineKeyboardButton("♻️ Обменник ядер", callback_data='power_red_cores_shop')],
+        [InlineKeyboardButton("🔙 В Линии Электропередач", callback_data='city_powerlines')],
+    ]
+    await _edit_or_send_power_red_cores(query, context, user.id, text, InlineKeyboardMarkup(keyboard))
+
+
+async def _render_power_red_cores_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    player = db.get_or_create_player(user.id, user.username or user.first_name)
+    cores = int(getattr(player, 'red_cores', 0) or 0)
+    text = (
+        "♻️ <b>ОБМЕННИК КРАСНЫХ ЯДЕР</b>\n\n"
+        "Остывшие ядра можно сдать в цех подстанции и получить полезные награды.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔥 Ваши красные ядра: <b>{cores}</b>\n\n"
+        "1 ядро → <b>750 монет</b>\n"
+        "3 ядра → <b>сброс кулдауна поиска энергетика</b>\n"
+        "4 ядра → <b>+1 фрагмент Селюка</b>\n"
+        "6 ядер → <b>+1 купон удачи</b>\n"
+        "10 ядер → <b>+3 автопоиска на 24 часа</b>"
+    )
+    keyboard = [
+        [InlineKeyboardButton("💰 1 ядро → 750 монет", callback_data='power_red_cores_exchange:coins')],
+        [InlineKeyboardButton("🔎 3 ядра → сброс поиска", callback_data='power_red_cores_exchange:search_skip')],
+        [InlineKeyboardButton("🧩 4 ядра → фрагмент Селюка", callback_data='power_red_cores_exchange:fragment')],
+        [InlineKeyboardButton("🍀 6 ядер → купон удачи", callback_data='power_red_cores_exchange:luck')],
+        [InlineKeyboardButton("⚙️ 10 ядер → автопоиск x3", callback_data='power_red_cores_exchange:auto3')],
+        [InlineKeyboardButton("🔙 Назад к Красным ядрам", callback_data='power_red_cores')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    await _edit_or_send_power_red_cores(query, context, user.id, text, InlineKeyboardMarkup(keyboard))
+
+
+async def show_power_red_cores_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await _render_power_red_cores_shop(update, context)
+
+
+def _format_red_core_exchange_rewards(result: dict) -> str:
+    rewards = result.get("rewards") or {}
+    lines = []
+    if rewards.get("coins"):
+        lines.append(f"💰 Монеты: <b>+{int(rewards['coins']):,}</b>")
+    if "last_search" in rewards:
+        lines.append("🔎 Поиск энергетика: <b>готов</b>")
+    if rewards.get("selyuk_fragments"):
+        lines.append(f"🧩 Фрагменты Селюка: <b>+{int(rewards['selyuk_fragments'])}</b>")
+    if rewards.get("luck_coupon_charges"):
+        lines.append(f"🍀 Купоны удачи: <b>+{int(rewards['luck_coupon_charges'])}</b>")
+    if rewards.get("auto_search_boost_count"):
+        until = safe_format_timestamp(int(rewards.get("auto_search_boost_until") or 0)) or "24 часа"
+        lines.append(f"⚙️ Автопоиск: <b>+{int(rewards['auto_search_boost_count'])}</b> до {until}")
+    return "\n".join(lines) if lines else "Награда применена."
+
+
+async def handle_power_red_cores_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data or ""
+    exchange_key = data.split(":", 1)[1] if ":" in data else ""
+    if exchange_key not in db.RED_CORE_EXCHANGE_CONFIG:
+        await query.answer("❌ Неизвестный обмен.", show_alert=True)
+        return
+
+    lock = _get_lock(f"user:{user.id}:red_cores")
+    async with lock:
+        result = db.exchange_red_cores_atomic(user.id, exchange_key)
+
+    if not result.get("ok"):
+        reason = result.get("reason")
+        if reason == "not_enough_cores":
+            await query.answer(f"❌ Недостаточно ядер. Нужно {result.get('need')}, у вас {result.get('have')}.", show_alert=True)
+        elif reason == "bad_exchange":
+            await query.answer("❌ Неизвестный обмен.", show_alert=True)
+        else:
+            await query.answer("❌ Не удалось выполнить обмен.", show_alert=True)
+        await _render_power_red_cores_shop(update, context)
+        return
+
+    await query.answer("✅ Обмен выполнен.", show_alert=True)
+    text = (
+        "♻️ <b>ОБМЕН ВЫПОЛНЕН</b>\n\n"
+        f"🔥 Списано ядер: <b>{int(result.get('core_cost') or 0)}</b>\n\n"
+        "Получено:\n"
+        f"{_format_red_core_exchange_rewards(result)}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 Осталось ядер: <b>{int(result.get('red_cores_after') or 0)}</b>\n"
+        f"💰 Баланс: <b>{int(result.get('coins_after') or 0):,}</b>"
+    )
+    keyboard = [
+        [InlineKeyboardButton("♻️ Ещё обменять", callback_data='power_red_cores_shop')],
+        [InlineKeyboardButton("🔙 Назад к Красным ядрам", callback_data='power_red_cores')],
+        [InlineKeyboardButton("🏙️ К городам", callback_data='cities_menu')],
+    ]
+    await _edit_or_send_power_red_cores(query, context, user.id, text, InlineKeyboardMarkup(keyboard))
 
 
 async def show_power_glasswool_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15910,6 +16340,7 @@ async def show_market_receiver(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = [
         [InlineKeyboardButton("📦 Открыть инвентарь", callback_data='inventory')],
         [InlineKeyboardButton("📊 По количеству", callback_data='receiver_by_quantity')],
+        [InlineKeyboardButton("♻️ Массовая продажа по редкостям" if lang == 'ru' else "♻️ Mass sell by rarities", callback_data='receiver_sell_by_rarity')],
         [InlineKeyboardButton("🗑️ Продать все", callback_data='sell_all_confirm_1')],
     ]
     if luck_charges > 0 and luck_coupon_payout > 0:
@@ -16773,7 +17204,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'inventory', 'view_', 'my_profile', 'profile_', 'find_energy',
         'claim_bonus', 'daily_bonus', 'receiver_', 'fav_', 'favtrack_',
         'friends_', 'casino_game_', 'casino_custom', 'casino_achievements',
-        'casino_rules', 'city_', 'toggle_', 'autosell_', 'silk_',
+        'casino_rules', 'city_', 'power_', 'sematori_ans:', 'toggle_', 'autosell_', 'silk_',
         'language_', 'settings_', 'snooze_remind', 'luck_coupon_',
     )
     if (query.message
@@ -17079,6 +17510,310 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.answer("✅ Установлено" if lang == 'ru' else "✅ Set")
         await show_profile_favorite_track(update, context)
+    elif data.startswith('fav_add_'):
+        query = update.callback_query
+        try:
+            parts = data.split('_')
+            item_id = int(parts[2])
+            page = int(parts[3][1:])
+            inventory_type = parts[4]
+        except Exception:
+            await query.answer("Ошибка данных", show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+
+        empty_slot = None
+        for i in (1, 2, 3):
+            if not getattr(player, f'favorite_drink_{i}', None):
+                empty_slot = i
+                break
+
+        if empty_slot is not None:
+            res = db.set_favorite_drink_slot(user_id, empty_slot, item_id)
+            if res and res.get('ok'):
+                await query.answer(f"⭐️ Добавлено в слот {empty_slot}!" if lang == 'ru' else f"⭐️ Added to slot {empty_slot}!")
+            else:
+                await query.answer("Ошибка добавления" if lang == 'ru' else "Error adding", show_alert=True)
+            query.data = f"view_{item_id}_{'rp' if inventory_type == 'receiver' else ('sp' if inventory_type == 'search' else 'p')}{page}"
+            await view_inventory_item(update, context)
+        else:
+            # Все слоты заняты: выводим меню замены
+            text = (
+                "<b>⚠️ Все слоты избранного заняты</b>\n\n"
+                "У вас уже выбрано 3 избранных напитка. Выберите слот для замены:\n\n"
+                if lang == 'ru' else
+                "<b>⚠️ All favorite slots are full</b>\n\n"
+                "You already have 3 favorite drinks selected. Choose a slot to replace:\n\n"
+            )
+            for i in (1, 2, 3):
+                slot_item_id = int(getattr(player, f'favorite_drink_{i}', 0) or 0)
+                item_details = db.get_inventory_item(slot_item_id)
+                drink_name = "Пусто" if lang == 'ru' else "Empty"
+                if item_details and item_details.drink:
+                    drink_name = item_details.drink.name
+                text += f"<b>{i}.</b> {drink_name}\n"
+
+            rows = []
+            for i in (1, 2, 3):
+                rows.append([
+                    InlineKeyboardButton(
+                        f"🔄 Заменить слот {i}" if lang == 'ru' else f"🔄 Replace slot {i}",
+                        callback_data=f"fav_replace_{item_id}_{i}_p{page}_{inventory_type}"
+                    )
+                ])
+            rows.append([
+                InlineKeyboardButton(
+                    "❌ Отмена" if lang == 'ru' else "❌ Cancel",
+                    callback_data=f"view_{item_id}_{'rp' if inventory_type == 'receiver' else ('sp' if inventory_type == 'search' else 'p')}{page}"
+                )
+            ])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode='HTML')
+
+    elif data.startswith('fav_remove_'):
+        query = update.callback_query
+        try:
+            parts = data.split('_')
+            item_id = int(parts[2])
+            page = int(parts[3][1:])
+            inventory_type = parts[4]
+        except Exception:
+            await query.answer("Ошибка данных", show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+
+        slot_to_clear = None
+        for i in (1, 2, 3):
+            if int(getattr(player, f'favorite_drink_{i}', 0) or 0) == item_id:
+                slot_to_clear = i
+                break
+
+        if slot_to_clear is not None:
+            res = db.clear_favorite_drink_slot(user_id, slot_to_clear)
+            if res and res.get('ok'):
+                await query.answer("❌ Убрано из избранного!" if lang == 'ru' else "❌ Removed from favorites!")
+            else:
+                await query.answer("Ошибка удаления" if lang == 'ru' else "Error removing", show_alert=True)
+        else:
+            await query.answer("Напиток не найден в избранном" if lang == 'ru' else "Drink not found in favorites", show_alert=True)
+
+        query.data = f"view_{item_id}_{'rp' if inventory_type == 'receiver' else ('sp' if inventory_type == 'search' else 'p')}{page}"
+        await view_inventory_item(update, context)
+
+    elif data.startswith('fav_replace_'):
+        query = update.callback_query
+        try:
+            parts = data.split('_')
+            item_id = int(parts[2])
+            slot = int(parts[3])
+            page = int(parts[4][1:])
+            inventory_type = parts[5]
+        except Exception:
+            await query.answer("Ошибка данных", show_alert=True)
+            return
+
+        user_id = query.from_user.id
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+
+        res = db.set_favorite_drink_slot(user_id, slot, item_id)
+        if res and res.get('ok'):
+            await query.answer(f"✅ Слот {slot} успешно обновлен!" if lang == 'ru' else f"✅ Slot {slot} updated!")
+        else:
+            await query.answer("Ошибка замены" if lang == 'ru' else "Error replacing", show_alert=True)
+
+        query.data = f"view_{item_id}_{'rp' if inventory_type == 'receiver' else ('sp' if inventory_type == 'search' else 'p')}{page}"
+        await view_inventory_item(update, context)
+
+    elif data.startswith('gift_inv_'):
+        query = update.callback_query
+        user_id = query.from_user.id
+        player = db.get_or_create_player(user_id, query.from_user.username or query.from_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+
+        if data.startswith('gift_inv_friend_'):
+            try:
+                parts = data.split('_')
+                item_id = int(parts[3])
+                friend_id = int(parts[4])
+                page = int(parts[5][1:])
+                inventory_type = parts[6]
+            except Exception:
+                await query.answer("Ошибка данных", show_alert=True)
+                return
+
+            if friend_id == user_id:
+                await query.answer("Нельзя дарить самому себе" if lang == 'ru' else "Cannot gift to yourself", show_alert=True)
+                return
+
+            giver_restriction = db.get_gift_restriction_info(user_id)
+            if giver_restriction:
+                await query.answer("Вы временно заблокированы в системе подарков" if lang == 'ru' else "You are restricted from gifting", show_alert=True)
+                return
+
+            recipient_restriction = db.get_gift_restriction_info(friend_id)
+            if recipient_restriction:
+                await query.answer("Получатель временно не может принимать подарки" if lang == 'ru' else "Recipient is restricted from receiving", show_alert=True)
+                return
+
+            gifts_sent_today = db.get_user_gifts_sent_today(user_id)
+            remaining_daily = gift_feature.DAILY_LIMIT - gifts_sent_today
+            if remaining_daily <= 0:
+                await query.answer("Достигнут дневной лимит подарков" if lang == 'ru' else "Daily limit reached", show_alert=True)
+                return
+
+            last_gift_time = db.get_user_last_gift_time(user_id)
+            if last_gift_time and (time.time() - last_gift_time) < gift_feature.COOLDOWN_SECONDS:
+                remaining = int(gift_feature.COOLDOWN_SECONDS - (time.time() - last_gift_time))
+                await query.answer(f"Подождите {remaining} сек." if lang == 'ru' else f"Wait {remaining}s.", show_alert=True)
+                return
+
+            inventory_item = db.get_inventory_item(item_id)
+            if not inventory_item or inventory_item.quantity <= 0:
+                await query.answer("Предмет не найден в инвентаре" if lang == 'ru' else "Item not found", show_alert=True)
+                return
+
+            friend_player = db.get_or_create_player(friend_id, None)
+            friend_username = getattr(friend_player, 'username', None)
+            friend_display = getattr(friend_player, 'display_name', None) or f"@{friend_username}" if friend_username else f"ID {friend_id}"
+
+            gift_feature.selection_state[user_id] = {
+                "created_at": int(time.time()),
+                "group_id": friend_id,
+                "recipient_username": friend_username or "",
+                "recipient_id": friend_id,
+                "recipient_display": friend_display,
+                "inventory_items": [inventory_item],
+                "gifts_sent_today": gifts_sent_today,
+                "max_gifts": min(gift_feature.MAX_BUNDLE_SIZE, remaining_daily),
+                "cart": {item_id: 1},
+                "current_page": 1,
+                "search_query": None,
+                "awaiting_search": False,
+                "search_message_id": None,
+                "gift_snapshot": gift_feature._build_gift_flow_snapshot(user_id, friend_id),
+            }
+
+            try:
+                await gift_feature._send_bundle_offer(update, context)
+            except Forbidden:
+                gift_feature.selection_state.pop(user_id, None)
+                await query.edit_message_text(
+                    "❌ Не удалось отправить предложение подарка получателю.\n\n"
+                    "Ему нужно сначала запустить этого бота в ЛС (нажать /start)."
+                    if lang == 'ru' else
+                    "❌ Could not send gift offer to recipient.\n\n"
+                    "They need to start this bot first in private messages (press /start)."
+                )
+            except Exception as e:
+                gift_feature.selection_state.pop(user_id, None)
+                await query.edit_message_text(f"❌ Ошибка при отправке подарка: {e}")
+
+        elif data.startswith('gift_inv_username_'):
+            try:
+                parts = data.split('_')
+                item_id = int(parts[3])
+                page = int(parts[4][1:])
+                inventory_type = parts[5]
+            except Exception:
+                await query.answer("Ошибка данных", show_alert=True)
+                return
+
+            context.user_data['awaiting_gift_inv_username'] = {
+                "item_id": item_id,
+                "page": page,
+                "inventory_type": inventory_type
+            }
+
+            text = (
+                "<b>🔍 Ввод получателя вручную</b>\n\n"
+                "Введите Telegram @username или ID игрока, которому хотите подарить напиток.\n"
+                "Пример: <code>@username</code> или <code>123456789</code>."
+                if lang == 'ru' else
+                "<b>🔍 Enter username manually</b>\n\n"
+                "Enter Telegram @username or ID of the player you want to gift this drink.\n"
+                "Example: <code>@username</code> or <code>123456789</code>."
+            )
+            keyboard = [[
+                InlineKeyboardButton(
+                    "❌ Отмена" if lang == 'ru' else "❌ Cancel",
+                    callback_data=f"gift_inv_{item_id}_p{page}_{inventory_type}"
+                )
+            ]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+
+        else:
+            try:
+                parts = data.split('_')
+                if 'fpage' in parts:
+                    fpage = int(parts[3])
+                    item_id = int(parts[4])
+                    page = int(parts[5][1:])
+                    inventory_type = parts[6]
+                else:
+                    fpage = 1
+                    item_id = int(parts[2])
+                    page = int(parts[3][1:])
+                    inventory_type = parts[4]
+            except Exception:
+                await query.answer("Ошибка данных", show_alert=True)
+                return
+
+            await query.answer()
+
+            friends_res = db.list_friends(user_id, page=fpage-1, per_page=5)
+            friends = friends_res.get('items', [])
+            total_friends = friends_res.get('total', 0)
+
+            text = (
+                "<b>👥 Выберите друга для подарка</b>\n\n"
+                "Ниже показан список ваших друзей. Выберите получателя или введите @username вручную."
+                if lang == 'ru' else
+                "<b>👥 Choose friend to gift</b>\n\n"
+                "Below is your friends list. Select a recipient or enter @username manually."
+            )
+
+            rows = []
+            for f in friends:
+                f_id = f['user_id']
+                f_uname = f['username'] or f['display_name'] or str(f_id)
+                rows.append([
+                    InlineKeyboardButton(
+                        f"👤 @{f_uname}" if f['username'] else f"👤 {f_uname}",
+                        callback_data=f"gift_inv_friend_{item_id}_{f_id}_p{page}_{inventory_type}"
+                    )
+                ])
+
+            nav_row = []
+            total_pages = max(1, (total_friends + 4) // 5)
+            if total_pages > 1:
+                prev_fpage = total_pages if fpage == 1 else fpage - 1
+                next_fpage = 1 if fpage == total_pages else fpage + 1
+                nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"gift_inv_fpage_{prev_fpage}_{item_id}_p{page}_{inventory_type}"))
+                nav_row.append(InlineKeyboardButton(f"{fpage}/{total_pages}", callback_data="noop"))
+                nav_row.append(InlineKeyboardButton("➡️", callback_data=f"gift_inv_fpage_{next_fpage}_{item_id}_p{page}_{inventory_type}"))
+                rows.append(nav_row)
+
+            rows.append([
+                InlineKeyboardButton(
+                    "🔍 Ввести @username вручную" if lang == 'ru' else "🔍 Enter @username manually",
+                    callback_data=f"gift_inv_username_{item_id}_p{page}_{inventory_type}"
+                )
+            ])
+            rows.append([
+                InlineKeyboardButton(
+                    "🔙 Назад к карточке" if lang == 'ru' else "🔙 Back to card",
+                    callback_data=f"view_{item_id}_{'rp' if inventory_type == 'receiver' else ('sp' if inventory_type == 'search' else 'p')}{page}"
+                )
+            ])
+
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode='HTML')
+
     elif data.startswith('fav_slot_'):
         query = update.callback_query
         try:
@@ -17377,6 +18112,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_sematori_ans(update, context)
     elif data == 'power_red_cores':
         await show_power_red_cores(update, context)
+    elif data.startswith('power_red_cores_mine:'):
+        await handle_power_red_cores_mine(update, context)
+    elif data == 'power_red_cores_shop':
+        await show_power_red_cores_shop(update, context)
+    elif data.startswith('power_red_cores_exchange:'):
+        await handle_power_red_cores_exchange(update, context)
     elif data == 'power_glasswool_field':
         await show_power_glasswool_field(update, context)
     elif data == 'power_persimmon':
@@ -20208,6 +20949,162 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not getattr(msg, 'text', None):
         return
 
+    if context.user_data.get('awaiting_gift_inv_username'):
+        gift_data = context.user_data.pop('awaiting_gift_inv_username')
+        item_id = gift_data['item_id']
+        page = gift_data['page']
+        inventory_type = gift_data['inventory_type']
+
+        user_id = update.effective_user.id
+        player = db.get_or_create_player(user_id, update.effective_user.username or update.effective_user.first_name)
+        lang = getattr(player, 'language', 'ru') or 'ru'
+        
+        incoming = (msg.text or "").strip()
+        recipient_username = incoming.lstrip("@").strip()
+        
+        recipient_id = None
+        recipient_player = None
+        
+        if recipient_username.isdigit():
+            recipient_id = int(recipient_username)
+            recipient_player = db.get_or_create_player(recipient_id, None)
+        else:
+            recipient_player = db.get_player_by_username(recipient_username)
+            if recipient_player:
+                recipient_id = int(recipient_player.user_id)
+        
+        if not recipient_id or not recipient_player:
+            keyboard = [[
+                InlineKeyboardButton(
+                    "❌ Отмена" if lang == 'ru' else "❌ Cancel",
+                    callback_data=f"gift_inv_{item_id}_p{page}_{inventory_type}"
+                )
+            ]]
+            await msg.reply_text(
+                "❌ Игрок не найден в базе данных бота. Он должен хотя бы раз запустить бота.\n"
+                "Попробуйте ввести другой @username или ID:"
+                if lang == 'ru' else
+                "❌ Player not found in database. They must start the bot at least once.\n"
+                "Try entering another @username or ID:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            context.user_data['awaiting_gift_inv_username'] = gift_data
+            return
+            
+        if recipient_id == user_id:
+            keyboard = [[
+                InlineKeyboardButton(
+                    "❌ Отмена" if lang == 'ru' else "❌ Cancel",
+                    callback_data=f"gift_inv_{item_id}_p{page}_{inventory_type}"
+                )
+            ]]
+            await msg.reply_text(
+                "❌ Нельзя дарить самому себе! Попробуйте ввести другого получателя:"
+                if lang == 'ru' else
+                "❌ Cannot gift to yourself! Try entering another recipient:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            context.user_data['awaiting_gift_inv_username'] = gift_data
+            return
+
+        giver_restriction = db.get_gift_restriction_info(user_id)
+        if giver_restriction:
+            await msg.reply_text(
+                "🚫 Вы временно заблокированы в системе подарков."
+                if lang == 'ru' else
+                "🚫 You are restricted from gifting."
+            )
+            return
+
+        recipient_restriction = db.get_gift_restriction_info(recipient_id)
+        if recipient_restriction:
+            await msg.reply_text(
+                "🚫 Получатель временно не может принимать подарки."
+                if lang == 'ru' else
+                "🚫 Recipient is restricted from receiving gifts."
+            )
+            return
+
+        gifts_sent_today = db.get_user_gifts_sent_today(user_id)
+        remaining_daily = gift_feature.DAILY_LIMIT - gifts_sent_today
+        if remaining_daily <= 0:
+            await msg.reply_text(
+                "⏳ Вы достигли дневного лимита подарков."
+                if lang == 'ru' else
+                "⏳ You have reached your daily limit of gifts."
+            )
+            return
+
+        last_gift_time = db.get_user_last_gift_time(user_id)
+        if last_gift_time and (time.time() - last_gift_time) < gift_feature.COOLDOWN_SECONDS:
+            remaining = int(gift_feature.COOLDOWN_SECONDS - (time.time() - last_gift_time))
+            await msg.reply_text(
+                f"⏳ Подождите {remaining} сек. перед следующим подарком."
+                if lang == 'ru' else
+                f"⏳ Wait {remaining}s. before the next gift."
+            )
+            return
+
+        inventory_item = db.get_inventory_item(item_id)
+        if not inventory_item or inventory_item.quantity <= 0:
+            await msg.reply_text(
+                "❌ Напиток не найден в инвентаре."
+                if lang == 'ru' else
+                "❌ Drink not found in inventory."
+            )
+            return
+
+        friend_username = getattr(recipient_player, 'username', None)
+        friend_display = getattr(recipient_player, 'display_name', None) or f"@{friend_username}" if friend_username else f"ID {recipient_id}"
+
+        gift_feature.selection_state[user_id] = {
+            "created_at": int(time.time()),
+            "group_id": recipient_id,
+            "recipient_username": friend_username or "",
+            "recipient_id": recipient_id,
+            "recipient_display": friend_display,
+            "inventory_items": [inventory_item],
+            "gifts_sent_today": gifts_sent_today,
+            "max_gifts": min(gift_feature.MAX_BUNDLE_SIZE, remaining_daily),
+            "cart": {item_id: 1},
+            "current_page": 1,
+            "search_query": None,
+            "awaiting_search": False,
+            "search_message_id": None,
+            "gift_snapshot": gift_feature._build_gift_flow_snapshot(user_id, recipient_id),
+        }
+
+        from telegram import CallbackQuery
+        class FakeQuery:
+            def __init__(self, user, message):
+                self.from_user = user
+                self.message = message
+            async def answer(self, *args, **kwargs):
+                pass
+            async def edit_message_text(self, text, *args, **kwargs):
+                await self.message.reply_html(text)
+
+        original_callback_query = update.callback_query
+        update.callback_query = FakeQuery(update.effective_user, msg)
+
+        try:
+            await gift_feature._send_bundle_offer(update, context)
+        except Forbidden:
+            gift_feature.selection_state.pop(user_id, None)
+            await msg.reply_text(
+                "❌ Не удалось отправить предложение подарка получателю.\n\n"
+                "Ему нужно сначала запустить этого бота в ЛС (нажать /start)."
+                if lang == 'ru' else
+                "❌ Could not send gift offer to recipient.\n\n"
+                "They need to start this bot first in private messages (press /start)."
+            )
+        except Exception as e:
+            gift_feature.selection_state.pop(user_id, None)
+            await msg.reply_text(f"❌ Ошибка при отправке подарка: {e}")
+        finally:
+            update.callback_query = original_callback_query
+        return
+
     if await gift_feature.handle_text_message(update, context):
         return
 
@@ -20558,7 +21455,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         try:
             img_paths = result.get("image_paths") or []
-            existing = [p for p in img_paths if p and os.path.exists(p)]
+            existing = [p for p in img_paths if p and os.path.exists(p) and os.path.getsize(p) > 0]
             found_count = int(result.get('found_count', 1) or 1)
             if found_count >= 2 and len(existing) >= 2:
                 f1 = None
@@ -20688,7 +21585,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         img_paths = result.get("image_paths") or []
-        existing = [p for p in img_paths if p and os.path.exists(p)]
+        existing = [p for p in img_paths if p and os.path.exists(p) and os.path.getsize(p) > 0]
         found_count = int(result.get('found_count', 1) or 1)
         if found_count >= 2 and len(existing) >= 2:
             f1 = None

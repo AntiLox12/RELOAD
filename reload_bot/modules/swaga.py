@@ -3,8 +3,8 @@ from __future__ import annotations
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes
 
-import swaga_admin
-import swagashop
+from modules.swaga import swaga_admin
+from modules.swaga import swagashop
 
 
 CALLBACK_EXACT = {

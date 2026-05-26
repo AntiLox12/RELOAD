@@ -19,7 +19,7 @@ if config.config_file_name is not None:
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from database import Base
+from core.database import Base
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,

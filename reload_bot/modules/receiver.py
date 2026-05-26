@@ -14,6 +14,7 @@ CALLBACK_EXACT = {
     "sell_all_confirm_2",
     "sell_all_execute",
     "sell_absolutely_all_but_one",
+    "receiver_sell_by_rarity",
 }
 
 CALLBACK_PREFIXES = (
@@ -24,6 +25,8 @@ CALLBACK_PREFIXES = (
     "sell_",
     "view_receipt_",
     "view_",
+    "rec_sell_rar_conf_",
+    "rec_sell_rar_exec_",
 )
 
 
@@ -61,6 +64,12 @@ async def handle_callback(
             await handlers["handle_receiver_item_sell"](update, context, item_key, quantity_token)
         except Exception:
             await _answer_error(update)
+    elif data == "receiver_sell_by_rarity":
+        await handlers["show_receiver_sell_by_rarity"](update, context)
+    elif data.startswith("rec_sell_rar_conf_"):
+        await handlers["confirm_receiver_sell_rarity"](update, context)
+    elif data.startswith("rec_sell_rar_exec_"):
+        await handlers["execute_receiver_sell_rarity"](update, context)
     elif data == "my_receipts":
         await handlers["my_receipts_handler"](update, context)
     elif data == "sell_all_confirm_1":
